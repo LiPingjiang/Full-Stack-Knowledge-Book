@@ -20,44 +20,77 @@
 
 ---
 
+## 全书脉络：五章递进
+
+这本书的五章是一条精心设计的学习路径，环环相扣：
+
+> **先重装思维 → 补齐前端短板 → 夯实 Java 基准 → 横向对比拓宽语言视野 → 用 AI 加速整个过程。**
+
+```mermaid
+flowchart LR
+    C1["第一章<br/>思维模式转变<br/>(重装世界观)"] --> C2["第二章<br/>前端核心知识<br/>(补齐短板)"]
+    C2 --> C3["第三章<br/>Java 深度知识<br/>(磨利对比标尺)"]
+    C3 --> C4["第四章<br/>多语言对比<br/>(拓宽视野)"]
+    C4 --> C5["第五章<br/>AI Coding 方法论<br/>(加速学习)"]
+    REF["并发模型引用库<br/>(被三、四章共享引用)"] -.被引用.- C3
+    REF -.被引用.- C4
+```
+
+为什么是这个顺序？第三章先把 Java 的并发、内存模型、类型、异常体系彻底夯实，是因为第四章要拿 Java 当**对比基准**去量其他语言——你得先有一把磨利的标尺，才能量出别的语言到底强在哪、弱在哪。
+
+---
+
 ## 全书地图
 
-全书由四个主体部分 + 一个「并发模型引用库」组成。各部分之间通过超链接交叉串联，遇到深水区会用钩子链接把你引向专门的深挖章节。
+### 第一章 · 后端转前端的思维模式转变 〔核心重点 ①〕
 
-### 第一部分 · 后端转前端的思维模式转变 〔核心重点 ①〕
+转前端最难的从来不是语法，而是**心智模型的重装**。这是全书的地基。
 
-这是全书的灵魂。转前端最难的从来不是 API 语法，而是**心智模型的重装**。
-
-- [本部分导读](./part1-mindset-shift/README.md)
+- [本章导读](./part1-mindset-shift/README.md)
 - [1.1 从「请求-响应」到「用户交互」：同步思维 → 事件驱动思维](./part1-mindset-shift/01-从请求响应到用户交互.md)
 - [1.2 从「无状态」到「有状态」：后端的无状态信仰 vs 前端的状态管理](./part1-mindset-shift/02-从无状态到有状态.md)
 - [1.3 从「强类型」到「类型光谱」：静态 / 动态类型的心智模型](./part1-mindset-shift/03-从强类型到类型光谱.md)
 - [1.4 从「单一运行时」到「多运行时」：JVM vs 浏览器 / Node / Deno](./part1-mindset-shift/04-从单一运行时到多运行时.md)
 - [1.5 从「数据建模」到「UI 建模」：表结构思维 → 组件与状态建模](./part1-mindset-shift/05-从数据建模到UI建模.md)
 
-### 第二部分 · 从 Java 延伸到多语言
+### 第二章 · 前端核心知识体系
 
-用 Java 当锚点，逐一拆解迁移到其他语言的关键认知差。
+后端视角下的前端速成。系统补齐三件套、框架、状态管理、工程化这些盲区。
 
-- [本部分导读](./part2-java-to-multilang/README.md)
-- [2.1 Java → JavaScript / TypeScript：最关键的一跳](./part2-java-to-multilang/01-Java到JS-TS.md)
-- [2.2 Java → Go：后端同温层的迁移](./part2-java-to-multilang/02-Java到Go.md)
-- [2.3 Java → Rust：所有权与系统级编程](./part2-java-to-multilang/03-Java到Rust.md)
-- [2.4 Java → Python：数据研发老朋友的再认识](./part2-java-to-multilang/04-Java到Python.md)
-- [2.5 语言选型决策树：什么场景该用哪门语言](./part2-java-to-multilang/05-语言选型决策树.md)
+- [本章导读](./part2-frontend-core/README.md)
+- [2.1 HTML / CSS / JS 三件套：后端工程师的最小够用集](./part2-frontend-core/01-三件套速成.md)
+- [2.2 现代前端框架：React / Vue 的组件化与声明式渲染](./part2-frontend-core/02-现代框架.md)
+- [2.3 前端状态管理：从混乱的全局变量到可预测的状态流](./part2-frontend-core/03-状态管理.md)
+- [2.4 前端工程化：构建、打包、模块化——你熟悉的 Maven 在前端长什么样](./part2-frontend-core/04-工程化.md)
 
-### 第三部分 · 同一功能的多语言对比 〔核心重点 ②〕
+### 第三章 · Java 深度知识（对比基准） 〔核心重点 · 标尺〕
 
-以**高并发**为主线案例，把同一个功能用不同语言实现，横向对比。遇到各语言的并发模型，用超链接「干镰刀」跳转到下方的并发模型引用库深挖。
+把后续要用到的 Java「标尺」磨利。这一章不是教你写 Java，而是把你「会用但未必透彻」的并发、内存、类型、异常彻底讲清，作为第四章横向对比的基准。
 
-- [本部分导读](./part3-same-feature-compare/README.md)
-- [3.1 高并发 HTTP 服务：Java / Go / Rust / Node / Python 五语言对比](./part3-same-feature-compare/01-高并发HTTP服务对比.md)
-- [3.2 并发数据处理：批量任务的五语言写法对比](./part3-same-feature-compare/02-并发数据处理对比.md)
-- [3.3 错误处理：异常 vs 返回值 vs Result 的哲学差异](./part3-same-feature-compare/03-错误处理对比.md)
+- [本章导读](./part3-java-deep/README.md)
+- [3.1 Java 并发体系：线程 / 线程池 / JUC / AQS / 虚拟线程](./part3-java-deep/01-并发体系.md)
+  > 深挖锚点：[Java 并发模型详解](./concurrency-models/java-thread-and-virtual-thread.md)
+- [3.2 Java 内存模型（JMM）：volatile / happens-before / 可见性](./part3-java-deep/02-内存模型JMM.md)
+- [3.3 JVM 运行时：内存结构 / GC / 类加载](./part3-java-deep/03-JVM运行时.md)
+- [3.4 Java 类型系统：泛型 / 类型擦除 / 型变](./part3-java-deep/04-类型系统.md)
+- [3.5 Java 异常体系：受检 / 非受检异常的设计哲学](./part3-java-deep/05-异常体系.md)
 
-### 并发模型引用库 〔被第三部分超链接引用〕
+### 第四章 · 核心场景的多语言对比与讲解 〔核心重点 ②〕
 
-每门语言的并发模型独立成篇，作为「深挖锚点」。第三部分的对比章节会大量链接到这里。
+以**高并发**为主线，把同一功能用 Java / Go / Rust / Node / Python 分别实现，横向对比，并借此讲解每门语言。遇到各语言的并发模型，用超链接「干镰刀」跳进下方引用库深挖。
+
+- [本章导读](./part4-multilang-compare/README.md)
+- [4.1 高并发 HTTP 服务：五语言同台对比](./part4-multilang-compare/01-高并发HTTP服务对比.md)
+- [4.2 Java → JavaScript / TypeScript：最关键的一跳](./part4-multilang-compare/02-Java到JS-TS.md)
+- [4.3 Java → Go：后端同温层的迁移](./part4-multilang-compare/03-Java到Go.md)
+- [4.4 Java → Rust：所有权与系统级编程](./part4-multilang-compare/04-Java到Rust.md)
+- [4.5 Java → Python：数据研发老朋友的再认识](./part4-multilang-compare/05-Java到Python.md)
+- [4.6 错误处理对比：异常 vs 返回值 vs Result 的哲学差异](./part4-multilang-compare/06-错误处理对比.md)
+- [4.7 语言选型决策树：什么场景该用哪门语言](./part4-multilang-compare/07-语言选型决策树.md)
+
+### 并发模型引用库 〔被第三、四章共享引用〕
+
+每门语言的并发模型独立成篇，作为「深挖锚点」。第三、四章会大量链接到这里。
 
 - [引用库导读](./concurrency-models/README.md)
 - [Java 并发模型：线程池 + JUC + 虚拟线程（Loom）](./concurrency-models/java-thread-and-virtual-thread.md)
@@ -66,14 +99,14 @@
 - [Node.js 并发模型：事件循环 + libuv](./concurrency-models/nodejs-eventloop.md)
 - [Python 并发模型：GIL + asyncio + 多进程](./concurrency-models/python-gil-asyncio.md)
 
-### 第四部分 · AI Coding 驱动的全栈学习方法论
+### 第五章 · AI Coding 驱动的全栈学习方法论
 
-在 AI Coding 时代，学一门新语言的方式已经变了。这一部分讲如何用 AI 把学习曲线压平。
+在 AI Coding 时代，学一门新语言的方式已经变了。这一章讲如何用 AI 把学习曲线压平。
 
-- [本部分导读](./part4-ai-coding-method/README.md)
-- [4.1 用 AI 快速进入陌生语言：从「查文档」到「对话式学习」](./part4-ai-coding-method/01-用AI快速进入陌生语言.md)
-- [4.2 AI 辅助的全栈工作流：前后端一把梭](./part4-ai-coding-method/02-AI辅助的全栈工作流.md)
-- [4.3 验证与避坑：AI 生成代码的信任边界](./part4-ai-coding-method/03-验证与避坑.md)
+- [本章导读](./part5-ai-coding-method/README.md)
+- [5.1 用 AI 快速进入陌生语言：从「查文档」到「对话式学习」](./part5-ai-coding-method/01-用AI快速进入陌生语言.md)
+- [5.2 AI 辅助的全栈工作流：前后端一把梭](./part5-ai-coding-method/02-AI辅助的全栈工作流.md)
+- [5.3 验证与避坑：AI 生成代码的信任边界](./part5-ai-coding-method/03-验证与避坑.md)
 
 ---
 
@@ -81,9 +114,9 @@
 
 推荐两种路径：
 
-**路径 A · 按部就班（推荐首次阅读）**：第一部分 → 第二部分 → 第三部分（遇到并发模型链接就跳进引用库）→ 第四部分。第一部分的思维转变是地基，后面所有内容都建立在它之上。
+**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章。前三章是地基，第四章是融会贯通，第五章是加速器。
 
-**路径 B · 问题驱动（带着具体问题查阅）**：直接从第三部分的对比案例切入，遇到不懂的语言特性顺着超链接回溯到第二部分的语言迁移章节，或并发模型引用库。
+**路径 B · 问题驱动（带着具体问题查阅）**：直接从第四章的对比案例切入，遇到 Java 基准不熟就回溯第三章，遇到前端概念不懂就回溯第二章，遇到思维卡壳就回第一章。
 
 全书所有 `.md` 文件之间用相对路径超链接互相串联，你可以在任意支持 Markdown 渲染的编辑器（VS Code、Typora、Obsidian）或 Git 平台中点击跳转，像在网页里冲浪一样阅读。
 
@@ -98,4 +131,4 @@
 >
 > 这两套关注点都重要，全栈就是同时住进地基和客厅。
 
-接下来从 [第一部分 · 思维模式转变](./part1-mindset-shift/README.md) 开始。
+接下来从 [第一章 · 思维模式转变](./part1-mindset-shift/README.md) 开始。

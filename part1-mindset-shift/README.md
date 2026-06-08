@@ -37,7 +37,7 @@
 
 ### [1.3 从「强类型」到「类型光谱」](./03-从强类型到类型光谱.md)
 Java 的强类型不是非黑即白，类型其实是一道光谱。理解 TypeScript 如何在动态世界里重建你熟悉的安全网。
-> 延伸阅读：[Java → JS/TS 的语言迁移](../part2-java-to-multilang/01-Java到JS-TS.md)
+> 延伸阅读：[Java → JS/TS 的语言迁移](../part4-multilang-compare/02-Java到JS-TS.md)
 
 ### [1.4 从「单一运行时」到「多运行时」](./04-从单一运行时到多运行时.md)
 你只伺候过一个 JVM。前端世界里同一段 JS 要在浏览器、Node、Deno、甚至边缘函数里跑，运行时差异会反复咬你。
