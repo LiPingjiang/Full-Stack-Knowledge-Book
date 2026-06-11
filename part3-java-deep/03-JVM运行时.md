@@ -528,9 +528,11 @@ graph TB
 
 ### 考点 5：常见 GC 收集器与选型 + 调优参数
 
-**面试官**：「线上服务你会怎么选 GC？常用调优参数有哪些？」
+**面试官**：「线上服务你会怎么选 GC？JDK 8 默认用的是哪个？常用调优参数有哪些？」
 
-- **G1**（JDK 9+ 默认）：分 Region 管理，可预测停顿（`-XX:MaxGCPauseMillis`），适合大堆、在线服务。
+- **Parallel GC**（Parallel Scavenge + Parallel Old，**JDK 8 默认**）：多线程并行、吞吐量优先，STW 较长，适合批处理、后台计算。
+- **CMS**（Concurrent Mark-Sweep）：JDK 8 时代**低延迟首选**（需手动 `-XX:+UseConcMarkSweepGC` 开启，并非默认），并发标记/清除停顿短；但有碎片、并发失败会退化，**JDK 9 废弃、JDK 14 移除**。
+- **G1**（JDK 9+ 默认）：分 Region 管理，可预测停顿（`-XX:MaxGCPauseMillis`），适合大堆、在线服务，逐步取代 CMS。
 - **ZGC / Shenandoah**：亚毫秒级停顿，适合对延迟极敏感、超大堆（几十上百 GB）。
 - 关键参数（要能说出几个）：
 
@@ -543,6 +545,67 @@ graph TB
 -XX:+HeapDumpOnOutOfMemoryError   # OOM 时自动 dump 堆，排查必备
 -XX:HeapDumpPath=/path/dump.hprof
 ```
+
+<details>
+<summary><b>展开：JDK 8 到底默认用哪个收集器？六款收集器的定位、搭配与演进（大白话版）</b></summary>
+
+**先纠正一个最常被记错的点：JDK 8 的默认收集器是 Parallel GC（吞吐量优先），不是 CMS，也不是 G1。** CMS 在 JDK 8 时代确实很流行，但它**从来不是默认**——想用得手动加 `-XX:+UseConcMarkSweepGC`。G1 是 JDK 9 才转正成默认的。
+
+**怎么验证？** 跑一行命令就知道你当前 JDK 默认用啥：
+
+```
+java -XX:+PrintFlagsFinal -version | grep "Use.*GC"
+# JDK 8 上 UseParallelGC 会是 true
+```
+
+---
+
+**六款经典收集器，按「管哪块堆 + 单线程还是多线程 + 要不要并发」来记：**
+
+| 收集器 | 管哪块 | 线程 | 与谁搭配 | 定位 |
+|------|------|------|------|------|
+| Serial | 新生代 | 单线程 | Serial Old | 客户端/小内存，全程 STW |
+| Serial Old | 老年代 | 单线程 | Serial | 同上，也作 CMS 失败后的兜底 |
+| ParNew | 新生代 | 多线程 | **专配 CMS** | Serial 的并行版 |
+| Parallel Scavenge | 新生代 | 多线程 | Parallel Old | 吞吐优先 |
+| Parallel Old | 老年代 | 多线程 | Parallel Scavenge | **JDK 8 默认组合** |
+| CMS | 老年代 | 并发 | ParNew | 低延迟，标记-清除 |
+
+> 注意 GC 是「新生代收集器 + 老年代收集器」**成对搭配**的：JDK 8 默认是 `Parallel Scavenge + Parallel Old`；当年开 CMS 的标准姿势是 `ParNew + CMS`（所以 ParNew 几乎只为 CMS 而生）。G1 之后才打破这种「分代各管一段」，用统一的 Region 把新生代/老年代都管了。
+
+---
+
+**① Parallel GC（JDK 8 默认）——榨干吞吐量**
+
+多条 GC 线程并行干活，目标是**让 GC 占用的总时间占比最低**（吞吐量 = 跑业务时间 /（跑业务 + GC）），不在乎单次 STW 多长。
+
+> 大白话：像一支搬家队同时上，整体搬得快就行，至于中途歇几次、每次歇多久不重要。适合**后台批处理、离线计算**——没人盯着延迟，只看总活干得快不快。
+
+**② CMS（JDK 8 时代低延迟首选，但不是默认）——和你抢着干，少停顿**
+
+CMS 的卖点是**并发**：标记和清除大部分阶段跟应用线程**同时跑**，只有「初始标记」「重新标记」两个短暂 STW。所以单次停顿短，适合**对响应延迟敏感的在线服务**。
+
+它的三个硬伤（也是面试高频）：
+
+1. **内存碎片**：用的是标记-清除（见考点 4），清完一地碎片，碎到一定程度会触发一次 STW 的 Full GC 来整理，停顿反而很长；
+2. **Concurrent Mode Failure（并发失败）**：并发清理还没干完，老年代就被新晋升的对象填满了 → 退化成单线程 Serial Old 做 Full GC，停顿暴涨；
+3. **抢 CPU**：并发阶段占用 CPU，业务线程能用的核变少，吞吐下降。
+
+> 大白话：CMS 像「边营业边打扫」，顾客几乎不受影响（停顿短）；但扫地不挪桌子（不整理碎片），久了地方越来越零碎；要是顾客涌入太快来不及扫，只能关门大扫除（退化 Full GC）。
+>
+> **结局**：正因为这些毛病，CMS 在 **JDK 9 被标记废弃，JDK 14 正式移除**——它的低延迟使命交给了 G1 和后来的 ZGC。
+
+**③ G1（JDK 9+ 默认）——CMS 的接班人**
+
+把堆切成很多大小相等的 Region，不再「新生代一整段、老年代一整段」，而是按「**回收价值最高**」优先收（Garbage First 名字由来），并能**指定目标停顿**（`-XX:MaxGCPauseMillis=200`）尽量满足。既兼顾吞吐又控制停顿，还自带整理（标记-整理）不留碎片。这就是为什么 JDK 9 起用它取代了 CMS 当默认。
+
+---
+
+**一句话记忆链：**
+
+> **JDK 8 默认 = Parallel GC（吞吐优先）；当年想要低延迟 = 手动开 CMS（ParNew + CMS）；JDK 9 起默认换成 G1（取代 CMS）；JDK 11+ 还能上 ZGC/Shenandoah 追求亚毫秒停顿。**
+
+</details>
 
 ### 考点 6：线上 OOM / CPU 飙高怎么排查（实战加分项，最能拉开差距）
 
