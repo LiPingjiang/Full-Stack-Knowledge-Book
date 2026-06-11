@@ -337,6 +337,76 @@ graph BT
 
 > **陷阱**：程序计数器是唯一不会 OOM 的区域，常被拿来考。元空间（JDK 8 用本地内存替代了永久代 PermGen）OOM 常见于大量动态生成类（CGLIB、反射、热部署）。
 
+<details>
+<summary><b>展开：OOM 到底有几种？每一种的触发原理和典型场景（建议系统掌握，面试 + 线上排查双高频）</b></summary>
+
+很多人以为 OOM 就是「堆满了」，其实 `OutOfMemoryError` 是一类错误的统称，**错误信息后面那串文字才是真正的「病因」**。看到 OOM 第一件事永远是看冒号后面那行是什么。下面按内存区域和成因，把常见的 OOM 类型逐一拆解。
+
+**总览表（先建立全景）**
+
+| OOM 类型（错误信息） | 内存区域 | 一句话病因 |
+|---------------------|---------|-----------|
+| `Java heap space` | 堆 | 对象太多 / 内存泄漏 / 堆太小 |
+| `GC overhead limit exceeded` | 堆 | GC 拼命回收却几乎收不回来 |
+| `Metaspace` / `PermGen space` | 元空间 / 永久代 | 动态生成类过多、类加载器泄漏 |
+| `Direct buffer memory` | 堆外（直接内存） | NIO/Netty 直接内存未释放 |
+| `Unable to create new native thread` | 栈（本地内存） | 线程开太多，本地内存/系统线程数耗尽 |
+| `Requested array size exceeds VM limit` | 堆 | 申请的数组长度超过 JVM 上限 |
+| `Out of swap space` | 本地内存 | 本地内存 + 交换区都不够了 |
+| 被系统 OOM Killer 杀（非 JVM 抛出） | 物理内存 | 进程总内存超出宿主机/容器限制 |
+
+**① 堆溢出 `Java heap space`（最常见）**
+
+原理：新对象要在堆里分配，但 GC 后堆里仍腾不出足够空间。两类成因——一是**真·内存泄漏**：对象本该被回收却被 GC Root 链一直引用着（静态集合只加不删、缓存无淘汰、监听器/回调没注销）；二是**容量不匹配**：堆本身就配小了，或一次性加载海量数据（如 `SELECT *` 把百万行查进内存、一次读超大文件到 `byte[]`）。
+典型场景：`static Map` 当缓存只 put 不 evict；大结果集全量装入 List；图片/文件全量读进内存。
+排查：`-XX:+HeapDumpOnOutOfMemoryError` 自动 dump，用 MAT 看 Dominator Tree 找最大对象 + 引用链。
+
+**② `GC overhead limit exceeded`（堆的「慢性死亡」版）**
+
+原理：默认规则——**JVM 花了超过 98% 的时间做 GC，却只回收回不到 2% 的堆**，连续多次如此就抛此错。本质和堆溢出同源（内存不够），但表现是「还没彻底满，但 GC 已经在做无用功、CPU 被 GC 吃光」。它其实是 JVM 的一种「提前止损」——与其让你卡在无尽 Full GC 里假死，不如直接抛错。
+典型场景：堆接近满载、对象勉强够回收一点点又马上被填满；常出现在堆配置略小 + 持续高分配的服务。
+排查：和堆溢出一样 dump 分析；治标可加大堆，治本要找泄漏/降分配。
+
+**③ 元空间 / 永久代 `Metaspace` / `PermGen space`（类太多）**
+
+原理：存的不是对象，而是**类的元数据**。JDK 7 及以前在永久代（PermGen，固定上限），JDK 8 起改到元空间（Metaspace，本地内存）。当**加载的类数量持续增长且卸不掉**，这块就会涨爆。
+典型场景：**大量动态生成类**——CGLIB/ASM 动态代理（Spring AOP、MyBatis、ORM 每个代理都是一个新类）、反射频繁生成 `GeneratedConstructorAccessor`、Groovy/脚本引擎每次编译都生成新类、Tomcat 反复热部署导致旧类加载器泄漏（旧类卸不掉）。
+排查：`-XX:MaxMetaspaceSize` 限制 + 监控 Metaspace 曲线；若持续单调上涨基本就是类加载器泄漏，用 `jmap -clstats` 看类加载器统计。
+
+**④ 直接内存 `Direct buffer memory`（堆外内存，最隐蔽）**
+
+原理：`ByteBuffer.allocateDirect()` 申请的是**堆外（本地）内存**，不受 `-Xmx` 控制，由 `-XX:MaxDirectMemorySize` 限制。这块内存的释放依赖对应的 `DirectByteBuffer` 对象被 GC 后触发 Cleaner 回收——**问题就在这：堆外内存的命运绑在一个堆内小对象上**。如果堆内还很空、迟迟不触发 GC，堆外内存就一直不释放，越积越多直到爆。
+典型场景：Netty、NIO、RPC 框架（Thrift/gRPC）、Kafka 客户端大量用直接内存做零拷贝；高并发下 DirectBuffer 申请快于回收。
+排查：看 `Direct buffer memory` 字样；用 `-XX:MaxDirectMemorySize` 设上限让问题更早暴露；Netty 可开 `io.netty.leakDetection` 检测泄漏。
+
+**⑤ `Unable to create new native thread`（线程开爆）**
+
+原理：注意——**这个 OOM 跟堆没关系**。每创建一个 Java 线程，JVM 要向操作系统申请一块本地内存做线程栈（默认约 1MB，受 `-Xss` 控制）。当线程数过多时，要么**本地内存被线程栈吃光**，要么撞上**操作系统的线程数上限**（如 Linux `ulimit -u`、`pid_max`），就再也创建不出新线程。
+典型场景：每个请求 new 一个线程不复用、线程池配置无上限或 `newCachedThreadPool` 被打满、连接数暴涨各自起线程。一个反直觉现象：**堆调得越大，留给线程栈的本地内存反而越少**，所以盲目加 `-Xmx` 可能加剧此类 OOM。
+排查：`jstack` 看线程数和状态；查 `ulimit -u`；用有界线程池。
+
+**⑥ `Requested array size exceeds VM limit`（数组超限）**
+
+原理：代码申请了一个**长度超过 JVM 允许上限**的数组（通常接近 `Integer.MAX_VALUE`，约 21 亿）。即使堆足够大也会抛，因为这是 JVM 对单个数组长度的硬限制。
+典型场景：分页/批处理算错了 size、用户传入的长度未校验、`new byte[someHugeInt]`。
+排查：基本是代码 bug，定位那行数组分配即可，加长度校验。
+
+**⑦ `Out of swap space`（本地内存彻底枯竭）**
+
+原理：JVM 想向 OS 申请本地内存，但**物理内存 + 交换分区（swap）都满了**。多见于 JVM 本身（堆 + 元空间 + 直接内存 + 线程栈）加上同机其他进程，把整机内存挤干。
+典型场景：单机部署多个大内存 JVM、容器内存上限设置不当、直接内存/Native 内存泄漏拖垮整机。
+排查：看系统 `free`/`vmstat`，往往要从「整机内存预算」而非单个 JVM 角度排查。
+
+**⑧ 被系统 OOM Killer 杀（容器时代最坑，不是 JVM 抛的）**
+
+原理：这条严格说**不是 `OutOfMemoryError`**——进程根本来不及抛错就被干掉了。当**进程实际占用的物理内存超过宿主机/容器（cgroup）限制**，Linux 内核的 OOM Killer 会直接 `kill -9` 掉它。日志里看不到 Java 异常栈，只在 `dmesg`/系统日志里看到「Killed process」。
+典型场景：**K8s/Docker 里最高频**——`-Xmx` 设得和容器 limit 一样大，却忘了 JVM 还要额外占用元空间、直接内存、线程栈、JVM 自身开销，结果总内存超过 limit 被 cgroup 杀。表现为「Pod 莫名重启、Exit Code 137」却没有任何 OOM 堆栈。
+排查：`dmesg | grep -i kill`、看容器 Exit Code 137（=128+9）；解法是给 JVM 留出堆外余量（`-Xmx` 设为容器 limit 的 ~70%，或用 `-XX:MaxRAMPercentage`）。
+
+> **总结心法**：① 看到 OOM 先看冒号后那行文字，定位是哪一类；② **不是所有 OOM 都在堆**——元空间、直接内存、线程栈都是本地内存，加 `-Xmx` 不但没用反而可能更糟；③ 容器里「没堆栈的重启 + Exit 137」要第一时间怀疑被 OOM Killer 杀，根因是没给堆外内存留预算。一句话：**OOM 不等于堆满，更不等于内存泄漏——它可能是泄漏、可能是配置不匹配、也可能是一次性分配过猛。**
+
+</details>
+
 ### 考点 2：对象创建的完整过程 + 内存分配
 
 **面试官**：「`new 一个对象` 在 JVM 里经历了什么？」
