@@ -106,6 +106,10 @@ jstat -gcutil 12345 1000
 # 典型泄漏信号：O 一直接近 100%，FGC 频繁但回收不下去 → 内存被钉死了
 ```
 
+> 📷 **真实输出**（跑 `OOMDemo` 时的 `jstat -gcutil`）：可以看到 `O`（老年代）一路飙到接近 `100`、`FGC`（FullGC 次数）不停增长但内存压不下去——这就是典型的「内存被钉死、GC 救不回来」的泄漏信号。
+>
+> ![jstat-gcutil 真实输出：老年代逼近100、FGC频繁](https://github.com/user-attachments/assets/e16ea828-b02f-478f-bf85-478188174d3f)
+
 第三步，dump 堆快照（也可以等它自动 dump，但主动 dump 能在没崩之前抓现场）：
 
 ```bash
@@ -118,6 +122,16 @@ jmap -histo:live 12345 | head -20
 #  num   #instances  #bytes  class name
 #    1       1024     ...     [B            <-- byte[] 占了绝大部分，正好对上我们的泄漏
 ```
+
+> 📷 **真实输出**（跑 `OOMDemo` 时的 `jmap -histo:live`）：第一行 `[B`（即 `byte[]`，`[` 是数组、`B` 是 byte）就把堆吃光了，`#bytes` 是第二名的几千倍——一眼锁定「是 `byte[]` 在泄漏」。`#instances` 数量正好对应代码里 `new byte[1024*1024]` 被调用的次数（每个 1MB）。
+>
+> ![jmap-histo 真实输出1：byte数组占据绝大部分内存](https://github.com/user-attachments/assets/5988a716-8a41-457d-bf8d-657785b2f750)
+>
+> 换个进程再抓一次，结论一致——`[B` 以约 446MB（`467697016` 字节）、454 个实例稳居第一，第二名 `[C` 才 9 万字节，相差 5000 多倍：
+>
+> ![jmap-histo 真实输出2：byte数组 446MB-454个实例](https://github.com/user-attachments/assets/08b869cc-4155-496f-8016-a7a07676d582)
+>
+> **数组类型符号速记**：`[B`=`byte[]`、`[C`=`char[]`、`[I`=`int[]`、`[Ljava.lang.Object;`=`Object[]`（`[` 表数组，后面是元素类型）。
 
 第四步，分析 `heap.hprof`。**有图形界面**就用 MAT / JProfiler / VisualVM 打开：
 
