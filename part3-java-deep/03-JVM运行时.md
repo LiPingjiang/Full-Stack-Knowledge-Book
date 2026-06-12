@@ -306,7 +306,93 @@ graph BT
 
 ---
 
-## 五、给后端大脑的速查表
+## 五、反射机制与原理（深挖）
+
+类加载讲的是「类怎么进 JVM」，**反射（Reflection）讲的是「类进来之后，运行时怎么反过来读写它的结构」**——在不知道编译期类型的情况下，运行时动态地拿到一个类的字段、方法、构造器并操作它。Spring 的依赖注入、MyBatis 的 ORM 映射、Jackson/Gson 的序列化、JUnit 找 `@Test` 方法、各种注解处理，底层全靠它。它和类加载是一条线：**类加载把类的元数据放进方法区/元空间，反射就是运行时去读写这份元数据的 API。**
+
+### 反射的根：`Class` 对象从哪来
+
+每个类被加载后，JVM 会在**堆**里为它创建**唯一一个** `Class` 对象（注意：是堆，不是元空间——元空间存的是类的元数据本体，`Class` 对象是这份元数据在堆里的「Java 层入口/镜像」）。这个 `Class` 对象就是反射的总入口，所有反射操作都从它开始。拿到它有三条路：
+
+```java
+Class<?> c1 = String.class;                 // 编译期已知类型，最快
+Class<?> c2 = "hello".getClass();           // 已有实例，问它的运行时类型
+Class<?> c3 = Class.forName("java.lang.String"); // 只有全限定名字符串，运行时动态加载
+```
+
+> 三者拿到的是**同一个** `Class` 对象（`c1 == c2 == c3` 为 `true`）——呼应前面类加载讲的「每个类在每个类加载器下只加载一次」，`Class` 对象自然也唯一。`Class.forName` 最特殊：它能用一个**字符串**把类动态加载进来，这正是 JDBC 老写法 `Class.forName("com.mysql.jdbc.Driver")`、以及框架「按配置文件里的类名加载类」的基础。
+
+### 四大反射入口：拿到了 `Class`，能操作什么
+
+| 反射对象 | 从 Class 获取 | 能干什么 |
+|------|------|------|
+| `Field` | `getField` / `getDeclaredField` | 读写字段值（含 private） |
+| `Method` | `getMethod` / `getDeclaredMethod` | 调用方法（含 private） |
+| `Constructor` | `getConstructor` / `getDeclaredConstructor` | 创建实例 |
+| 注解 | `getAnnotation(s)` | 读取 `RUNTIME` 保留的注解 |
+
+```java
+Class<?> clazz = Class.forName("com.example.User");
+
+// ① 创建实例（替代 new）
+Object user = clazz.getDeclaredConstructor().newInstance();
+
+// ② 读写字段（哪怕是 private）
+Field nameField = clazz.getDeclaredField("name");
+nameField.setAccessible(true);          // 关键：突破访问控制
+nameField.set(user, "Alice");
+
+// ③ 调用方法（哪怕是 private）
+Method m = clazz.getDeclaredMethod("greet", String.class);
+m.setAccessible(true);
+Object ret = m.invoke(user, "world");   // 等价于 user.greet("world")
+```
+
+> **`getXxx` vs `getDeclaredXxx` 区别（高频考点）**：`getMethod` 只能拿到 **public**（含从父类继承的）；`getDeclaredMethod` 能拿到**本类声明的全部**（含 private/protected，但不含继承来的）。要碰 private 成员，必须用 `getDeclared*` + `setAccessible(true)`。
+
+### `setAccessible(true)` 为什么能「突破 private」
+
+`private` 是**编译期 + JVM 访问检查**层面的约束——正常调用时，编译器和 JVM 的访问控制会拦你。`setAccessible(true)` 做的是**关闭这一次反射调用的访问权限检查**（`AccessibleObject` 的 override 标志位置 true），于是 JVM 在 `invoke`/`set` 时跳过权限校验。所以反射能读写 private——它不是「破解」了 private，而是 JDK 官方留的、能合法绕过访问检查的口子（这也是框架能注入你 private 字段的原理）。
+
+> 注意：JDK 9 模块化（JPMS）后，跨模块对未 `opens` 的包做 `setAccessible` 会被拦（抛 `InaccessibleObjectException`），这是模块系统在收紧「反射无所不能」这件事。
+
+### 底层原理：`invoke` 到底怎么调到方法的
+
+这是 P6/P7 深度的追问点。反射调用方法**不是**简单地「按方法名查表然后跳过去」，它有一个**从慢到快的演化**：
+
+1. **前几次调用走 `NativeMethodAccessorImpl`**：通过 JNI 进入 JVM 本地代码完成调用。**慢**——因为要跨 Java/native 边界、要做参数打包/拆包、每次都查权限。
+2. **调用次数超过阈值（默认 15 次，`-Dsun.reflect.inflationThreshold`）后「膨胀（inflation）」**：JVM 在运行时**动态生成一个字节码类**（`GeneratedMethodAccessor`），用纯 Java 字节码直接调用目标方法，避开 JNI。之后走这个生成类，**快很多**（接近直接调用）。
+
+> 这解释了一个现象：**反射「冷调用」很慢，但被反复调用的反射会越来越快**——因为膨胀后变成了字节码直调。框架（如 Spring）正是靠「缓存 `Method`/`Field` 对象 + 反复调用触发膨胀」把反射开销摊薄到可接受。
+
+### 反射为什么慢、慢在哪、怎么优化
+
+慢的来源主要三块：① **每次 `getMethod`/`getField` 都会做安全检查并返回拷贝**（所以要缓存这些对象，别每次重新获取）；② **JNI/native 调用边界开销**（膨胀后缓解）；③ **参数的自动装箱与 `Object[]` 打包**（基本类型参数要装箱、变长参数要建数组）；④ **JIT 难以内联反射调用**，丢失了直接调用能做的内联/逃逸分析等优化。
+
+优化手段（按现代程度排）：
+
+- **缓存 `Class`/`Method`/`Field` 对象**：最基础也最有效，避免重复查找。
+- **`setAccessible(true)` 一次后复用**：省掉重复权限检查。
+- **`MethodHandle`（JDK 7+）**：比传统反射更快的方法句柄，JIT 更易优化，是反射的「现代替代」。
+- **`VarHandle`（JDK 9+）**：针对字段/数组的高性能、带内存语义的访问。
+- **`LambdaMetafactory` / 动态生成代码**：把反射调用「编译」成等价的直接调用，框架级优化（如高性能序列化库）。
+- **彻底避开运行时反射**：用**注解处理器（APT）在编译期生成代码**（如 Dagger、MapStruct）——零运行时反射开销，这是 Android/GraalVM 生态的主流方向。
+
+> **对 GraalVM Native Image 的影响（加分项）**：Native Image 在编译期做封闭世界假设、提前编译，**运行时无法动态加载未知类**，所以所有反射目标必须在编译期通过 `reflect-config.json` 声明注册。这就是「重反射的框架在 Native Image 下容易踩坑」的根因，也是 Spring Native/Quarkus 推动「编译期处理替代运行时反射」的动力。
+
+### 典型应用场景（理解了原理才知道框架在干嘛）
+
+- **Spring IoC/DI**：扫描类、读注解、反射 `newInstance` 创建 Bean、反射 `set` 注入字段。
+- **MyBatis/JPA**：把数据库行的列值反射 `set` 进实体对象字段。
+- **Jackson/Gson/fastjson**：序列化时反射读所有字段值，反序列化时反射 `set` 回去（呼应前面：泛型擦除后用 `TypeToken` 锚住泛型）。
+- **JUnit/TestNG**：反射扫描带 `@Test` 的方法并 `invoke`。
+- **动态代理**：`Proxy.newProxyInstance` + `InvocationHandler.invoke`，AOP 的基础之一。
+
+> 一句话总结：**反射 = 运行时读写类元数据的能力，根在每个类唯一的 `Class` 对象；它能突破 private 是靠 `setAccessible` 关检查；它"先慢后快"是因为调用到一定次数会膨胀成字节码直调；现代趋势是用 `MethodHandle`/编译期代码生成替代它以换取性能和 Native Image 兼容性。**
+
+---
+
+## 六、给后端大脑的速查表
 
 | 概念 | 一句话本质 | 实战意义 |
 |------|-----------|---------|
@@ -319,7 +405,7 @@ graph BT
 
 ---
 
-## 六、面试深度剖析：大厂高频考点
+## 七、面试深度剖析：大厂高频考点
 
 > JVM 是大厂面试的「硬通货」，尤其考察**线上问题排查能力**——这正是区分「背过八股」和「真扛过线上事故」的地方。下面按高频考点的追问链展开。
 
