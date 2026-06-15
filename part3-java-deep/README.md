@@ -30,12 +30,14 @@ graph TD
     A --> D[3.3 JVM 运行时<br/>内存结构/GC/类加载]
     A --> E[3.4 类型系统<br/>泛型/类型擦除]
     A --> F[3.5 异常体系<br/>受检/非受检/最佳实践]
+    A --> H[3.6 网络 IO 模型<br/>BIO/NIO/AIO/Reactor]
 
     B -.为第四章并发对比筑基.-> G[第四章 多语言对比]
     C -.为内存模型对比筑基.-> G
     D -.为运行时对比筑基.-> G
     E -.为类型系统对比筑基.-> G
     F -.为错误处理对比筑基.-> G
+    H -.为并发/IO 模型对比筑基.-> G
 
     style A fill:#e1f5ff
     style G fill:#fff4e1
@@ -56,6 +58,8 @@ graph TD
 **[3.4 Java 类型系统](./04-类型系统.md)** —— 泛型到底是什么、类型擦除的真相与坑、协变逆变。呼应 [1.3 类型光谱](../part1-mindset-shift/03-从强类型到类型光谱.md)，并为对比 TS/Rust 类型系统筑基。*面试剖析覆盖：反射突破类型擦除、桥接方法、自动装箱与 Integer 缓存池、String 不可变与常量池/intern、equals 与 hashCode 契约。*
 
 **[3.5 Java 异常体系](./05-异常体系.md)** —— 受检异常 vs 非受检异常的设计哲学与争议、异常最佳实践。这是后面对比 Go 的 `error` 返回值、Rust 的 `Result`、JS 的 `try/catch` 的基准。*面试剖析覆盖：finally 与 return 执行顺序、try-with-resources 编译原理与抑制异常、异常性能开销、Spring 全局异常处理与事务回滚、异常链与日志规范。*
+
+**[3.6 Java 网络 IO 模型](./06-网络IO模型.md)** —— 从 BIO（一连接一线程）到 NIO（Selector + epoll 多路复用）再到 AIO，讲透网络 IO 的两阶段本质、Reactor 模式、回调地狱，以及虚拟线程如何「用同步写法拿异步吞吐」。这是理解 Netty、Node 事件循环的共同地基。*面试剖析覆盖：BIO/NIO/AIO 区别、select/poll/epoll、零拷贝、为何需要 Netty。*
 
 ---
 

@@ -32,9 +32,9 @@
 
 **③ 所以真正「对应 Node 形态」的，是 NIO 之上的框架。** 因为裸写 NIO Selector 太痛苦，Java 生态把它封装成了框架——最典型的是 **Netty**：它的 `EventLoopGroup`/`EventLoop` 几乎就是 Node EventLoop 的 Java 翻版（一个线程绑定多个 Channel、事件驱动、回调式 Handler 链）。Spring WebFlux、Vert.x 也是这一脉。**可以说：Node 默认就给你的，Java 要靠 Netty 这类框架才能得到。**
 
-**④ 但 Java 还有另一条路：虚拟线程（JDK 21）。** Node 解决「异步麻烦」只有一招——async/await。Java 则在 Reactor 之外又给了第二条路：**虚拟线程**让你用「同步阻塞」的写法（`read()` 直接阻塞），底层 JVM 自动把阻塞的虚拟线程从 OS 线程上卸载，效果上达到 NIO 的高并发。相当于**「用同步的代码长相，拿到异步的吞吐」**——恰好是 Node 回调地狱的反面解法。
+**④ 但 Java 还有另一条路：虚拟线程（JDK 21）。** Node 解决「异步麻烦」只有一招——async/await。Java 则在 Reactor 之外又给了第二条路：**虚拟线程**让你用「同步阻塞」的写法（`read()` 直接阻塞），底层 JVM 自动把阻塞的虚拟线程从 OS 线程上卸载，效果上达到 NIO 的高并发。相当于**「用同步的代码长相，拿到异步的吞吐」**——恰好是 Node [回调地狱](../part3-java-deep/06-网络IO模型.md#六回调地狱异步模型绕不开的痛以及-java-怎么躲过它)的反面解法。
 
-> **一图总结**：OS 底层两者用的是同一套 epoll/kqueue；分歧在上层——Node 选了「单线程 EventLoop + async/await」作为唯一形态；Java 默认给你阻塞 BIO，要 Reactor 得用 Netty，或者干脆用虚拟线程「用同步写法拿异步吞吐」。详见 [3.1 并发体系](../part3-java-deep/01-并发体系.md)。
+> **一图总结**：OS 底层两者用的是同一套 epoll/kqueue；分歧在上层——Node 选了「单线程 EventLoop + async/await」作为唯一形态；Java 默认给你阻塞 BIO，要 Reactor 得用 Netty，或者干脆用虚拟线程「用同步写法拿异步吞吐」。BIO/NIO/AIO/Reactor/Netty 的完整拆解，见 [3.6 Java 网络 IO 模型](../part3-java-deep/06-网络IO模型.md)；虚拟线程见 [3.1 并发体系](../part3-java-deep/01-并发体系.md)。
 
 </details>
 
