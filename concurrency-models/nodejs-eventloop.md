@@ -14,6 +14,30 @@
 
 类比 Java：就像你不在业务线程里 `socket.read()` 死等，而是全用 NIO 的 `Selector` + 回调。Node 把这套「Reactor 模式」做成了语言的默认形态。
 
+<details>
+<summary><b>展开：那「对应的 Java 形态」到底是什么？</b></summary>
+
+一句话：**Node 的「单线程 EventLoop + Reactor」，对应的就是 Java NIO 的 `Selector` + 事件循环——只不过 Java 把它当成「需要你手动搭的高级工具」，而 Node 把它当成「语言唯一形态」。**
+
+**① 底层是同一套东西。** Node 的 EventLoop 底层是 libuv，封装了 OS 的 `epoll`(Linux)/`kqueue`(macOS)/IOCP(Windows)；Java NIO 的 `Selector` 封装的是**完全相同**的 `epoll`/`kqueue`。从操作系统视角看，两者就是同一个机制：一个线程用 `select()` 同时盯着上万个 fd，谁就绪处理谁。这就是 **Reactor 模式**。
+
+**② 区别在「谁是默认形态」。** 这才是关键差异：
+
+| | Node | Java |
+|---|------|------|
+| 语言默认形态 | **单线程 EventLoop（强制）**，你写的代码默认就跑在循环里 | **「一连接一线程」的阻塞 BIO**（`new Thread` + `inputStream.read()` 死等） |
+| Reactor 怎么来 | 内置，唯一姿势 | NIO Selector 是 JDK 1.4 才补的**可选 API**，要手写 `Selector.open()`、注册 `SelectionKey`、自己写分发循环（很繁琐） |
+
+换句话说：你在 Java 里**默认拿到的是 BIO**，想要 Node 那种事件循环，得自己切换到 NIO 并手动搭。
+
+**③ 所以真正「对应 Node 形态」的，是 NIO 之上的框架。** 因为裸写 NIO Selector 太痛苦，Java 生态把它封装成了框架——最典型的是 **Netty**：它的 `EventLoopGroup`/`EventLoop` 几乎就是 Node EventLoop 的 Java 翻版（一个线程绑定多个 Channel、事件驱动、回调式 Handler 链）。Spring WebFlux、Vert.x 也是这一脉。**可以说：Node 默认就给你的，Java 要靠 Netty 这类框架才能得到。**
+
+**④ 但 Java 还有另一条路：虚拟线程（JDK 21）。** Node 解决「异步麻烦」只有一招——async/await。Java 则在 Reactor 之外又给了第二条路：**虚拟线程**让你用「同步阻塞」的写法（`read()` 直接阻塞），底层 JVM 自动把阻塞的虚拟线程从 OS 线程上卸载，效果上达到 NIO 的高并发。相当于**「用同步的代码长相，拿到异步的吞吐」**——恰好是 Node 回调地狱的反面解法。
+
+> **一图总结**：OS 底层两者用的是同一套 epoll/kqueue；分歧在上层——Node 选了「单线程 EventLoop + async/await」作为唯一形态；Java 默认给你阻塞 BIO，要 Reactor 得用 Netty，或者干脆用虚拟线程「用同步写法拿异步吞吐」。详见 [3.1 并发体系](../part3-java-deep/01-并发体系.md)。
+
+</details>
+
 ---
 
 ## 二、libuv：Node 的并发引擎
