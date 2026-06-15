@@ -39,6 +39,24 @@ graph TD
 - **轻量协程 + 自动让出**：Java 虚拟线程、Go goroutine。你写同步代码，运行时自动在阻塞时切换。体验最好。
 - **事件循环 + 显式 await**：Rust async、Node、Python asyncio。你显式标注让出点（`await`），由事件循环调度。
 
+### 别把它们当成平级的竞品——它们其实分属不同层次
+
+很多人会把 `epoll`、Reactor、NIO、goroutine、虚拟线程并排放在一起比较，但**它们根本不在同一层**。一张表理清「谁在谁之上」：
+
+| 层次 | 代表 | 是什么 | 类比 |
+|------|------|--------|------|
+| ① 操作系统能力 | epoll / kqueue / IOCP | 内核提供的 IO 多路复用系统调用 | 地基 |
+| ② 语言/库封装 | Java NIO 的 Selector、libuv | 把 ① 包装成跨平台的 API | 砖 |
+| ③ 设计模式 | Reactor / Proactor | 「事件来了就分发回调」的架构图纸 | 图纸 |
+| ④ 编程模型 | goroutine、虚拟线程、async/await | 给业务开发者的最终写法 | 装修好的房子 |
+
+**关键结论：底层全是同一套 epoll**（这就是为什么各语言高并发性能能拉到同一量级）；真正的分水岭在第 ④ 层的「写法」：
+
+- **暴露异步**（NIO、Reactor、Node、Rust/Python async）：把「异步」摆到台面上，你要写回调或 `await`，伴随回调地狱与[函数染色](./java-thread-and-virtual-thread.md)。
+- **隐藏异步**（goroutine、虚拟线程）：把「异步」藏进运行时，你照常写同步代码，零 `async` 关键字、零染色。
+
+> 一句话记忆：**epoll 是同一块地基，Reactor 是图纸，NIO 是砖，goroutine/虚拟线程是装修好的房子。** 之所以体验天差地别，差别只在「最上面那层把异步藏没藏起来」。
+
 ---
 
 ## 各篇导读
