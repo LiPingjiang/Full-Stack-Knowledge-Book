@@ -74,6 +74,15 @@ flowchart LR
 - [3.3 JVM 运行时：内存结构 / GC / 类加载](./part3-java-deep/03-JVM运行时.md)
 - [3.4 Java 类型系统：泛型 / 类型擦除 / 型变](./part3-java-deep/04-类型系统.md)
 - [3.5 Java 异常体系：受检 / 非受检异常的设计哲学](./part3-java-deep/05-异常体系.md)
+- [3.6 Java 网络 IO 模型：BIO / NIO / Reactor / Netty](./part3-java-deep/06-网络IO模型.md)
+- [3.7 高可用架构：限流 / 熔断 / 降级 / 幂等 / 容灾](./part3-java-deep/07-高可用架构.md)
+- [3.8 缓存与 Redis：穿透 / 击穿 / 雪崩 / 一致性 / 淘汰](./part3-java-deep/08-缓存与Redis.md)
+- [3.9 数据库 MySQL：索引 / 事务 MVCC / 锁 / 分库分表](./part3-java-deep/09-数据库MySQL.md)
+- [3.10 分布式理论与一致性：CAP / BASE / Raft / Paxos](./part3-java-deep/10-分布式理论与一致性.md)
+- [3.11 分布式事务：2PC / TCC / Saga / 本地消息表](./part3-java-deep/11-分布式事务.md)
+- [3.12 消息队列：Kafka / RocketMQ / 可靠投递 / 幂等消费](./part3-java-deep/12-消息队列.md)
+- [3.13 Spring 全家桶：IOC / AOP / Boot 自动配置 / Cloud](./part3-java-deep/13-Spring全家桶.md)
+- [3.14 微服务治理与分布式锁：注册发现 / 分布式锁 / 链路追踪](./part3-java-deep/14-微服务与分布式锁.md)
 
 ### 第四章 · 核心场景的多语言对比与讲解 〔核心重点 ②〕
 
