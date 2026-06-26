@@ -39,6 +39,7 @@ graph TD
     A --> N[3.12 消息队列<br/>Kafka/RocketMQ]
     A --> O[3.13 Spring 全家桶<br/>IOC/AOP/Boot/Cloud]
     A --> P[3.14 微服务与分布式锁<br/>注册发现/锁/链路追踪]
+    A --> R[附录 A1 核心数据结构<br/>跳表/红黑树/布隆过滤器]
 
     B -.为第四章并发对比筑基.-> G[第四章 多语言对比]
     C -.为内存模型对比筑基.-> G
@@ -94,6 +95,8 @@ graph TD
 **[3.13 Spring 全家桶](./13-Spring全家桶.md)** —— 为什么 Java 后端绕不开它。IOC 容器与依赖注入、AOP 原理（JDK 动态代理 vs CGLIB）、Bean 生命周期、Spring Boot 自动配置原理（spring.factories + 条件装配）、Spring MVC 请求处理流程、Spring Cloud 核心组件选型。*面试剖析覆盖：循环依赖三级缓存、@Transactional 失效场景、BeanPostProcessor 时机。*
 
 **[3.14 微服务治理与分布式锁](./14-微服务与分布式锁.md)** —— 从单体到微服务后多出来的麻烦。服务注册与发现、配置中心、分布式锁三种实现（Redis/ZooKeeper/MySQL）、链路追踪、服务网关、服务间通信选型。*面试剖析覆盖：Redis 分布式锁主从切换丢锁/RedLock 争议、Redisson 看门狗、ZK 临时顺序节点。*
+
+**[附录 A1：核心数据结构原理](./A1-核心数据结构原理.md)** —— 跳表、红黑树、布隆过滤器、一致性 Hash——这些被多个章节引用的通用数据结构集中讲透。结构图解、插入/查找过程、复杂度对比、变体与参数设计、Java/Redis 实战用法，面试时任何场景问到都能从容作答。
 
 ---
 
