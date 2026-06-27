@@ -83,7 +83,8 @@ flowchart LR
 - [3.12 消息队列：Kafka / RocketMQ / 可靠投递 / 幂等消费](./part3-java-deep/12-消息队列.md)
 - [3.13 Spring 全家桶：IOC / AOP / Boot 自动配置 / Cloud](./part3-java-deep/13-Spring全家桶.md)
 - [3.14 微服务治理与分布式锁：注册发现 / 分布式锁 / 链路追踪](./part3-java-deep/14-微服务与分布式锁.md)
-- [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash](./part3-java-deep/A1-核心数据结构原理.md)
+- [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash / HashMap / B+ 树](./part3-java-deep/A1-核心数据结构原理.md)
+- [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
 
 ### 第四章 · 核心场景的多语言对比与讲解 〔核心重点 ②〕
 

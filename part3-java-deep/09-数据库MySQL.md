@@ -59,15 +59,130 @@ B+ 树的三大优势：
 | 类型 | 叶子节点存什么 | 特点 |
 |------|--------------|------|
 | **聚簇索引**（主键索引） | 整行数据 | 数据和索引存在一起，一张表只能有一个 |
-| **非聚簇索引**（二级索引） | 主键值 | 查到主键后还要**回表**去聚簇索引取完整行 |
+| **非聚簇索引**（二级索引） | 主键值 | 查到主键后还要**回表（Index Lookup / Bookmark Lookup）**去聚簇索引取完整行 |
 
-**回表**：二级索引找到主键 → 拿着主键去聚簇索引再查一次 → 得到完整行。这就是为什么二级索引查询比主键查询慢。
+**回表（Index Lookup / Bookmark Lookup）**：二级索引找到主键 → 拿着主键去聚簇索引再查一次 → 得到完整行。这就是为什么二级索引查询比主键查询慢。
 
 ```sql
 -- 假设 name 上有索引
 SELECT * FROM user WHERE name = '张三';
 -- 流程：name 索引树 → 找到 id=5 → 回表到聚簇索引 → 拿到整行
 ```
+
+<details>
+<summary><b>展开：聚簇索引 vs 非聚簇索引——实际例子与图解</b></summary>
+
+假设有一张 `user` 表：
+
+```sql
+CREATE TABLE user (
+    id    INT PRIMARY KEY,
+    name  VARCHAR(50),
+    age   INT,
+    email VARCHAR(100),
+    INDEX idx_name (name),
+    INDEX idx_name_age (name, age)
+);
+```
+
+#### 1. 聚簇索引 vs 二级索引的 B+ 树结构差异
+
+```mermaid
+graph TD
+    subgraph 聚簇索引 - 主键 id
+        A1["根节点<br/>[3 | 7]"]
+        A2["[1 | 2 | 3]"]
+        A3["[4 | 5 | 7]"]
+        A4["叶子: id=1<br/>整行: (1, 李四, 28, li@mail)"]
+        A5["叶子: id=2<br/>整行: (2, 王五, 35, wang@mail)"]
+        A6["叶子: id=3<br/>整行: (3, 赵六, 22, zhao@mail)"]
+        A7["叶子: id=4<br/>整行: (4, 孙七, 30, sun@mail)"]
+        A8["叶子: id=5<br/>整行: (5, 张三, 25, zhang@mail)"]
+        A9["叶子: id=7<br/>整行: (7, 周八, 40, zhou@mail)"]
+        A1 --> A2
+        A1 --> A3
+        A2 --> A4
+        A2 --> A5
+        A2 --> A6
+        A3 --> A7
+        A3 --> A8
+        A3 --> A9
+    end
+
+    subgraph 二级索引 - idx_name
+        B1["根节点<br/>[李 | 张]"]
+        B2["[李四 | 王五]"]
+        B3["[张三 | 赵六 | 周八]"]
+        B4["叶子: name=李四<br/>主键 id=1"]
+        B5["叶子: name=王五<br/>主键 id=2"]
+        B6["叶子: name=张三<br/>主键 id=5"]
+        B7["叶子: name=赵六<br/>主键 id=3"]
+        B8["叶子: name=周八<br/>主键 id=7"]
+        B1 --> B2
+        B1 --> B3
+        B2 --> B4
+        B2 --> B5
+        B3 --> B6
+        B3 --> B7
+        B3 --> B8
+    end
+```
+
+**关键区别**：聚簇索引的叶子节点存储**完整行数据**，二级索引的叶子节点只存储**主键 id 值**。
+
+#### 2. 回表过程图解
+
+执行 `SELECT * FROM user WHERE name = '张三'` 时：
+
+```mermaid
+flowchart LR
+    A["SQL: WHERE name='张三'"] --> B["① 查 name 二级索引树"]
+    B --> C["找到叶子节点<br/>name=张三 → id=5"]
+    C --> D["② 拿 id=5 回表<br/>去聚簇索引树"]
+    D --> E["在聚簇索引中<br/>查找 id=5"]
+    E --> F["③ 取到完整行<br/>(5, 张三, 25, zhang@mail)"]
+
+    style A fill:#f9f,stroke:#333
+    style C fill:#ff9,stroke:#333
+    style F fill:#9f9,stroke:#333
+```
+
+回表 = **两次 B+ 树查找**：先查二级索引拿到主键，再查聚簇索引拿到整行。
+
+#### 3. 覆盖索引避免回表的对比
+
+```sql
+-- 场景 A：需要回表（SELECT * 要的字段超出索引范围）
+SELECT * FROM user WHERE name = '张三';
+-- name 索引只存了 (name, id)，要 age/email 必须回表
+
+-- 场景 B：覆盖索引，不需要回表
+SELECT name, age FROM user WHERE name = '张三';
+-- 联合索引 idx_name_age(name, age) 已经包含了 name 和 age
+-- 直接从索引返回，EXPLAIN Extra 显示 "Using index"
+```
+
+```mermaid
+flowchart LR
+    subgraph 需要回表
+        X1["WHERE name='张三'<br/>SELECT *"] --> X2["name 索引<br/>→ id=5"]
+        X2 --> X3["回表查聚簇索引<br/>→ 整行"]
+    end
+
+    subgraph 覆盖索引 - 不回表
+        Y1["WHERE name='张三'<br/>SELECT name, age"] --> Y2["idx_name_age 索引<br/>→ (张三, 25)"]
+        Y2 --> Y3["直接返回 ✅<br/>无需回表"]
+    end
+
+    style X3 fill:#f99,stroke:#333
+    style Y3 fill:#9f9,stroke:#333
+```
+
+#### 一句话总结
+
+> 聚簇索引 = 新华字典正文（按拼音排的内容本身），二级索引 = 部首目录（查到拼音/页码后还要翻到正文去看）。
+
+</details>
 
 ### 2.3 联合索引 + 最左前缀原则
 
