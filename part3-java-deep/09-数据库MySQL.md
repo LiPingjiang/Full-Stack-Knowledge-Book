@@ -551,15 +551,38 @@ redo log 和 binlog 是两个独立的日志系统（一个在引擎层，一个
 
 ```mermaid
 sequenceDiagram
-    participant 事务 as 事务
+    participant Client as 客户端
+    participant Server as MySQL Server 层
+    participant Engine as InnoDB 引擎层
+    participant Buffer as Buffer Pool<br/>(内存数据页)
+    participant Undo as undo log
     participant Redo as redo log
     participant Bin as binlog
 
-    事务->>Redo: 1. 写 redo log（标记为 prepare）
-    事务->>Bin: 2. 写 binlog
-    事务->>Redo: 3. 提交：redo log 标记为 commit
-    Note over Redo,Bin: 三步完成 = 事务提交成功
+    Client->>Server: UPDATE account SET balance=900 WHERE id=1
+
+    rect rgb(240, 248, 255)
+    Note over Server,Undo: ── 执行阶段（事务提交之前） ──
+    Server->>Engine: 调用引擎接口执行修改
+    Engine->>Undo: ① 写 undo log（旧值 balance=1000）
+    Engine->>Buffer: ② 修改内存中的数据页（balance→900）
+    Engine->>Redo: ③ 写 redo log 到 log buffer（内存）
+    Note over Buffer: 此时内存中数据已改，但磁盘数据页还是旧的
+    end
+
+    rect rgb(255, 248, 240)
+    Note over Server,Bin: ── 两阶段提交（事务提交时） ──
+    Engine->>Redo: ④ redo log 刷盘，标记为 prepare
+    Server->>Bin: ⑤ 写 binlog 并刷盘
+    Engine->>Redo: ⑥ redo log 标记为 commit
+    Note over Redo,Bin: ④⑤⑥ 全部完成 = 事务提交成功
+    end
+
+    Redo-->>Client: 返回"提交成功"
+    Note over Buffer: 脏页由后台线程异步刷到磁盘
 ```
+
+> **关键时序**：SQL 语句在两阶段提交**之前**就已经执行完了——内存中的数据页已经改好，undo log 也已写好。两阶段提交解决的不是"数据有没有改"，而是"crash 之后这个事务算提交还是没提交"。内存中的修改是随时可通过 undo log 撤销的草稿，只有 redo log commit + binlog 都落盘了，事务才算板上钉钉。
 
 crash 恢复时的判断逻辑：
 
