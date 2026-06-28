@@ -54,12 +54,12 @@ B+ 树的三大优势：
 
 > B+ 树的结构图解、与 B 树/红黑树/跳表/Hash 的对比、查找过程演示、以及常见树结构总览（BST/AVL/红黑树/B树/B+树/跳表/Trie/堆）见 **[附录 A1：核心数据结构原理](./A1-核心数据结构原理.md)**
 
-### 2.2 聚簇索引 vs 非聚簇索引
+### 2.2 聚簇索引（Clustered Index） vs 非聚簇索引（Non-Clustered Index / Secondary Index）
 
 | 类型 | 叶子节点存什么 | 特点 |
 |------|--------------|------|
-| **聚簇索引**（主键索引） | 整行数据 | 数据和索引存在一起，一张表只能有一个 |
-| **非聚簇索引**（二级索引） | 主键值 | 查到主键后还要**回表（Index Lookup / Bookmark Lookup）**去聚簇索引取完整行 |
+| **聚簇索引（Clustered Index）**，也叫主键索引（Primary Index） | 整行数据 | 数据和索引存在一起，一张表只能有一个 |
+| **非聚簇索引（Secondary Index）**，也叫二级索引 | 主键值 | 查到主键后还要**回表（Index Lookup / Bookmark Lookup）**去聚簇索引取完整行 |
 
 **回表（Index Lookup / Bookmark Lookup）**：二级索引找到主键 → 拿着主键去聚簇索引再查一次 → 得到完整行。这就是为什么二级索引查询比主键查询慢。
 
@@ -70,7 +70,7 @@ SELECT * FROM user WHERE name = '张三';
 ```
 
 <details>
-<summary><b>展开：聚簇索引 vs 非聚簇索引——实际例子与图解</b></summary>
+<summary><b>展开：聚簇索引（Clustered Index） vs 非聚簇索引（Secondary Index）——实际例子与图解</b></summary>
 
 假设有一张 `user` 表：
 
