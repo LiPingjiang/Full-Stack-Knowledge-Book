@@ -631,13 +631,48 @@ flowchart TD
 <details>
 <summary><b>展开：面试追问「为什么需要两阶段提交？不用会怎样？」</b></summary>
 
-假设不用两阶段提交，只按顺序写两个日志：
+**如果不用两阶段提交，只按顺序写两个日志，无论谁先谁后都会出问题：**
 
-**先写 redo log 再写 binlog**：redo log 写完、binlog 没写完时 crash → 主库用 redo log 恢复了数据，但从库用 binlog 同步时少了这条变更 → **主从不一致**。
+**先写 redo log 再写 binlog**：redo log 写完、binlog 没写完时 crash → 主库用 redo log 恢复了数据（balance=900），但从库用 binlog 同步时少了这条变更（balance 还是 1000）→ **主从不一致**。
 
-**先写 binlog 再写 redo log**：binlog 写完、redo log 没写完时 crash → 主库重启后数据丢失（redo log 没记录），但从库已经同步了 binlog → **主从不一致**。
+**先写 binlog 再写 redo log**：binlog 写完、redo log 没写完时 crash → 主库重启后数据丢失（redo log 没记录，balance 还是 1000），但从库已经同步了 binlog（balance=900）→ **主从不一致**。
 
-两阶段提交就是用 redo log 的 prepare/commit 状态来和 binlog 形成"原子绑定"——要么都算提交，要么都算没提交，永远不会出现一个有一个没有的情况。
+所以必须引入两阶段提交，用 redo log 的 prepare/commit 状态把两份日志"原子绑定"。下面逐一分析两阶段提交下，**每个步骤 crash 后会怎样处理**：
+
+**场景一：阶段一（改内存）执行过程中 crash**
+
+redo log 还在 log buffer（内存），什么都没落盘。重启后内存全部丢失，redo log 没有任何记录，binlog 也没有 → **事务自动消失，无需处理**。Buffer Pool 中改过的脏页也随内存一起丢了，磁盘上的数据还是旧的。
+
+**场景二：④ redo log prepare 写了一半 crash（prepare 不完整）**
+
+重启后扫描 redo log，发现这条日志不完整（校验和不对）→ **直接丢弃，等同于事务没发生**。binlog 也没写，主从一致。
+
+**场景三：④ redo log prepare 写完，⑤ binlog 还没写就 crash**
+
+重启后扫描 redo log，发现 state=PREPARE → 去查 binlog，找不到对应的 XID → **回滚事务**（用 undo log 撤销内存中的修改）。主库数据回到旧值，从库的 binlog 里也没有这条变更 → **主从一致** ✅
+
+**场景四：④ redo log prepare 写完，⑤ binlog 写了一半 crash（binlog 不完整）**
+
+重启后扫描 redo log，发现 state=PREPARE → 去查 binlog，发现有记录但不完整（校验和/长度不对）→ **回滚事务**。效果同场景三 → **主从一致** ✅
+
+**场景五：④ redo log prepare 写完，⑤ binlog 完整写完，⑥ redo log commit 还没写就 crash**
+
+重启后扫描 redo log，发现 state=PREPARE → 去查 binlog，发现有完整的对应 XID → **补提交事务**（把 redo log 标记为 COMMIT）。为什么敢补提交？因为 binlog 已经完整落盘了，从库可能已经同步了这条变更，如果主库回滚就会造成主从不一致。所以此时必须提交 → **主从一致** ✅
+
+**场景六：⑥ redo log commit 写完（全部完成）**
+
+事务已提交，一切正常。即使此时 crash，重启后扫描 redo log 发现 state=COMMIT → **无需任何处理** ✅
+
+| crash 时机 | redo log 状态 | binlog 状态 | 恢复策略 | 结果 |
+|-----------|--------------|------------|---------|------|
+| 阶段一执行中 | 不存在（还在内存） | 不存在 | 无需处理 | 事务消失 |
+| ④ prepare 写一半 | 不完整 | 不存在 | 丢弃 | 事务消失 |
+| ④ prepare 写完 | PREPARE | 不存在 | **回滚** | 主从一致 |
+| ⑤ binlog 写一半 | PREPARE | 不完整 | **回滚** | 主从一致 |
+| ⑤ binlog 写完 | PREPARE | 完整 | **补提交** | 主从一致 |
+| ⑥ commit 写完 | COMMIT | 完整 | 无需处理 | 正常 |
+
+> 可以看到，不管在哪个步骤 crash，两阶段提交都能保证 redo log 和 binlog 的逻辑一致——要么都算提交，要么都算没提交。这就是引入 prepare 状态的价值：它给了恢复程序一个"中间判断点"，让系统可以根据 binlog 是否完整来做最终裁决。
 
 </details>
 
