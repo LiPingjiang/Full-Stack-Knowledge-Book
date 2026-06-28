@@ -8,17 +8,17 @@
 
 先建立一张地图：Spring 不是单一框架，而是一组**从底层容器到上层微服务**的分层体系。
 
-```
-┌──────────────────────────────────────────────────────┐
-│                  Spring Cloud                         │
-│   (微服务组件集：注册发现/配置中心/网关/熔断…)         │
-├──────────────────────────────────────────────────────┤
-│                  Spring Boot                          │
-│   (自动配置 + Starter 机制，让你开箱即用)              │
-├──────────────────────────────────────────────────────┤
-│               Spring Framework                        │
-│   (IOC 容器 + AOP + MVC + 事务管理 … 最底层基石)      │
-└──────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["Spring Cloud<br/>微服务组件集：注册发现 / 配置中心 / 网关 / 熔断"]
+    B["Spring Boot<br/>自动配置 + Starter 机制，开箱即用"]
+    C["Spring Framework<br/>IOC 容器 + AOP + MVC + 事务管理（最底层基石）"]
+
+    A -->|基于| B -->|基于| C
+
+    style A fill:#e1f5fe,stroke:#0288d1
+    style B fill:#e8f5e9,stroke:#388e3c
+    style C fill:#fff3e0,stroke:#f57c00
 ```
 
 | 层级 | 解决什么问题 | 一句话 |
@@ -166,14 +166,23 @@ public class OrderService {
 
 AOP 的思路：把横切逻辑**抽到切面里**，运行时自动织入目标方法，业务代码不感知。
 
-```
-横切关注点示例：
-┌─────────────┐
-│ 日志打印     │  ← 每个方法都要记
-│ 事务管理     │  ← 方法开始开事务，结束提交/回滚
-│ 权限校验     │  ← 调用前检查
-│ 性能监控     │  ← 计时
-└─────────────┘
+```mermaid
+flowchart LR
+    subgraph 横切关注点
+        L["日志打印<br/>每个方法都要记"]
+        T["事务管理<br/>方法开始开事务，结束提交/回滚"]
+        P["权限校验<br/>调用前检查"]
+        M["性能监控<br/>计时"]
+    end
+
+    S1["ServiceA.method()"] -.-> L & T & P & M
+    S2["ServiceB.method()"] -.-> L & T & P & M
+    S3["ServiceC.method()"] -.-> L & T & P & M
+
+    style L fill:#fff3e0,stroke:#f57c00
+    style T fill:#fff3e0,stroke:#f57c00
+    style P fill:#fff3e0,stroke:#f57c00
+    style M fill:#fff3e0,stroke:#f57c00
 ```
 
 ### 3.2 核心概念
@@ -435,25 +444,27 @@ ViewResolver（视图解析，前后端分离时直接返回 JSON）
 <details>
 <summary><b>展开：微服务选型决策树（国内 Java 后端）</b></summary>
 
-```
-需要注册中心？
-  ├── 已有 ZooKeeper 且不想换 → ZK + Dubbo 体系
-  └── 新项目 → Nacos（注册 + 配置一站式）
+```mermaid
+flowchart TD
+    R["注册中心？"] -->|已有 ZK 且不想换| R1["ZK + Dubbo 体系"]
+    R -->|新项目| R2["Nacos（注册 + 配置一站式）"]
 
-需要网关？
-  └── Spring Cloud Gateway（不要再用 Zuul 1.x）
+    G["网关？"] --> G1["Spring Cloud Gateway<br/>（不要再用 Zuul 1.x）"]
 
-熔断限流？
-  ├── 简单场景 → Resilience4j（轻量、函数式）
-  └── 需要控制台 + 规则动态推送 → Sentinel
+    F["熔断限流？"] -->|简单场景| F1["Resilience4j（轻量、函数式）"]
+    F -->|需要控制台 + 动态推送| F2["Sentinel"]
 
-链路追踪？
-  ├── 已有基础设施 → SkyWalking（字节码增强，无侵入）
-  └── Spring 生态优先 → Micrometer Tracing + Zipkin
+    T["链路追踪？"] -->|已有基础设施| T1["SkyWalking（字节码增强，无侵入）"]
+    T -->|Spring 生态优先| T2["Micrometer Tracing + Zipkin"]
 
-远程调用？
-  ├── Spring Cloud 体系 → OpenFeign
-  └── 高性能 RPC → Dubbo / gRPC
+    C["远程调用？"] -->|Spring Cloud 体系| C1["OpenFeign"]
+    C -->|高性能 RPC| C2["Dubbo / gRPC"]
+
+    style R fill:#e1f5fe,stroke:#0288d1
+    style G fill:#e1f5fe,stroke:#0288d1
+    style F fill:#e1f5fe,stroke:#0288d1
+    style T fill:#e1f5fe,stroke:#0288d1
+    style C fill:#e1f5fe,stroke:#0288d1
 ```
 
 </details>
