@@ -285,16 +285,18 @@ Bean 就绪，放入容器供使用
 
 | 阶段 | 做什么 | 你能介入的接口/注解 |
 |------|--------|-------------------|
-| 实例化 | 通过构造器创建对象（空壳） | 构造方法 |
-| 属性填充 | 把依赖 Bean 注入进来 | @Autowired / @Value |
-| Aware 回调 | 让 Bean 感知容器信息 | BeanNameAware, ApplicationContextAware |
-| 前置处理 | 初始化之前拦截 | BeanPostProcessor#postProcessBeforeInitialization |
-| 初始化 | 自定义初始化逻辑 | @PostConstruct / InitializingBean / init-method |
-| 后置处理 | 初始化之后拦截（**AOP 代理生成点**） | BeanPostProcessor#postProcessAfterInitialization |
-| 使用 | 业务调用 | — |
-| 销毁 | 释放资源 | @PreDestroy / DisposableBean / destroy-method |
+| **实例化** | 在堆上分配内存，调用构造器创建对象（空壳，所有依赖字段还是 null） | 构造方法 |
+| **属性填充** | 把**本 Bean 依赖的其他 Bean** 注入进来（容器从 Map 里找到依赖的实例，塞进 `@Autowired` 字段） | @Autowired / @Value |
+| **Aware 回调** | 让 Bean 感知容器信息（容器主动调用 Bean 实现的 Aware 方法） | BeanNameAware, ApplicationContextAware |
+| **前置处理** | 初始化之前拦截（对 Bean 做"二次加工"） | BeanPostProcessor#postProcessBeforeInitialization |
+| **初始化** | 执行你自定义的初始化逻辑（如预加载缓存、建立连接） | @PostConstruct / InitializingBean / init-method |
+| **后置处理** | 初始化之后拦截（**AOP 代理在这里生成，"偷梁换柱"替换原始 Bean**） | BeanPostProcessor#postProcessAfterInitialization |
+| **使用** | 业务调用 | — |
+| **销毁** | 释放资源 | @PreDestroy / DisposableBean / destroy-method |
 
-**Aware 回调**这一步需要特别解释。Aware 直译是"感知到的"——正常情况下 Bean 是不知道自己在容器里的（不知道自己叫什么名字、不知道容器是谁），这是 IOC 的设计初衷。但有时候你确实需要拿到这些信息，Aware 接口就是 Spring 留的"后门"：你的 Bean 实现某个 Aware 接口，Spring 在创建过程中就会**主动回调你实现的方法，把信息传给你**——不是你去问容器要（`bean.getName()`），而是容器主动告诉你（回调 `setBeanName()`）。
+**容易混淆的术语——"初始化"不是"创建对象"**。日常说"初始化"你会想到"创建出来"，但在 Spring 生命周期中，"初始化（Initialization）"是一个特定阶段的专有名词，指的是执行 `@PostConstruct` 等**你自定义的初始化逻辑**。"创建对象"那一步叫"实例化（Instantiation）"。初始化排在第五步而不是第一步，是因为你的自定义逻辑往往依赖前面的属性注入——如果依赖还没注入进来，你在 `@PostConstruct` 方法里调 `this.userDao.loadCache()` 就会空指针。
+
+**Aware 回调**这一步需要特别解释。Aware 直译是"感知到的"——正常情况下 Bean 是不知道自己在容器里的（不知道自己叫什么名字、不知道容器是谁），这是 IOC 的设计初衷。但有时候你确实需要拿到这些信息，Aware 接口就是 Spring 留的"后门"：你的 Bean 实现某个 Aware 接口，Spring 在创建过程中就会**主动回调你实现的方法，把信息传给你**——不是你去问容器要（`bean.getName()`），而是容器主动告诉你（回调 `setBeanName()`）。BeanNameAware 不是一个对象或管理者，而是一个接口，调用方始终是容器。
 
 | Aware 接口 | 容器告诉你什么 | 回调方法 |
 |-----------|--------------|---------|
@@ -304,18 +306,19 @@ Bean 就绪，放入容器供使用
 | `EnvironmentAware` | 当前的环境配置是什么 | `setEnvironment(Environment env)` |
 
 <details>
-<summary><b>展开：BeanPostProcessor 能用来做什么？AOP 是在哪个阶段生成代理的？</b></summary>
+<summary><b>展开：BeanPostProcessor——Bean 的"二次加工"机制</b></summary>
 
-**BeanPostProcessor 能做什么**：
+**BeanPostProcessor（Bean 后置处理器）** 是 Spring 最核心的扩展点之一。它的两个方法 `postProcessBeforeInitialization` 和 `postProcessAfterInitialization` 卡在"初始化"前后，对容器内的**所有 Bean** 都会生效——每有一个 Bean 走到这个阶段，这两个方法就被调用一次。
 
-- `AbstractAutoProxyCreator`（AOP 代理创建）：在 `postProcessAfterInitialization` 阶段对需要代理的 Bean 生成代理对象
-- `AutowiredAnnotationBeanPostProcessor`：处理 `@Autowired` / `@Value` 注入
-- `CommonAnnotationBeanPostProcessor`：处理 `@PostConstruct` / `@PreDestroy` / `@Resource`
-- 自定义：监控 Bean 创建耗时、动态修改 Bean 属性、实现自定义注解处理
+关键机制是**"偷梁换柱"**：这两个方法都必须返回一个 Object，你可以原封不动返回收到的 bean，也可以创建一个全新的代理对象返回。如果你返回了新对象，容器最终注册和使用的就是你的新对象，原始 Bean 被替换掉了。
 
-**AOP 代理在哪个阶段生成？**
+**典型应用**：
 
-在 `postProcessAfterInitialization`（后置处理阶段）。具体实现类是 `AbstractAutoProxyCreator`，它检查 Bean 是否匹配任何 Advisor 的切点，如果匹配就创建代理对象返回（替代原始 Bean）。
+- **AOP 动态代理**（最经典）：`AbstractAutoProxyCreator` 在 `postProcessAfterInitialization` 阶段检查 Bean 是否匹配切面，匹配就用 JDK 动态代理或 CGLIB 生成代理对象替换原始 Bean。`@Transactional` 能生效就是因为这个机制。
+- **注解驱动注入**：`AutowiredAnnotationBeanPostProcessor` 处理 `@Autowired` / `@Value`，`CommonAnnotationBeanPostProcessor` 处理 `@PostConstruct` / `@PreDestroy` / `@Resource`。
+- **自定义加工**：监控 Bean 创建耗时、对敏感字段解密、实现自定义注解处理。
+
+**与 BeanFactoryPostProcessor 的区别**：BeanFactoryPostProcessor 操作的是 Bean 的**配置元数据**（BeanDefinition），此时 Bean 还没被创建出来（未实例化）；BeanPostProcessor 操作的是**已经实例化出来的 Bean 实例对象**。
 
 **特殊情况——循环依赖**：如果发生循环依赖，代理会提前在三级缓存的 `getEarlyBeanReference` 中创建（通过 `SmartInstantiationAwareBeanPostProcessor#getEarlyBeanReference`），不再等到后置处理阶段。
 
