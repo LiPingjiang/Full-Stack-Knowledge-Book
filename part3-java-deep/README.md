@@ -101,6 +101,8 @@ graph TD
 
 **[附录 A2：网络协议基础](./A2-网络协议基础.md)** —— TCP 三次握手/四次挥手、TIME_WAIT、TCP vs UDP、HTTP 版本演进（1.0→1.1→2→3）、HTTPS/TLS、状态码速查、DNS 解析流程、网络分层模型、从输入 URL 到页面展示。后端面试网络基础题的一站式速查。
 
+**[附录 A3：两阶段提交](./A3-两阶段提交.md)** —— 一个思想，三个战场。MySQL 内部 2PC（redo log + binlog 的一致性保证，三阶段时序图，六种 crash 场景逐一分析）、分布式 2PC（XA 协议，协调者单点问题）、Flink 2PC（Checkpoint + Sink 事务的 Exactly-Once），统一对比表帮你理清 2PC 在不同场景下的具体含义。
+
 ---
 
 ## 阅读建议

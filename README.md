@@ -85,6 +85,7 @@ flowchart LR
 - [3.14 微服务治理与分布式锁：注册发现 / 分布式锁 / 链路追踪](./part3-java-deep/14-微服务与分布式锁.md)
 - [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash / HashMap / B+ 树](./part3-java-deep/A1-核心数据结构原理.md)
 - [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
+- [附录 A3：两阶段提交——MySQL 内部 2PC / 分布式 2PC / Flink 2PC](./part3-java-deep/A3-两阶段提交.md)
 
 ### 第四章 · 核心场景的多语言对比与讲解 〔核心重点 ②〕
 
