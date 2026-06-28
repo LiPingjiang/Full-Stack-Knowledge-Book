@@ -40,6 +40,8 @@ flowchart TD
 
 IOC 全称 **Inversion of Control（控制反转）**，与之配套的概念是 **DI（Dependency Injection，依赖注入）**——DI 是 IOC 的具体实现方式。
 
+先厘清两个概念：**容器（Container）** 和 **对象（Bean）** 不是一个层次的东西。对象就是你平时用的那些实例——`UserService`、`OrderDao`、`DataSource`。容器是管理这些对象的"大管家"——Spring 启动时创建一个 `ApplicationContext`（这就是"容器"），它内部维护了一个类似 `Map<String, Object>` 的结构，所有被 `@Component`、`@Service`、`@Bean` 标记的类都会被它实例化后放进去。当你声明 `@Autowired UserDao userDao` 时，容器从这个 Map 里找到对应的实例塞给你。所以"控制反转"说的就是：以前对象的创建和组装由你的业务代码控制，现在由容器控制。
+
 ### 2.1 什么是控制反转 / 依赖注入
 
 "控制反转"这个名字说的不是"自动创建实例"，而是**控制权翻转了**——以前是你的代码控制要用哪个对象（你 `new` 谁、什么时候 `new`、传什么参数），现在这个控制权反转给了容器。你只声明「我需要一个 UserDao」，至于用哪个实现类、什么时候创建、是单例还是多例、销毁时做什么——全部由容器说了算。一个简单的工厂方法也能"自动创建实例"，但工厂的行为还是你代码定义的；IOC 容器则是你连工厂逻辑都不写，完全交给框架按注解/配置来决定。
@@ -291,6 +293,15 @@ Bean 就绪，放入容器供使用
 | 后置处理 | 初始化之后拦截（**AOP 代理生成点**） | BeanPostProcessor#postProcessAfterInitialization |
 | 使用 | 业务调用 | — |
 | 销毁 | 释放资源 | @PreDestroy / DisposableBean / destroy-method |
+
+**Aware 回调**这一步需要特别解释。Aware 直译是"感知到的"——正常情况下 Bean 是不知道自己在容器里的（不知道自己叫什么名字、不知道容器是谁），这是 IOC 的设计初衷。但有时候你确实需要拿到这些信息，Aware 接口就是 Spring 留的"后门"：你的 Bean 实现某个 Aware 接口，Spring 在创建过程中就会**主动回调你实现的方法，把信息传给你**——不是你去问容器要（`bean.getName()`），而是容器主动告诉你（回调 `setBeanName()`）。
+
+| Aware 接口 | 容器告诉你什么 | 回调方法 |
+|-----------|--------------|---------|
+| `BeanNameAware` | 你在容器里叫什么名字 | `setBeanName(String name)` |
+| `BeanFactoryAware` | 创建你的工厂是谁 | `setBeanFactory(BeanFactory factory)` |
+| `ApplicationContextAware` | 你所在的容器是谁 | `setApplicationContext(ApplicationContext ctx)` |
+| `EnvironmentAware` | 当前的环境配置是什么 | `setEnvironment(Environment env)` |
 
 <details>
 <summary><b>展开：BeanPostProcessor 能用来做什么？AOP 是在哪个阶段生成代理的？</b></summary>
