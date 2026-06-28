@@ -556,56 +556,82 @@ sequenceDiagram
     participant Client as 客户端
     participant Server as MySQL Server 层
     participant Engine as InnoDB 引擎层
-    participant Buffer as Buffer Pool<br/>(内存数据页)
-    participant Undo as undo log<br/>(内存+磁盘)
-    participant RedoBuf as redo log buffer<br/>(内存)
-    participant Redo as redo log<br/>(磁盘)
-    participant Bin as binlog<br/>(磁盘)
-    participant Disk as 磁盘数据页<br/>(.ibd 文件)
+    participant Buffer as Buffer Pool(内存)
+    participant Undo as undo log
+    participant Redo as redo log
+    participant Bin as binlog
+    participant Disk as 磁盘数据页(.ibd)
 
-    Client->>Server: BEGIN; UPDATE …; UPDATE …; COMMIT;
+    Client->>Server: UPDATE account SET balance=900 WHERE id=1
 
     rect rgb(240, 248, 255)
-    Note over Server,RedoBuf: ── 阶段一：改内存 ──<br/>每条 SQL 同步做三件事，全部 SQL 执行完才进入阶段二
-
-    Note over Engine: SQL-1: UPDATE account SET balance=900 WHERE id=1
-    Engine->>Undo: 1a. 写 undo log（旧值 balance=1000）
-    Engine->>Buffer: 1b. 改内存数据页（balance→900）
-    Engine->>RedoBuf: 1c. 写 redo log 到 log buffer（内存）
-    Note over Engine: ── 以上三步对每条 SQL 是同步完成的 ──
-
-    Note over Engine: SQL-2: UPDATE account SET name='test' WHERE id=1
-    Engine->>Undo: 2a. 写 undo log（旧值 name='old'）
-    Engine->>Buffer: 2b. 改内存数据页（name→'test'）
-    Engine->>RedoBuf: 2c. 写 redo log 到 log buffer（内存）
-
-    Note over Buffer: 此时内存中数据已改，但磁盘数据页还是旧的
+    Note over Server,Undo: 阶段一 改内存
+    Server->>Engine: 调用引擎接口执行修改
+    Engine->>Undo: 1. 写 undo log(旧值 balance=1000)
+    Engine->>Buffer: 2. 改内存数据页(balance=900)
+    Engine->>Redo: 3. 写 redo log 到 log buffer(内存)
+    Note over Buffer: 内存中数据已改, 磁盘数据页还是旧的
     end
-
-    Note over Engine: ── 阶段一全部完成，才进入阶段二（严格串行） ──
 
     rect rgb(255, 248, 240)
-    Note over Server,Bin: ── 阶段二：落日志（两阶段提交） ──<br/>保证两份日志写入完整，与数据页无关
-    Engine->>Redo: ④ redo log buffer 刷盘（fsync），state=PREPARE
-    Server->>Bin: ⑤ 写 binlog 并刷盘（fsync）
-    Engine->>Redo: ⑥ redo log state 改为 COMMIT 并刷盘
-    Note over Redo,Bin: ④⑤⑥ 全部完成 = 事务提交成功
+    Note over Server,Bin: 阶段二 落日志(两阶段提交)
+    Engine->>Redo: 4. redo log buffer 刷盘(fsync) state=PREPARE
+    Server->>Bin: 5. 写 binlog 并刷盘(fsync)
+    Engine->>Redo: 6. redo log state 改为 COMMIT 并刷盘
+    Note over Redo,Bin: 4-5-6 全部完成 = 事务提交成功
     end
 
-    Redo-->>Client: 返回"提交成功"
+    Redo-->>Client: 返回提交成功
 
     rect rgb(240, 255, 240)
-    Note over Buffer,Disk: ── 阶段三：异步落数据 ──<br/>后台线程独立运行，不等事务提交，甚至可能在阶段一就开始刷
+    Note over Buffer,Disk: 阶段三 异步落数据(后台线程, 随时可能发生)
     Buffer->>Disk: Page Cleaner 线程刷脏页到 .ibd 文件
-    Note over Disk: crash 了也没关系，靠 redo log 重放 / undo log 回滚
+    Note over Disk: crash 靠 redo log 重放 / undo log 回滚
     end
 ```
 
-上面的时序图展示了一个事务从执行到提交的完整流程，核心是**三个阶段的串行/并行关系**：
+如果一个事务包含**多条 SQL**，阶段一内部的执行细节如下图所示——每条 SQL 同步做三件事（写 undo → 改数据页 → 写 redo log buffer），全部 SQL 执行完才进入阶段二：
+
+```mermaid
+sequenceDiagram
+    participant Engine as InnoDB 引擎层
+    participant Undo as undo log
+    participant Buffer as Buffer Pool(内存)
+    participant RedoBuf as redo log buffer(内存)
+    participant Redo as redo log(磁盘)
+    participant Bin as binlog(磁盘)
+
+    rect rgb(240, 248, 255)
+    Note over Engine,RedoBuf: 阶段一 改内存: 每条SQL同步做三件事
+
+    Note over Engine: SQL-1: UPDATE account SET balance=900 WHERE id=1
+    Engine->>Undo: 1a. 写 undo log(旧值 balance=1000)
+    Engine->>Buffer: 1b. 改内存数据页(balance=900)
+    Engine->>RedoBuf: 1c. 写 redo log 到 log buffer
+
+    Note over Engine: SQL-2: UPDATE account SET name=test WHERE id=1
+    Engine->>Undo: 2a. 写 undo log(旧值 name=old)
+    Engine->>Buffer: 2b. 改内存数据页(name=test)
+    Engine->>RedoBuf: 2c. 写 redo log 到 log buffer
+
+    Note over Buffer: 全部 SQL 执行完, 内存中数据已改
+    end
+
+    Note over Engine: 阶段一全部完成 才进入阶段二(严格串行)
+
+    rect rgb(255, 248, 240)
+    Note over Engine,Bin: 阶段二 落日志(两阶段提交)
+    Engine->>Redo: log buffer 刷盘(fsync) state=PREPARE
+    Engine->>Bin: 写 binlog 并刷盘(fsync)
+    Engine->>Redo: state 改为 COMMIT 并刷盘
+    end
+```
+
+上面两张图展示了一个事务从执行到提交的完整流程，核心是**三个阶段的串行/并行关系**：
 
 **阶段一：改内存（全在内存）。** 每条 SQL 执行时，InnoDB 在同一个操作里同步完成三件事：写 undo log（记旧值）→ 改 Buffer Pool 数据页（写新值）→ 写 redo log 到 log buffer（内存缓冲区）。如果事务包含多条 SQL，就逐条重复这个过程。此时磁盘上的数据页还是旧的，所有修改都是可撤销的「草稿」。**阶段一全部执行完，才会进入阶段二，两者严格串行。**
 
-**阶段二：落日志（两阶段提交）。** 步骤 ④⑤⑥ 把日志从内存刷到磁盘——redo log buffer fsync（PREPARE）→ binlog fsync → redo log（COMMIT）。这一阶段完成后事务才算「板上钉钉」，客户端收到提交成功。**两阶段提交保障的是两份日志的写入完整性，不是数据页的写入**。它确保两份日志要么都落盘、要么都不落盘。
+**阶段二：落日志（两阶段提交）。** 步骤 4/5/6 把日志从内存刷到磁盘——redo log buffer fsync（PREPARE）→ binlog fsync → redo log（COMMIT）。这一阶段完成后事务才算「板上钉钉」，客户端收到提交成功。**两阶段提交保障的是两份日志的写入完整性，不是数据页的写入**。它确保两份日志要么都落盘、要么都不落盘。
 
 **阶段三：异步落数据（与阶段一二完全解耦）。** Page Cleaner 后台线程是一个独立的异步循环，它**不关心事务处于什么阶段**——只要 Buffer Pool 有脏页就可能刷盘。所以阶段三不是"等阶段二完成后才开始"，而是随时可能发生，甚至可能在阶段一刚改完内存、阶段二还没开始时就把脏页刷到了磁盘。这就是为什么 crash 后即使事务未提交也需要用 undo log 回滚磁盘数据页。
 
