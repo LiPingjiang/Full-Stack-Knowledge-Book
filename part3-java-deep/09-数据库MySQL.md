@@ -660,11 +660,16 @@ crash 恢复时的判断逻辑：
 
 ```mermaid
 flowchart TD
-    A["MySQL 重启，扫描 redo log"] --> B{redo log 状态？}
-    B -->|commit| C["事务已提交，正常"]
-    B -->|prepare| D{binlog 完整吗？}
-    D -->|"有对应 XID"| E["补提交事务 ✅"]
-    D -->|"不完整"| F["回滚事务 ❌"]
+    A["MySQL 重启"] --> B["扫描 redo log"]
+    B --> C{redo log 状态?}
+    C -->|commit| D["事务已提交, 无需处理"]
+    C -->|prepare| E{binlog 完整吗?}
+    E -->|有对应 XID| F["补提交事务"]
+    E -->|不完整或不存在| G["用 undo log 回滚磁盘数据页"]
+    C -->|不完整或不存在| H["丢弃该 redo log 记录"]
+    A --> I["扫描 undo log"]
+    I --> J["找到所有没有 commit 记录的事务"]
+    J --> G
 ```
 
 <details>
@@ -680,11 +685,13 @@ flowchart TD
 
 **场景一：阶段一（改内存）执行过程中 crash**
 
-redo log 还在 log buffer（内存），什么都没落盘。但注意：Page Cleaner 后台线程可能已经把部分脏页刷到了磁盘。所以重启后恢复程序会用 undo log 检查并回滚这些「没有对应 redo log commit 记录」的脏数据页，确保磁盘数据回到事务前的状态。如果脏页恰好没刷过，磁盘本身就是旧值，回滚操作等于没效果但也不会出错。
+redo log 还在 log buffer（内存），什么都没落盘。恢复程序扫描 redo log 时根本找不到这个事务——在 redo log 视角它「不存在」。但 Page Cleaner 后台线程可能已经把脏页刷到了磁盘。怎么办？恢复程序还有第二条路：**扫描 undo log，找到所有「没有对应 redo log commit 记录」的事务，统一用 undo log 回滚磁盘数据页**。这是一个兜底机制，不依赖 redo log 是否存在。如果脏页恰好没刷过，磁盘本身就是旧值，回滚等于没效果但也不会出错。
 
 **场景二：④ redo log prepare 写了一半 crash（prepare 不完整）**
 
-重启后扫描 redo log，发现这条日志不完整（校验和不对）→ 丢弃这条不完整的 redo log 记录。但和场景一一样，**磁盘数据页可能已经被 Page Cleaner 刷过了**（后台线程不关心事务阶段，只要有脏页就可能刷盘）。所以恢复程序同样需要用 undo log 回滚磁盘数据页。undo log 在阶段一执行时就已经落盘（它本身的持久化也是通过 redo log 保护的），所以 crash 后 undo log 是完整可用的。
+重启后扫描 redo log，发现这条日志不完整（校验和不对）→ 丢弃这条 redo log 记录，在 redo log 视角这个事务同样「不存在」。数据页的恢复走的和场景一一样的兜底路径：**扫描 undo log → 发现这个事务没有 commit 记录 → 用 undo log 回滚磁盘数据页**。
+
+注意场景一、二和场景三、四的**判断路径不同**：场景一二的 redo log 不完整或不存在，恢复程序是通过 undo log 兜底扫描发现未提交事务的；场景三四的 redo log prepare 是完整的，恢复程序能读到 PREPARE 状态，会主动去查 binlog 来裁决提交还是回滚。但最终的数据页处理方式是一样的——都是用 undo log 执行反向操作。undo log 在阶段一执行时就已经落盘（它本身的持久化也是通过 redo log 保护的），所以 crash 后 undo log 是完整可用的。
 
 **场景三：④ redo log prepare 写完，⑤ binlog 还没写就 crash**
 
