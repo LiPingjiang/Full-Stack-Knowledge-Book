@@ -572,9 +572,9 @@ sequenceDiagram
 
     rect rgb(255, 248, 240)
     Note over Server,Bin: ── 两阶段提交（事务提交时） ──
-    Engine->>Redo: ④ redo log 刷盘，标记为 prepare
-    Server->>Bin: ⑤ 写 binlog 并刷盘
-    Engine->>Redo: ⑥ redo log 标记为 commit
+    Engine->>Redo: ④ redo log 刷盘（fsync），state 字段写为 PREPARE
+    Server->>Bin: ⑤ 写 binlog 并刷盘（fsync）
+    Engine->>Redo: ⑥ redo log 的 state 字段改为 COMMIT 并刷盘
     Note over Redo,Bin: ④⑤⑥ 全部完成 = 事务提交成功
     end
 
@@ -583,6 +583,25 @@ sequenceDiagram
 ```
 
 > **关键时序**：SQL 语句在两阶段提交**之前**就已经执行完了——内存中的数据页已经改好，undo log 也已写好。两阶段提交解决的不是"数据有没有改"，而是"crash 之后这个事务算提交还是没提交"。内存中的修改是随时可通过 undo log 撤销的草稿，只有 redo log commit + binlog 都落盘了，事务才算板上钉钉。
+
+**刷盘（flush to disk）是什么？** 日志从内存写到磁盘其实分两步：第一步 `write()`，把数据从 InnoDB 的 log buffer 写到操作系统的**文件系统缓存**（OS page cache）——速度快，但数据仍在内存，断电会丢；第二步 `fsync()`，强制操作系统把 page cache 的数据写到物理磁盘——速度慢，但真正安全。通常说的「刷盘」指两步都完成，数据落到了物理介质上。
+
+**prepare / commit 是什么？** 它们是 redo log 记录中的一个**状态字段（state）**，写在磁盘上的日志文件里。"标记为 prepare"就是把这条日志的 state 写成 `PREPARE` 并 fsync 落盘；"标记为 commit"就是把 state 改成 `COMMIT` 并再次 fsync。crash 重启后，InnoDB 扫描磁盘上的 redo log 文件，读到 state 字段就能判断每个事务走到了哪一步。
+
+<details>
+<summary><b>展开：innodb_flush_log_at_trx_commit 刷盘策略</b></summary>
+
+MySQL 用 `innodb_flush_log_at_trx_commit` 参数控制 redo log 的刷盘时机，值不同安全性和性能差异很大：
+
+| 值 | 行为 | 安全性 | 性能 |
+|---|------|--------|------|
+| **1**（默认） | 每次事务提交都 fsync | 最安全，不丢数据 | 最慢 |
+| **2** | 每次提交只 write 到 OS 缓存，不 fsync | MySQL 崩了不丢，**OS 崩了丢最近 1 秒** | 较快 |
+| **0** | 连 write 都不做，靠后台线程每秒刷一次 | MySQL 崩了也**丢最近 1 秒** | 最快 |
+
+生产环境必须设为 **1**。只有在允许少量数据丢失的场景（如批量导入）才考虑临时改为 2。
+
+</details>
 
 crash 恢复时的判断逻辑：
 
