@@ -647,11 +647,15 @@ redo log 还在 log buffer（内存），什么都没落盘。重启后内存全
 
 **场景二：④ redo log prepare 写了一半 crash（prepare 不完整）**
 
-重启后扫描 redo log，发现这条日志不完整（校验和不对）→ **直接丢弃，等同于事务没发生**。binlog 也没写，主从一致。
+重启后扫描 redo log，发现这条日志不完整（校验和不对）→ **直接丢弃，等同于事务没发生**。binlog 也没写，主从一致。重启后内存是从磁盘重新加载的，Buffer Pool 里的脏页早已随 crash 丢失，磁盘数据页还是旧值，所以数据页本身无需处理。
 
 **场景三：④ redo log prepare 写完，⑤ binlog 还没写就 crash**
 
-重启后扫描 redo log，发现 state=PREPARE → 去查 binlog，找不到对应的 XID → **回滚事务**（用 undo log 撤销内存中的修改）。主库数据回到旧值，从库的 binlog 里也没有这条变更 → **主从一致** ✅
+重启后扫描 redo log，发现 state=PREPARE → 去查 binlog，找不到对应的 XID → **回滚事务**。
+
+这里的「回滚」具体指什么？重启后内存是从磁盘重新加载的，脏页已经丢了，那为什么还要回滚？因为**你不能假设脏页一定没刷盘**——后台 Page Cleaner 线程随时可能在刷脏页。如果 crash 前恰好后台线程把这个事务改过的脏页刷到了磁盘（balance 已经变成 900），但 binlog 没有这条变更，不回滚就会主从不一致。所以恢复程序必须统一处理：**用 undo log 对数据页执行反向操作**（把 balance 从 900 改回 1000），不管脏页有没有刷过，都执行一遍以保证正确。回滚的是数据页，不是重新执行事务。
+
+主库数据回到旧值，从库的 binlog 里也没有这条变更 → **主从一致** ✅
 
 **场景四：④ redo log prepare 写完，⑤ binlog 写了一半 crash（binlog 不完整）**
 
