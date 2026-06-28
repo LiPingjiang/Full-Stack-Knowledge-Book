@@ -558,11 +558,12 @@ sequenceDiagram
     participant Undo as undo log
     participant Redo as redo log
     participant Bin as binlog
+    participant Disk as 磁盘数据页<br/>(.ibd 文件)
 
     Client->>Server: UPDATE account SET balance=900 WHERE id=1
 
     rect rgb(240, 248, 255)
-    Note over Server,Undo: ── 执行阶段（事务提交之前） ──
+    Note over Server,Undo: ── 阶段一：改内存（全在内存，可撤销的草稿） ──
     Server->>Engine: 调用引擎接口执行修改
     Engine->>Undo: ① 写 undo log（旧值 balance=1000）
     Engine->>Buffer: ② 修改内存中的数据页（balance→900）
@@ -571,7 +572,7 @@ sequenceDiagram
     end
 
     rect rgb(255, 248, 240)
-    Note over Server,Bin: ── 两阶段提交（事务提交时） ──
+    Note over Server,Bin: ── 阶段二：落日志（两阶段提交，保证日志写入完整） ──
     Engine->>Redo: ④ redo log 刷盘（fsync），state 字段写为 PREPARE
     Server->>Bin: ⑤ 写 binlog 并刷盘（fsync）
     Engine->>Redo: ⑥ redo log 的 state 字段改为 COMMIT 并刷盘
@@ -579,14 +580,19 @@ sequenceDiagram
     end
 
     Redo-->>Client: 返回"提交成功"
-    Note over Buffer: 脏页由后台线程异步刷到磁盘
+
+    rect rgb(240, 255, 240)
+    Note over Buffer,Disk: ── 阶段三：异步落数据（后台线程，不在提交关键路径上） ──
+    Buffer->>Disk: 后台 Page Cleaner 线程刷脏页到 .ibd 数据文件
+    Note over Disk: crash 了也没关系，靠 redo log 重放恢复
+    end
 ```
 
 上面的时序图展示了一个事务从执行到提交的完整流程，可以理解为**三个阶段**：
 
 **阶段一：执行（全在内存）。** 步骤 ①②③ 都在内存中完成——undo log 写入、Buffer Pool 数据页修改、redo log 写到 log buffer。此时磁盘上的数据页还是旧的，所有修改都是可撤销的「草稿」。注意 redo log 也有自己的内存缓冲区（log buffer），执行阶段产生的 redo log 先写到这里，并不立即落盘。
 
-**阶段二：两阶段提交（日志刷盘）。** 步骤 ④⑤⑥ 是事务提交时把日志从内存刷到磁盘的过程——redo log fsync（PREPARE）→ binlog fsync → redo log（COMMIT）。这一阶段完成后事务才算「板上钉钉」，客户端收到提交成功。
+**阶段二：落日志（两阶段提交）。** 步骤 ④⑤⑥ 是事务提交时把日志从内存刷到磁盘的过程——redo log fsync（PREPARE）→ binlog fsync → redo log（COMMIT）。这一阶段完成后事务才算「板上钉钉」，客户端收到提交成功。注意：**两阶段提交保障的是两份日志（redo log + binlog）的写入完整性，而不是数据页的写入**。它确保两份日志要么都落盘、要么都不落盘，绝不会出现一个有一个没有的情况。
 
 **阶段三：数据页刷盘（后台异步）。** Buffer Pool 中的脏页由后台线程（如 Page Cleaner）在合适时机异步写到磁盘上的数据文件（.ibd）。这一步**不在事务提交的关键路径上**——不需要等它完成就已经返回成功了。即使脏页还没刷就 crash，重启后靠 redo log 重放即可恢复。
 
