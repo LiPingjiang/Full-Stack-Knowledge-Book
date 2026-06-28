@@ -557,48 +557,59 @@ sequenceDiagram
     participant Server as MySQL Server 层
     participant Engine as InnoDB 引擎层
     participant Buffer as Buffer Pool<br/>(内存数据页)
-    participant Undo as undo log
-    participant Redo as redo log
-    participant Bin as binlog
+    participant Undo as undo log<br/>(内存+磁盘)
+    participant RedoBuf as redo log buffer<br/>(内存)
+    participant Redo as redo log<br/>(磁盘)
+    participant Bin as binlog<br/>(磁盘)
     participant Disk as 磁盘数据页<br/>(.ibd 文件)
 
-    Client->>Server: UPDATE account SET balance=900 WHERE id=1
+    Client->>Server: BEGIN; UPDATE …; UPDATE …; COMMIT;
 
     rect rgb(240, 248, 255)
-    Note over Server,Undo: ── 阶段一：改内存（全在内存，可撤销的草稿） ──
-    Server->>Engine: 调用引擎接口执行修改
-    Engine->>Undo: ① 写 undo log（旧值 balance=1000）
-    Engine->>Buffer: ② 修改内存中的数据页（balance→900）
-    Engine->>Redo: ③ 写 redo log 到 log buffer（内存）
+    Note over Server,RedoBuf: ── 阶段一：改内存 ──<br/>每条 SQL 同步做三件事，全部 SQL 执行完才进入阶段二
+
+    Note over Engine: SQL-1: UPDATE account SET balance=900 WHERE id=1
+    Engine->>Undo: 1a. 写 undo log（旧值 balance=1000）
+    Engine->>Buffer: 1b. 改内存数据页（balance→900）
+    Engine->>RedoBuf: 1c. 写 redo log 到 log buffer（内存）
+    Note over Engine: ── 以上三步对每条 SQL 是同步完成的 ──
+
+    Note over Engine: SQL-2: UPDATE account SET name='test' WHERE id=1
+    Engine->>Undo: 2a. 写 undo log（旧值 name='old'）
+    Engine->>Buffer: 2b. 改内存数据页（name→'test'）
+    Engine->>RedoBuf: 2c. 写 redo log 到 log buffer（内存）
+
     Note over Buffer: 此时内存中数据已改，但磁盘数据页还是旧的
     end
 
+    Note over Engine: ── 阶段一全部完成，才进入阶段二（严格串行） ──
+
     rect rgb(255, 248, 240)
-    Note over Server,Bin: ── 阶段二：落日志（两阶段提交，保证日志写入完整） ──
-    Engine->>Redo: ④ redo log 刷盘（fsync），state 字段写为 PREPARE
+    Note over Server,Bin: ── 阶段二：落日志（两阶段提交） ──<br/>保证两份日志写入完整，与数据页无关
+    Engine->>Redo: ④ redo log buffer 刷盘（fsync），state=PREPARE
     Server->>Bin: ⑤ 写 binlog 并刷盘（fsync）
-    Engine->>Redo: ⑥ redo log 的 state 字段改为 COMMIT 并刷盘
+    Engine->>Redo: ⑥ redo log state 改为 COMMIT 并刷盘
     Note over Redo,Bin: ④⑤⑥ 全部完成 = 事务提交成功
     end
 
     Redo-->>Client: 返回"提交成功"
 
     rect rgb(240, 255, 240)
-    Note over Buffer,Disk: ── 阶段三：异步落数据（后台线程，不在提交关键路径上） ──
-    Buffer->>Disk: 后台 Page Cleaner 线程刷脏页到 .ibd 数据文件
-    Note over Disk: crash 了也没关系，靠 redo log 重放恢复
+    Note over Buffer,Disk: ── 阶段三：异步落数据 ──<br/>后台线程独立运行，不等事务提交，甚至可能在阶段一就开始刷
+    Buffer->>Disk: Page Cleaner 线程刷脏页到 .ibd 文件
+    Note over Disk: crash 了也没关系，靠 redo log 重放 / undo log 回滚
     end
 ```
 
-上面的时序图展示了一个事务从执行到提交的完整流程，可以理解为**三个阶段**：
+上面的时序图展示了一个事务从执行到提交的完整流程，核心是**三个阶段的串行/并行关系**：
 
-**阶段一：执行（全在内存）。** 步骤 ①②③ 都在内存中完成——undo log 写入、Buffer Pool 数据页修改、redo log 写到 log buffer。此时磁盘上的数据页还是旧的，所有修改都是可撤销的「草稿」。注意 redo log 也有自己的内存缓冲区（log buffer），执行阶段产生的 redo log 先写到这里，并不立即落盘。
+**阶段一：改内存（全在内存）。** 每条 SQL 执行时，InnoDB 在同一个操作里同步完成三件事：写 undo log（记旧值）→ 改 Buffer Pool 数据页（写新值）→ 写 redo log 到 log buffer（内存缓冲区）。如果事务包含多条 SQL，就逐条重复这个过程。此时磁盘上的数据页还是旧的，所有修改都是可撤销的「草稿」。**阶段一全部执行完，才会进入阶段二，两者严格串行。**
 
-**阶段二：落日志（两阶段提交）。** 步骤 ④⑤⑥ 是事务提交时把日志从内存刷到磁盘的过程——redo log fsync（PREPARE）→ binlog fsync → redo log（COMMIT）。这一阶段完成后事务才算「板上钉钉」，客户端收到提交成功。注意：**两阶段提交保障的是两份日志（redo log + binlog）的写入完整性，而不是数据页的写入**。它确保两份日志要么都落盘、要么都不落盘，绝不会出现一个有一个没有的情况。
+**阶段二：落日志（两阶段提交）。** 步骤 ④⑤⑥ 把日志从内存刷到磁盘——redo log buffer fsync（PREPARE）→ binlog fsync → redo log（COMMIT）。这一阶段完成后事务才算「板上钉钉」，客户端收到提交成功。**两阶段提交保障的是两份日志的写入完整性，不是数据页的写入**。它确保两份日志要么都落盘、要么都不落盘。
 
-**阶段三：数据页刷盘（后台异步）。** Buffer Pool 中的脏页由后台线程（如 Page Cleaner）在合适时机异步写到磁盘上的数据文件（.ibd）。这一步**不在事务提交的关键路径上**——不需要等它完成就已经返回成功了。即使脏页还没刷就 crash，重启后靠 redo log 重放即可恢复。
+**阶段三：异步落数据（与阶段一二完全解耦）。** Page Cleaner 后台线程是一个独立的异步循环，它**不关心事务处于什么阶段**——只要 Buffer Pool 有脏页就可能刷盘。所以阶段三不是"等阶段二完成后才开始"，而是随时可能发生，甚至可能在阶段一刚改完内存、阶段二还没开始时就把脏页刷到了磁盘。这就是为什么 crash 后即使事务未提交也需要用 undo log 回滚磁盘数据页。
 
-> 所以整个流程的逻辑是：**先改内存 → 再落日志 → 最后异步落数据**。事务的安全性靠的是日志落盘，不靠数据页落盘。这就是 WAL（Write-Ahead Logging）的核心思想——日志永远走在数据前面。
+> 总结：**阶段一 → 阶段二严格串行（先改内存再落日志）；阶段三与前两者完全异步解耦（随时可能刷脏页）**。事务的安全性靠的是日志落盘，不靠数据页落盘。这就是 WAL（Write-Ahead Logging）的核心思想——日志永远走在数据前面。
 
 **刷盘（flush to disk）是什么？** 日志从内存写到磁盘其实分两步：第一步 `write()`，把数据从 InnoDB 的 log buffer 写到操作系统的**文件系统缓存**（OS page cache）——速度快，但数据仍在内存，断电会丢；第二步 `fsync()`，强制操作系统把 page cache 的数据写到物理磁盘——速度慢，但真正安全。通常说的「刷盘」指两步都完成，数据落到了物理介质上。
 
