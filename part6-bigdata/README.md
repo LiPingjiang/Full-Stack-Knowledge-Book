@@ -31,13 +31,24 @@ graph LR
 
 ## 各节导读
 
-**[6.1 大数据技术栈全景](./01-大数据技术栈全景.md)** —— 为什么需要大数据技术（MySQL 三大瓶颈）、核心技术栈全景图（采集→存储→计算→应用）、数据仓库分层模型（ODS/DWD/DWS/ADS）、核心组件速查（HDFS/Hive/Spark/Flink/HBase/ClickHouse）、Hive SQL vs MySQL SQL 的关键差异、Lambda 架构 vs Kappa 架构、大数据与后端的协作模式。
+**[6.1 大数据技术栈全景](./01-大数据技术栈全景.md)** —— 为什么需要大数据技术（MySQL 三大瓶颈）、核心技术栈全景图（采集→存储→计算→应用）、存储分类（SQL/NoSQL/搜索/分布式文件）、计算/查询/采集/管道组件速查、数据仓库分层模型（ODS/DWD/DWS/ADS）、Lambda 架构 vs Kappa 架构、大数据与后端的协作模式。
+
+**[6.2 HDFS](./02-HDFS.md)** —— 分布式文件系统的基石。NameNode + DataNode 架构、数据分块（128MB）与 3 副本放置策略、读写流程、NameNode HA 与 Federation。*面试剖析覆盖：HDFS 适合/不适合什么、NameNode 单点问题、小文件问题、Block 大小选择。*
+
+**[6.3 Hive](./03-Hive.md)** —— 用 SQL 查大数据。Hive 的本质（SQL 翻译器 + MetaStore）、内部表 vs 外部表、分区裁剪（最重要的优化手段）、分桶、文件格式（ORC/Parquet）、SQL 差异速查、数据倾斜解决方案。*面试剖析覆盖：Hive 和数据库的区别、内外部表区别、数据倾斜排查、ORC vs Parquet 选型。*
+
+**[6.4 Spark](./04-Spark.md)** —— 内存计算引擎。RDD 核心抽象（不可变/分区/惰性/血缘容错）、Transformation vs Action、宽窄依赖与 Shuffle、Job→Stage→Task 划分、Spark SQL 与 Catalyst 优化器、性能优化要点。*面试剖析覆盖：Spark vs MapReduce、RDD 容错机制、Shuffle 原理、数据倾斜处理。*
+
+**[6.5 Flink](./05-Flink.md)** —— 实时计算引擎。流处理三大挑战（乱序/延迟/窗口）、Event Time vs Processing Time、Watermark 机制、四种窗口类型、Checkpoint + Exactly-Once 语义、Flink SQL。*面试剖析覆盖：Flink vs Spark Streaming、Checkpoint vs Savepoint、Watermark 设置、反压机制。*
+
+**[6.6 Doris](./06-Doris.md)** —— MPP 实时分析数据库。FE + BE 架构、三种数据模型（Duplicate/Aggregate/Unique）、列式存储 + 向量化执行、物化视图、数据导入方式、Doris vs ClickHouse vs StarRocks 对比。*面试剖析覆盖：Doris 定位、数据模型选型、查询为什么快、实时数据导入方案。*
 
 ---
 
 ## 阅读建议
 
-- 如果你是纯后端开发者，先读 6.1 建立全景认知，重点理解"什么场景用什么组件"
-- 如果你需要和数据团队协作（比如提供数据接口、接收数据分析结果），重点理解数仓分层和数据流转
+- 如果你是纯后端开发者，先读 6.1 建立全景认知，再挑和你工作相关的组件深入
+- 如果面试大数据相关岗位，6.2-6.6 的面试剖析部分是重点
+- 如果你需要和数据团队协作，重点理解数仓分层（6.1）和 Kafka 的桥梁作用
 - SQL 基础和查询优化详见 [附录 A4 SQL 语言与查询优化](../part3-java-deep/A4-SQL语言与数据处理.md)
 - Kafka 的详细介绍在 [3.12 消息队列](../part3-java-deep/12-消息队列.md)

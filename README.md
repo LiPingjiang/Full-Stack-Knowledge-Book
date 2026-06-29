@@ -133,6 +133,11 @@ flowchart LR
 
 - [本章导读](./part6-bigdata/README.md)
 - [6.1 大数据技术栈全景：HDFS / Hive / Spark / Flink / 数仓分层](./part6-bigdata/01-大数据技术栈全景.md)
+- [6.2 HDFS：分布式文件系统 / NameNode + DataNode / 副本放置 / HA](./part6-bigdata/02-HDFS.md)
+- [6.3 Hive：SQL 翻译器 / 分区裁剪 / ORC & Parquet / 数据倾斜](./part6-bigdata/03-Hive.md)
+- [6.4 Spark：RDD / 内存计算 / Shuffle / Catalyst 优化器](./part6-bigdata/04-Spark.md)
+- [6.5 Flink：流处理 / Event Time & Watermark / Checkpoint / Exactly-Once](./part6-bigdata/05-Flink.md)
+- [6.6 Doris：MPP OLAP / 三种数据模型 / 向量化执行 / 实时导入](./part6-bigdata/06-Doris.md)
 
 ---
 
