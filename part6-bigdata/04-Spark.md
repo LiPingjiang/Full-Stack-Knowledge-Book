@@ -150,7 +150,7 @@ AQE 包含三个核心能力：
 
 | 特性 | 说明 |
 |------|------|
-| **Spark Connect GA** | 正式版 Spark Connect，支持多语言客户端（Python/Scala/Go/Rust）远程连接 Spark 集群 |
+| **Spark Connect GA**（GA = Generally Available，正式发布） | 正式版 Spark Connect，支持多语言客户端（Python/Scala/Go/Rust）远程连接 Spark 集群 |
 | **ANSI SQL 默认开启** | 更严格的 SQL 语义（如溢出报错而非截断），减少隐式类型转换带来的数据质量问题 |
 | **Variant 数据类型** | 原生支持半结构化数据（JSON-like），比 `get_json_object` 快数倍 |
 | **Collation 支持** | 字符串排序和比较支持指定排序规则（大小写不敏感比较等） |
@@ -273,13 +273,41 @@ FROM orders GROUP BY dt;
 
 ### 6.2 优化计算逻辑
 
-#### Broadcast Join——避免 Shuffle 的首选
+#### Spark JOIN 策略全景——五种物理 JOIN
 
-当大表 JOIN 小表时，可以把小表广播到所有 Executor 的内存中，在 Map 端直接完成 JOIN，完全避免 Shuffle。
+Spark SQL 的 Catalyst 优化器在生成物理执行计划时，会根据数据大小、JOIN 类型、是否有 Hint 等因素，从五种物理 JOIN 策略中选择一种。理解这五种策略的触发条件和适用场景，是优化 JOIN 性能的基础。
+
+| 策略 | 是否 Shuffle | 是否排序 | 适用场景 | 触发条件 |
+|------|------------|---------|---------|---------|
+| **BroadcastHashJoin** | 否（小表广播） | 否 | 大表 JOIN 小表 | 小表 < `autoBroadcastJoinThreshold`（默认 10MB）或使用 `/*+ BROADCAST(t) */` |
+| **SortMergeJoin** | 是 | 是 | 大表 JOIN 大表（等值 JOIN） | 两表都超过广播阈值，JOIN key 可排序（默认策略） |
+| **ShuffleHashJoin** | 是 | 否 | 大表 JOIN 中等表（等值 JOIN） | 需设置 `spark.sql.join.preferSortMergeJoin=false`，或使用 `/*+ SHUFFLE_HASH(t) */` |
+| **CartesianJoin** | 是 | 否 | 笛卡尔积（无 JOIN 条件） | CROSS JOIN 或 INNER JOIN 无 ON 条件 |
+| **BroadcastNestedLoopJoin** | 否（小表广播） | 否 | 非等值 JOIN（如 `a.price > b.min_price`） | 小表可广播 + 非等值条件 |
+
+```
+Spark 选择 JOIN 策略的决策树（简化版）：
+
+  有 JOIN Hint？
+  ├── /*+ BROADCAST(t) */ → BroadcastHashJoin
+  ├── /*+ SHUFFLE_HASH(t) */ → ShuffleHashJoin
+  ├── /*+ MERGE(t) */ → SortMergeJoin
+  └── 无 Hint → 自动判断 ↓
+
+  是等值 JOIN？
+  ├── 是 → 小表 < 广播阈值？
+  │         ├── 是 → BroadcastHashJoin
+  │         └── 否 → SortMergeJoin（默认）
+  └── 否 → 小表可广播？
+            ├── 是 → BroadcastNestedLoopJoin
+            └── 否 → CartesianJoin（慎用，性能极差）
+```
+
+**BroadcastHashJoin** 是性能最优的策略——小表被序列化后广播到每个 Executor 内存中，构建 Hash 表，大表流式探测。完全避免 Shuffle，适合维度表 JOIN 事实表的星型模型场景。
 
 ```sql
--- 使用 MAPJOIN hint 强制广播
-SELECT /*+ MAPJOIN(dim) */
+-- 使用 MAPJOIN hint 强制广播（MAPJOIN / BROADCAST / BROADCASTJOIN 三个 hint 等价）
+SELECT /*+ BROADCAST(dim) */
     fact.order_id, fact.amount, dim.category_name
 FROM fact_order fact
 JOIN dim_product dim ON fact.prod_key = dim.prod_key;
@@ -288,6 +316,21 @@ JOIN dim_product dim ON fact.prod_key = dim.prod_key;
 广播表大小的判断标准：Spark UI 执行计划中各 Scan 节点的实际大小（注意 ORC/Parquet 解压后会膨胀 2-3 倍），小于 60MB 可直接广播，60-200MB 需要评估 Driver 内存是否充足，超过 200MB 不建议广播。
 
 也可以通过 AQE 动态广播：`SET spark.sql.adaptive.autoBroadcastJoinThreshold=100MB`，让 Spark 在运行时根据实际数据量自动决定是否广播。
+
+**SortMergeJoin** 是 Spark 大表 JOIN 大表的默认策略。两张表按 JOIN key 各自 Shuffle + 排序后，用归并算法做匹配。优点是不受数据量限制（不需要把任何一张表放进内存），缺点是需要两次 Shuffle + 两次排序。
+
+**ShuffleHashJoin** 只 Shuffle 不排序——Shuffle 后对小表那侧构建 Hash 表，大表那侧做探测。比 SortMergeJoin 少了排序开销，但要求小表的每个分区能放进内存。Spark 默认优先 SortMergeJoin（更稳定），需要手动开启或用 Hint。
+
+```sql
+-- 用 Hint 指定 ShuffleHashJoin
+SELECT /*+ SHUFFLE_HASH(b) */
+    a.*, b.value
+FROM big_table a JOIN medium_table b ON a.id = b.id;
+```
+
+**CartesianJoin** 和 **BroadcastNestedLoopJoin** 是两种非等值 JOIN 策略。CartesianJoin 做笛卡尔积（M×N 行输出），除非数据量极小否则不应使用。BroadcastNestedLoopJoin 广播小表后对每行大表遍历小表匹配，适合非等值条件（如范围 JOIN `a.start <= b.ts AND b.ts < a.end`）且小表可广播的场景。
+
+> **经验法则**：90% 的 ETL 场景只需关注两种策略——小表走 BroadcastHashJoin，大表走 SortMergeJoin。如果发现 SortMergeJoin 的排序阶段成为瓶颈（Spark UI 中 Stage 的排序耗时占比高），且其中一侧表不算太大，可以尝试切换为 ShuffleHashJoin。非等值 JOIN 尽量控制其中一侧为小表，走 BroadcastNestedLoopJoin 避免笛卡尔积。
 
 #### CTE / WITH 子查询的陷阱——不会被复用
 
