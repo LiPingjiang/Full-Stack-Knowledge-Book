@@ -98,7 +98,7 @@ spark.sql("""
 """)
 ```
 
-**Catalyst 优化器**：Spark SQL 的查询会经过 Catalyst 优化器（逻辑优化 → 物理优化），类似 MySQL 的查询优化器。它能自动做谓词下推（把 WHERE 条件推到数据源层过滤）、列裁剪、Join 策略选择等优化。
+**Catalyst 优化器**：Spark SQL 的查询会经过 Catalyst 优化器（逻辑优化 → 物理优化），类似 MySQL 的查询优化器。它能在**部分场景下**自动做谓词下推、列裁剪、Join 策略选择等优化——但"自动"不等于"万能"。Catalyst 在 INNER JOIN 下表现良好（过滤条件写在 WHERE 还是 ON 里效果一样），但在**外连接（LEFT/RIGHT JOIN）场景下存在明显局限**：右表的过滤条件写在 WHERE 中不会被下推（因为下推会把 LEFT JOIN 变成 INNER JOIN，改变语义）。此外，分区字段被函数包裹、隐式类型转换、视图遮挡底层分区字段等情况，Catalyst 也无法自动处理。这些需要开发者手动优化的场景，详见下文 [5.1 分区裁剪失效六大场景](#51-减少数据量)。
 
 ---
 
@@ -137,6 +137,33 @@ Spark ETL 任务优化可以从三个维度系统思考：**减少数据量**（
 ```
 
 验证分区裁剪是否生效：在 Spark UI 的 SQL 详情页查看 `PartitionFilters` 字段——有值且非空则生效，空列表或缺失则失效。也可以用 `EXPLAIN EXTENDED <SQL>` 查看物理执行计划中 `Filter` 算子是否在 `FileScan` 节点内部。
+
+#### 谓词下推在外连接中的行为——Catalyst 不能自动优化的盲区
+
+后端开发者习惯了"把过滤条件写在 WHERE 里就行，优化器会处理"，但外连接下这个直觉是错的。LEFT JOIN 场景下，过滤条件写在不同位置，Catalyst 的行为完全不同：
+
+| 条件位置 | LEFT JOIN 中左表条件 | LEFT JOIN 中右表条件 |
+|---------|---------------------|---------------------|
+| 写在 **JOIN ON** 中 | 不下推（ON 中只影响匹配，不影响左表输出） | **下推** ✓ |
+| 写在 **WHERE** 中 | **下推** ✓ | **不下推** ✗（会把 LEFT 变 INNER） |
+
+```sql
+-- ✗ 错误写法：右表过滤条件在 WHERE 中，Catalyst 不会下推
+-- Spark 会先 LEFT JOIN 全量数据，再过滤 → 无效数据参与了 Shuffle
+SELECT a.*, b.value
+FROM big_table a
+LEFT JOIN small_table b ON a.id = b.id
+WHERE b.dt = '2024-06-29';
+
+-- ✓ 正确写法：右表过滤条件移到子查询内部，读数据时就过滤
+SELECT a.*, b.value
+FROM big_table a
+LEFT JOIN (
+    SELECT * FROM small_table WHERE dt = '2024-06-29'
+) b ON a.id = b.id;
+```
+
+> **经验法则**：INNER JOIN 可以放心把条件写在 WHERE 里，Catalyst 能处理。但 LEFT/RIGHT JOIN 一定要手动检查：右表（或 LEFT JOIN 的非保留表）的过滤条件，要写在子查询内部或 JOIN ON 中，别指望 Catalyst 替你下推。
 
 #### 中间数据量——数据膨胀问题
 
