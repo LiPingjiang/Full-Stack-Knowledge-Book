@@ -418,17 +418,71 @@ JOIN user_ranked u ON o.order_id = u.order_id
 JOIN category_ranked c ON o.order_id = c.order_id;
 ```
 
-#### reduceByKey vs groupByKey
+#### reduceByKey vs groupByKey——从源码看本质区别
+
+后端开发者可能觉得 reduceByKey 和 groupByKey 是两个独立的 API，但看 Spark 源码会发现：**所有 ByKey 聚合操作都收敛到同一个底层方法 `combineByKeyWithClassTag`**，它们的区别只是传入的三个函数参数不同。
+
+```scala
+// Spark 源码：PairRDDFunctions.scala（简化版）
+
+// reduceByKey 的底层调用
+def reduceByKey(func: (V, V) => V): RDD[(K, V)] =
+  combineByKeyWithClassTag[V](
+    (v: V) => v,          // createCombiner：值本身就是初始聚合结果
+    func,                 // mergeValue：分区内聚合（Map 端 combine）
+    func                  // mergeCombiners：跨分区聚合（Reduce 端）
+  )
+
+// groupByKey 的底层调用
+def groupByKey(): RDD[(K, Iterable[V])] =
+  combineByKeyWithClassTag[CompactBuffer[V]](
+    (v: V) => CompactBuffer(v),    // createCombiner：创建列表
+    (buf, v) => buf += v,          // mergeValue：往列表追加元素
+    (buf1, buf2) => buf1 ++= buf2  // mergeCombiners：合并两个列表
+  )
+
+// aggregateByKey 的底层调用
+def aggregateByKey[U](zeroValue: U)(seqOp: (U, V) => U, combOp: (U, U) => U): RDD[(K, U)] =
+  combineByKeyWithClassTag[U](
+    (v: V) => seqOp(zeroValue, v), // createCombiner：用零值初始化
+    seqOp,                         // mergeValue：分区内聚合
+    combOp                         // mergeCombiners：跨分区聚合
+  )
+
+// foldByKey 也是调用 combineByKeyWithClassTag，只是 seqOp = combOp = func
+```
+
+**关键区别在于 `mergeValue`（Map 端 combine 时做什么）**：
 
 ```
-groupByKey：先 Shuffle 所有数据到相同 key 的分区，再聚合
-  → 全量数据过网络，内存压力大
+reduceByKey 的 mergeValue = func（比如 _ + _）
+  → Map 端每个分区内，相同 key 的值直接聚合成一个数
+  → Shuffle 时只传聚合后的结果，数据量大幅减少
 
-reduceByKey：先在各分区内局部聚合（combine），再 Shuffle 聚合后的结果
-  → 过网络的数据量大幅减少
+groupByKey 的 mergeValue = list.append(value)
+  → Map 端每个分区内，相同 key 的值只是追加到列表里
+  → Shuffle 时列表中的每个元素都要传，数据量没有减少
 ```
 
-> **经验法则**：能用 `reduceByKey` / `aggregateByKey` 就不用 `groupByKey`。
+```
+场景：统计每个单词出现次数，数据分布在 3 个分区
+
+reduceByKey(_ + _)：
+  分区 1：(hello,1)(hello,1)(world,1) → combine → (hello,2)(world,1)
+  分区 2：(hello,1)(spark,1)         → combine → (hello,1)(spark,1)
+  分区 3：(hello,1)(world,1)         → combine → (hello,1)(world,1)
+  Shuffle 传输：6 条记录（已聚合）
+  Reduce 端：(hello, 2+1+1=4)(world, 1+1=2)(spark, 1)
+
+groupByKey() + mapValues(_.sum)：
+  分区 1：(hello,1)(hello,1)(world,1) → 追加 → (hello,[1,1])(world,[1])
+  分区 2：(hello,1)(spark,1)         → 追加 → (hello,[1])(spark,[1])
+  分区 3：(hello,1)(world,1)         → 追加 → (hello,[1])(world,[1])
+  Shuffle 传输：8 条原始值（未聚合，全量过网络）
+  Reduce 端：(hello, [1,1,1,1].sum=4)(world, [1,1].sum=2)(spark, [1].sum=1)
+```
+
+> **经验法则**：能用 `reduceByKey` / `aggregateByKey` / `foldByKey` 就不用 `groupByKey`——它们底层都是 `combineByKeyWithClassTag`，但前三个在 Map 端就做了聚合（combiner），过网络的数据量远小于 groupByKey。
 
 ### 6.3 调整计算资源
 
@@ -457,6 +511,33 @@ Spark Executor 的 JVM 内存分为三个区域：
 **关键参数 `spark.memory.fraction`**：很多公司的大数据平台默认值是 **0.3**（最初为了兼容 Hive UDF 的内存需求），这意味着 8G 的 Executor 只有 2.4G 用于 Shuffle/JOIN/聚合——严重偏低。如果你的任务不使用自定义 UDF，建议调整到 **0.6**，执行内存翻倍，Spill 大幅减少。
 
 **真实案例**：某推荐团队的 LTV 指标计算任务，executor.memory = 8g 但 memory.fraction = 0.3，导致执行内存仅 2.4G。核心 Stage 处理 3.4TB 数据时 Memory Spill 高达 1751GB、Disk Spill 78GB，单个 Stage 耗时 25 分钟。将 memory.fraction 从 0.3 调到 0.6 后（执行内存从 2.4G 变为 4.8G），Stage 耗时从 25 分钟降至约 12 分钟，**零风险、不增加资源申请量**——这是性价比最高的优化手段。
+
+#### Memory Spill 和 Disk Spill 是什么关系？
+
+Spark UI 上同时显示 Memory Spill 和 Disk Spill 两个指标，很多人以为 Spark 会"选择"用 memory 还是 disk 来溢写——其实不是。**它们是同一次溢写动作的两个统计视角**：
+
+```
+当执行内存不够时，Spark 会把内存中的数据溢写到磁盘。这一次溢写产生两个数字：
+
+Memory Spill = 数据在内存中的大小（反序列化、未压缩的 Java 对象）
+Disk Spill   = 同一份数据序列化 + 压缩后写到磁盘的大小
+
+例如上面的案例：
+  Memory Spill = 1751 GB（内存中的 Java 对象大小）
+  Disk Spill   = 78 GB（序列化 + 压缩后的磁盘大小）
+  压缩比 ≈ 22:1（这是正常的，Java 对象头 + 指针 + 对齐填充占了大量空间）
+```
+
+溢写的触发机制是 Spark 的**统一内存管理器（Unified Memory Manager）**：执行内存和存储内存共享同一个内存池（由 `memory.fraction` 控制总量）。当执行内存不足时，Spark 先尝试从存储内存中"借"空间（驱逐缓存的 RDD 数据）；如果借不到了，就触发 Spill——把内存中排序好的数据序列化压缩后写到本地磁盘的临时文件中，释放内存继续处理后续数据。
+
+```
+Spill 对性能的影响链：
+  内存不足 → 触发 Spill → 序列化 + 压缩（CPU 开销）→ 写磁盘（IO 开销）
+  → 后续还要从磁盘读回来（再一次 IO 开销）→ 反序列化（CPU 开销）
+  → 同一份数据被处理了两遍，性能可能降低 2-5 倍
+```
+
+> **看 Spark UI 的经验法则**：如果 Memory Spill > 0，说明执行内存不够用了。优化优先级：先调 memory.fraction（零成本），再调 shuffle.partitions（减少单 Task 数据量），最后才调大 executor.memory（增加资源）。Disk Spill 的大小不重要——它只是 Memory Spill 压缩后的结果，你需要关注的是 Memory Spill 本身。
 
 #### Shuffle 分区数
 
