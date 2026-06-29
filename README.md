@@ -138,6 +138,7 @@ flowchart LR
 - [6.4 Spark：RDD / 内存计算 / Shuffle / Catalyst 优化器](./part6-bigdata/04-Spark.md)
 - [6.5 Flink：流处理 / Event Time & Watermark / Checkpoint / Exactly-Once](./part6-bigdata/05-Flink.md)
 - [6.6 Doris：MPP OLAP / 三种数据模型 / 向量化执行 / 实时导入](./part6-bigdata/06-Doris.md)
+- [6.7 数据仓库设计：维度建模 / 星型 & 雪花模型 / 拉链表 / 数据质量](./part6-bigdata/07-数据仓库设计.md)
 
 ---
 
