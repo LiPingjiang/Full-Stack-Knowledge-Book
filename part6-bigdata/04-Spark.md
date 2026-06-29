@@ -355,9 +355,97 @@ SELECT user_id, SUM(amount) as total FROM orders WHERE dt = '2024-06-29' GROUP B
 -- 后续步骤直接读 tmp_cte_result
 ```
 
+#### 窗口函数——语法、分类与面试常考函数
+
+窗口函数（Window Function）是 SQL 中"既要聚合又要保留明细"的利器。和 GROUP BY 不同，窗口函数**不会合并行**——每行都保留，同时附带一个在"窗口"内计算出的值。Spark SQL 从 **1.4 版本**开始完整支持 SQL 标准的窗口函数语法，后续版本持续增强（如 Spark 2.0 引入 Dataset API 的窗口支持，Spark 3.x 在 AQE 下优化窗口执行）。
+
+**完整语法**
+
+```sql
+函数名(参数) OVER (
+    [PARTITION BY 分区字段, ...]     -- 按哪个维度分组（类似 GROUP BY，但不合并行）
+    [ORDER BY 排序字段 [ASC|DESC]]   -- 分区内按什么排序
+    [窗口框架子句]                    -- 计算范围：哪些行参与计算
+)
+```
+
+三个子句都是可选的：省略 PARTITION BY 则整张表为一个分区；省略 ORDER BY 则分区内不排序（聚合窗口用）；省略窗口框架则根据是否有 ORDER BY 使用不同的默认值（下文详述）。
+
+**三类窗口函数**
+
+| 类别 | 函数 | 用途 | 是否需要 ORDER BY |
+|------|------|------|-----------------|
+| **排名函数** | `ROW_NUMBER()` | 分区内行号，1,2,3,4（不跳号） | 必须 |
+| | `RANK()` | 排名（并列跳号），1,1,3,4 | 必须 |
+| | `DENSE_RANK()` | 排名（并列不跳号），1,1,2,3 | 必须 |
+| | `NTILE(n)` | 分区内分成 n 等份，返回桶号 | 必须 |
+| **聚合函数** | `SUM()` / `COUNT()` / `AVG()` / `MAX()` / `MIN()` | 在窗口内做聚合 | 可选（有无 ORDER BY 语义不同） |
+| **偏移函数** | `LAG(col, n, default)` | 取前 n 行的值（上一条记录） | 必须 |
+| | `LEAD(col, n, default)` | 取后 n 行的值（下一条记录） | 必须 |
+| | `FIRST_VALUE(col)` | 窗口内第一行的值 | 通常需要 |
+| | `LAST_VALUE(col)` | 窗口内最后一行的值 | 通常需要 |
+
+```sql
+-- 面试高频场景 1：每个部门薪资排名 TOP 3
+SELECT * FROM (
+    SELECT name, dept_id, salary,
+           ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) as rn
+    FROM employees
+) t WHERE rn <= 3;
+
+-- 面试高频场景 2：同比/环比——取上一期的值做对比
+SELECT dt, gmv,
+       LAG(gmv, 1) OVER (ORDER BY dt) as prev_day_gmv,           -- 昨天的 GMV
+       LAG(gmv, 7) OVER (ORDER BY dt) as prev_week_gmv,          -- 上周同一天的 GMV
+       gmv - LAG(gmv, 1) OVER (ORDER BY dt) as day_over_day      -- 日环比增量
+FROM daily_gmv;
+
+-- 面试高频场景 3：RANK vs DENSE_RANK vs ROW_NUMBER 的区别
+-- 薪资：8000, 8000, 7000, 6000
+-- ROW_NUMBER: 1, 2, 3, 4（强制不重复，常用于去重取一条）
+-- RANK:       1, 1, 3, 4（并列后跳号，常用于竞赛排名）
+-- DENSE_RANK: 1, 1, 2, 3（并列后不跳号，常用于"排名第几"的业务语义）
+```
+
+**窗口框架（Frame）——ROWS BETWEEN 详解**
+
+窗口框架决定"当前行往前往后看多远"。这是理解窗口函数行为的关键，也是面试常考的细节。
+
+```
+窗口框架语法：
+  ROWS BETWEEN <起点> AND <终点>
+
+五种边界关键词：
+  UNBOUNDED PRECEDING  = 分区的第一行（从最开头开始）
+  n PRECEDING          = 当前行往前 n 行
+  CURRENT ROW          = 当前行
+  n FOLLOWING          = 当前行往后 n 行
+  UNBOUNDED FOLLOWING  = 分区的最后一行（到最末尾）
+
+常见组合：
+  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW      → 从头累计到当前行
+  ROWS BETWEEN 6 PRECEDING AND CURRENT ROW              → 最近 7 行（含当前行）
+  ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING              → 前一行 + 当前行 + 后一行
+  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING → 整个分区（全量）
+```
+
+**ROWS vs RANGE 的区别**：`ROWS` 按物理行数计算边界（第几行到第几行），`RANGE` 按值的范围计算边界（ORDER BY 字段值的差值）。实际开发中 **ROWS 用得更多**，因为行为更可预测。
+
+**默认框架规则**（不写 ROWS BETWEEN 时 Spark 自动使用的框架）：
+
+```
+有 ORDER BY 时：默认 RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  → 相当于"从分区开头累计到当前行"，SUM 变成累计求和
+
+无 ORDER BY 时：默认 ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+  → 相当于"整个分区"，SUM 变成分区内总和
+```
+
+这就是为什么同样是 `SUM() OVER(PARTITION BY ...)`，加不加 ORDER BY 结果完全不同的原因。
+
 #### 窗口函数优化
 
-窗口函数是 SQL 分析利器，但也是 Spill 和倾斜的高发区。以下逐项说明优化手段，每个都附带 SQL 对比。
+理解了窗口函数的语法和框架之后，再来看优化手段。窗口函数是 Spill 和倾斜的高发区——因为同一个 PARTITION BY key 下的所有行必须集中到同一个 Task 处理。以下逐项说明优化手段，每个都附带 SQL 对比。
 
 **① 去掉不必要的 ORDER BY**
 
@@ -415,21 +503,30 @@ LIMIT 20;
 
 **④ 显式指定 ROWS BETWEEN 范围**
 
-不指定范围时，Spark 默认使用 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`，内存消耗随数据量线性增长。
+不指定范围时，有 ORDER BY 的聚合窗口默认使用 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`（从分区开头累计到当前行），内存消耗随数据量线性增长——处理到分区最后一行时，需要持有从第一行到当前行的所有中间状态。如果业务只需要"最近 N 行"的滑动计算，显式指定 ROWS BETWEEN 可以把内存占用从 O(n) 降到 O(N)。
 
 ```sql
--- ✗ 默认范围：累计到当前行，处理分区最后一行时需要持有整个分区的数据
+-- ✗ 默认范围：从分区第一行累计到当前行（UNBOUNDED PRECEDING → CURRENT ROW）
+-- 随着行数增加，每一行要累加的范围越来越大
 SELECT user_id, order_date, amount,
        SUM(amount) OVER (PARTITION BY user_id ORDER BY order_date) as running_total
 FROM orders;
 
--- ✓ 指定固定窗口：只看最近 7 天的滑动求和，内存占用恒定
+-- ✓ 显式指定：只看当前行和它前面 6 行（共 7 行），滑动窗口
+-- ROWS BETWEEN 6 PRECEDING AND CURRENT ROW 含义：
+--   6 PRECEDING = 往前数 6 行（物理行，不是 6 天）
+--   CURRENT ROW = 当前行
+--   合计 7 行参与计算，内存占用恒定
 SELECT user_id, order_date, amount,
        SUM(amount) OVER (
            PARTITION BY user_id ORDER BY order_date
            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
-       ) as rolling_7day_total
+       ) as rolling_7row_total
 FROM orders;
+-- 注意：ROWS BETWEEN 按物理行数而非日期值计算。如果数据不是每天一行
+-- （有缺失日期），"6 PRECEDING"不等于"最近 7 天"。
+-- 需要严格按日期范围的场景，用 RANGE BETWEEN INTERVAL 7 DAYS PRECEDING AND CURRENT ROW
+-- （Spark 3.0+ 支持 INTERVAL 语法）
 ```
 
 **⑤ 多窗口规格拆分为独立 CTE**
