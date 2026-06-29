@@ -39,6 +39,9 @@ graph TD
     A --> N[3.12 消息队列<br/>Kafka/RocketMQ]
     A --> O[3.13 Spring 全家桶<br/>IOC/AOP/Boot/Cloud]
     A --> P[3.14 微服务与分布式锁<br/>注册发现/锁/链路追踪]
+    A --> P2[3.15 Java 集合框架<br/>ArrayList/HashMap/ConcurrentHashMap]
+    A --> P3[3.16 Java 8+ 新特性<br/>Lambda/Stream/Optional/Record]
+    A --> P4[3.17 设计模式<br/>23种模式/SOLID/Spring实战]
     A --> R[附录 A1 核心数据结构<br/>跳表/红黑树/布隆过滤器/B+树]
     A --> S[附录 A2 网络协议基础<br/>TCP握手/HTTP/DNS]
 
@@ -57,6 +60,9 @@ graph TD
     N -.异步架构.-> Q
     O -.框架生态.-> Q
     P -.治理实战.-> Q
+    P2 -.集合源码.-> Q
+    P3 -.语言演进.-> G
+    P4 -.设计思维.-> Q
 
     style A fill:#e1f5ff
     style G fill:#fff4e1
@@ -97,11 +103,25 @@ graph TD
 
 **[3.14 微服务治理与分布式锁](./14-微服务与分布式锁.md)** —— 从单体到微服务后多出来的麻烦。服务注册与发现、配置中心、分布式锁三种实现（Redis/ZooKeeper/MySQL）、链路追踪、服务网关、服务间通信选型。*面试剖析覆盖：Redis 分布式锁主从切换丢锁/RedLock 争议、Redisson 看门狗、ZK 临时顺序节点。*
 
+**[3.15 Java 集合框架](./15-Java集合框架.md)** —— ArrayList 扩容机制、LinkedList 为何几乎不该用、HashMap 源码全解（hash 扰动/红黑树转换/扩容 rehash）、ConcurrentHashMap（JDK 7 分段锁 → JDK 8 CAS + synchronized）、LinkedHashMap 实现 LRU、TreeMap、PriorityQueue。*面试剖析覆盖：HashMap 线程不安全的具体表现、fail-fast vs fail-safe、synchronizedMap vs ConcurrentHashMap、key 的 hashCode/equals 契约。*
+
+**[3.16 Java 8+ 新特性](./16-Java8+新特性.md)** —— Lambda 与函数式接口、Stream API（惰性求值/flatMap/Collectors）、Optional 正确用法与反模式、新日期 API（java.time）、JDK 9-21 关键特性速览（var/Record/Sealed Class/Pattern Matching/虚拟线程）。*面试剖析覆盖：Stream vs for 循环性能、Lambda 捕获变量限制、parallelStream 陷阱、orElse vs orElseGet。*
+
+**[3.17 设计模式](./17-设计模式.md)** —— 先宏观（SOLID 原则 → 三大类 23 种模式），再逐个击破。创建型（单例 5 种写法/工厂/建造者）、结构型（代理/适配器/装饰器/外观）、行为型（策略/模板方法/观察者/责任链）。每种模式一句话定义 + Java/Spring 实战应用 + 代码骨架。*面试剖析覆盖：Spring 用了哪些设计模式、策略模式消除 if-else、代理 vs 装饰器 vs 适配器区分。*
+
 **[附录 A1：核心数据结构原理](./A1-核心数据结构原理.md)** —— 跳表、红黑树、布隆过滤器、一致性 Hash、HashMap、B+ 树——这些被多个章节引用的通用数据结构集中讲透。结构图解、插入/查找过程、复杂度对比、变体与参数设计、Java/Redis 实战用法、常见树结构总览（BST/AVL/红黑树/B树/B+树/跳表/Trie/堆），面试时任何场景问到都能从容作答。
 
 **[附录 A2：网络协议基础](./A2-网络协议基础.md)** —— TCP 三次握手/四次挥手、TIME_WAIT、TCP vs UDP、HTTP 版本演进（1.0→1.1→2→3）、HTTPS/TLS、状态码速查、DNS 解析流程、网络分层模型、从输入 URL 到页面展示。后端面试网络基础题的一站式速查。
 
 **[附录 A3：两阶段提交](./A3-两阶段提交.md)** —— 一个思想，三个战场。MySQL 内部 2PC（redo log + binlog 的一致性保证，三阶段时序图，六种 crash 场景逐一分析）、分布式 2PC（XA 协议，协调者单点问题）、Flink 2PC（Checkpoint + Sink 事务的 Exactly-Once），统一对比表帮你理清 2PC 在不同场景下的具体含义。
+
+**[附录 A4：SQL 语言与数据处理](./A4-SQL语言与数据处理.md)** —— SQL 执行顺序（和书写顺序不一样）、JOIN 全家福与底层实现、窗口函数、EXPLAIN 执行计划、索引失效速查、慢 SQL 排查流程、深分页优化、SQL 实战高频题型（TopN/连续登录/行转列）。后半部分从 MySQL 延伸到大数据技术栈全景（HDFS/Hive/Spark/Flink）和数据仓库分层模型（ODS→DWD→DWS→ADS）。
+
+**[附录 A5：ElasticSearch](./A5-ElasticSearch.md)** —— 倒排索引原理、ES 核心概念与 MySQL 类比、分词器、集群架构（分片/副本/近实时原理）、DSL 查询入门（match/term/bool/aggs）、ES 与 MySQL 的互补关系。附 NoSQL 家族速览（MongoDB 文档型数据库简介）。*面试剖析覆盖：ES 为什么快、深分页问题、MySQL-ES 数据一致性方案。*
+
+**[附录 A6：代码规范与设计原则](./A6-代码规范与设计原则.md)** —— SOLID 五原则逐一拆解（每个原则一句话 + Java 正例/反例）、阿里巴巴 Java 编码规范精选要点（命名/异常处理/集合/并发/日志）、代码坏味道速查表。
+
+**[附录 A7：开发工具链](./A7-开发工具链.md)** —— Git 进阶（分支策略/rebase vs merge/cherry-pick/bisect/stash）、Maven 生命周期与依赖冲突排查、Maven vs Gradle、CI/CD 概念与工具选型、Linux 运维命令速查（文件/进程/网络/线上排查组合拳）。
 
 ---
 

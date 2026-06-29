@@ -83,9 +83,16 @@ flowchart LR
 - [3.12 消息队列：Kafka / RocketMQ / 可靠投递 / 幂等消费](./part3-java-deep/12-消息队列.md)
 - [3.13 Spring 全家桶：IOC / AOP / Boot 自动配置 / Cloud](./part3-java-deep/13-Spring全家桶.md)
 - [3.14 微服务治理与分布式锁：注册发现 / 分布式锁 / 链路追踪](./part3-java-deep/14-微服务与分布式锁.md)
+- [3.15 Java 集合框架：ArrayList / HashMap / ConcurrentHashMap 源码](./part3-java-deep/15-Java集合框架.md)
+- [3.16 Java 8+ 新特性：Lambda / Stream / Optional / Record / 虚拟线程](./part3-java-deep/16-Java8+新特性.md)
+- [3.17 设计模式：23 种经典模式 / SOLID / Spring 实战](./part3-java-deep/17-设计模式.md)
 - [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash / HashMap / B+ 树](./part3-java-deep/A1-核心数据结构原理.md)
 - [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
 - [附录 A3：两阶段提交——MySQL 内部 2PC / 分布式 2PC / Flink 2PC](./part3-java-deep/A3-两阶段提交.md)
+- [附录 A4：SQL 语言与数据处理——查询优化 / 窗口函数 / 大数据入门](./part3-java-deep/A4-SQL语言与数据处理.md)
+- [附录 A5：ElasticSearch——倒排索引 / DSL 查询 / 集群架构 / MongoDB 简介](./part3-java-deep/A5-ElasticSearch.md)
+- [附录 A6：代码规范与设计原则——SOLID / 阿里规范 / 代码坏味道](./part3-java-deep/A6-代码规范与设计原则.md)
+- [附录 A7：开发工具链——Git 进阶 / Maven / CI·CD / Linux 速查](./part3-java-deep/A7-开发工具链.md)
 
 ### 第四章 · 核心场景的多语言对比与讲解 〔核心重点 ②〕
 
