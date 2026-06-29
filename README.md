@@ -89,7 +89,7 @@ flowchart LR
 - [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash / HashMap / B+ 树](./part3-java-deep/A1-核心数据结构原理.md)
 - [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
 - [附录 A3：两阶段提交——MySQL 内部 2PC / 分布式 2PC / Flink 2PC](./part3-java-deep/A3-两阶段提交.md)
-- [附录 A4：SQL 语言与数据处理——查询优化 / 窗口函数 / 大数据入门](./part3-java-deep/A4-SQL语言与数据处理.md)
+- [附录 A4：SQL 语言与查询优化——执行顺序 / JOIN / 窗口函数 / EXPLAIN / 慢 SQL](./part3-java-deep/A4-SQL语言与数据处理.md)
 - [附录 A5：ElasticSearch——倒排索引 / DSL 查询 / 集群架构 / MongoDB 简介](./part3-java-deep/A5-ElasticSearch.md)
 - [附录 A6：代码规范与设计原则——SOLID / 阿里规范 / 代码坏味道](./part3-java-deep/A6-代码规范与设计原则.md)
 - [附录 A7：开发工具链——Git 进阶 / Maven / CI·CD / Linux 速查](./part3-java-deep/A7-开发工具链.md)
@@ -127,13 +127,20 @@ flowchart LR
 - [5.2 AI 辅助的全栈工作流：前后端一把梭](./part5-ai-coding-method/02-AI辅助的全栈工作流.md)
 - [5.3 验证与避坑：AI 生成代码的信任边界](./part5-ai-coding-method/03-验证与避坑.md)
 
+### 第六章 · 大数据基础 〔平行技术领域〕
+
+当单机 MySQL 在存储、计算、实时性上触碰天花板时，你需要理解大数据技术栈的全景。大数据和前端、后端一样，是全栈体系下的一个平行领域。
+
+- [本章导读](./part6-bigdata/README.md)
+- [6.1 大数据技术栈全景：HDFS / Hive / Spark / Flink / 数仓分层](./part6-bigdata/01-大数据技术栈全景.md)
+
 ---
 
 ## 如何阅读
 
 推荐两种路径：
 
-**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章。前三章是地基，第四章是融会贯通，第五章是加速器。
+**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章 → 第六章。前三章是地基，第四章是融会贯通，第五章是加速器，第六章是视野拓展。
 
 **路径 B · 问题驱动（带着具体问题查阅）**：直接从第四章的对比案例切入，遇到 Java 基准不熟就回溯第三章，遇到前端概念不懂就回溯第二章，遇到思维卡壳就回第一章。
 

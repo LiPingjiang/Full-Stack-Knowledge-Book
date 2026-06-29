@@ -115,7 +115,7 @@ graph TD
 
 **[附录 A3：两阶段提交](./A3-两阶段提交.md)** —— 一个思想，三个战场。MySQL 内部 2PC（redo log + binlog 的一致性保证，三阶段时序图，六种 crash 场景逐一分析）、分布式 2PC（XA 协议，协调者单点问题）、Flink 2PC（Checkpoint + Sink 事务的 Exactly-Once），统一对比表帮你理清 2PC 在不同场景下的具体含义。
 
-**[附录 A4：SQL 语言与数据处理](./A4-SQL语言与数据处理.md)** —— SQL 执行顺序（和书写顺序不一样）、JOIN 全家福与底层实现、窗口函数、EXPLAIN 执行计划、索引失效速查、慢 SQL 排查流程、深分页优化、SQL 实战高频题型（TopN/连续登录/行转列）。后半部分从 MySQL 延伸到大数据技术栈全景（HDFS/Hive/Spark/Flink）和数据仓库分层模型（ODS→DWD→DWS→ADS）。
+**[附录 A4：SQL 语言与查询优化](./A4-SQL语言与数据处理.md)** —— SQL 执行顺序（和书写顺序不一样）、JOIN 全家福与底层实现、窗口函数、EXPLAIN 执行计划、索引失效速查、慢 SQL 排查流程、深分页优化、SQL 实战高频题型（TopN/连续登录/行转列）。大数据技术栈已独立为 [第六章](../part6-bigdata/README.md)。
 
 **[附录 A5：ElasticSearch](./A5-ElasticSearch.md)** —— 倒排索引原理、ES 核心概念与 MySQL 类比、分词器、集群架构（分片/副本/近实时原理）、DSL 查询入门（match/term/bool/aggs）、ES 与 MySQL 的互补关系。附 NoSQL 家族速览（MongoDB 文档型数据库简介）。*面试剖析覆盖：ES 为什么快、深分页问题、MySQL-ES 数据一致性方案。*
 

@@ -1,6 +1,6 @@
-# 附录 A4：SQL 语言与数据处理——从查询优化到大数据入门
+# 附录 A4：SQL 语言与查询优化——写出正确、高效的 SQL
 
-> **一句话定位**：[3.9 MySQL](./09-数据库MySQL.md) 讲的是数据库引擎的内部原理（索引、事务、锁），本附录聚焦**SQL 语言本身**——怎么写出正确、高效的 SQL，以及当数据量超出单机 MySQL 承载能力时，数据处理的技术栈如何演进。对于 Java 后端开发者来说，SQL 既是日常工具也是面试必考项，而大数据基础知识则是数据研发岗和高级后端岗的加分能力。
+> **一句话定位**：[3.9 MySQL](./09-数据库MySQL.md) 讲的是数据库引擎的内部原理（索引、事务、锁），本附录聚焦**SQL 语言本身**——怎么写出正确、高效的 SQL。对于 Java 后端开发者来说，SQL 既是日常工具也是面试必考项。当数据量超出单机 MySQL 承载能力后，技术栈如何演进，详见 [第六章 大数据基础](../part6-bigdata/README.md)。
 
 ---
 
@@ -191,73 +191,7 @@ FROM scores GROUP BY student_id;
 
 ---
 
-## 四、从 MySQL 到大数据——数据处理技术栈演进
-
-### 4.1 为什么需要大数据技术？
-
-当数据量增长到单机 MySQL 无法承载时（通常是亿级以上），需要分布式计算和存储：
-
-| 瓶颈 | MySQL 的极限 | 大数据的解法 |
-|------|-------------|-------------|
-| 存储容量 | 单机磁盘上限 | HDFS 分布式文件系统，理论上无限扩展 |
-| 查询速度 | 单表超 5000 万行开始变慢 | MapReduce / Spark 并行计算 |
-| 实时处理 | 不适合流式数据 | Flink / Kafka Streams 实时计算 |
-| 复杂分析 | SQL 能力有限 | Hive（SQL on Hadoop）、Spark SQL |
-
-### 4.2 核心技术栈全景
-
-```mermaid
-graph TD
-    A["数据源<br/>MySQL / 日志 / 埋点 / API"] --> B["数据采集<br/>Canal / Flume / Kafka"]
-    B --> C["数据存储<br/>HDFS / HBase / S3"]
-    C --> D["批处理计算<br/>Hive / Spark"]
-    C --> E["实时计算<br/>Flink / Spark Streaming"]
-    D --> F["数据仓库<br/>分层：ODS→DWD→DWS→ADS"]
-    E --> F
-    F --> G["数据应用<br/>BI 报表 / 推荐 / 风控"]
-```
-
-### 4.3 数据仓库分层模型
-
-| 层级 | 全称 | 作用 | 数据特点 |
-|------|------|------|---------|
-| **ODS** | Operational Data Store | 原始数据层，从业务库同步的原始数据 | 不做清洗，保留原貌 |
-| **DWD** | Data Warehouse Detail | 明细数据层，清洗和标准化 | 一行一条业务事实 |
-| **DWS** | Data Warehouse Summary | 汇总数据层，轻度聚合 | 按主题汇总（日活、GMV） |
-| **ADS** | Application Data Service | 应用数据层，直接给报表/API 用 | 面向具体需求的宽表 |
-
-### 4.4 核心组件简介
-
-| 组件 | 定位 | 一句话 |
-|------|------|--------|
-| **HDFS** | 分布式文件系统 | 把大文件切成 128MB 块，分散存储到多台机器 |
-| **Hive** | SQL on Hadoop | 用 SQL 查询 HDFS 上的数据，底层转成 MapReduce/Spark 任务 |
-| **Spark** | 通用计算引擎 | 内存计算，比 MapReduce 快 10-100 倍 |
-| **Flink** | 实时计算引擎 | 事件驱动、毫秒级延迟的流处理（也支持批处理） |
-| **Kafka** | 消息队列/数据管道 | 详见 [3.12 消息队列](./12-消息队列.md) |
-| **HBase** | 分布式列式数据库 | 十亿级行、百万级列的实时读写 |
-| **ClickHouse** | 列式分析数据库 | OLAP 场景下极致的查询速度 |
-
-<details>
-<summary><b>展开：Hive SQL vs MySQL SQL 的主要差异</b></summary>
-
-Hive SQL 语法和 MySQL SQL 高度相似，但底层完全不同（分布式计算 vs 单机数据库），有几个关键差异：
-
-**数据类型差异**：Hive 支持复杂类型 `ARRAY`、`MAP`、`STRUCT`，MySQL 不支持。Hive 没有 `AUTO_INCREMENT`。
-
-**执行方式**：MySQL 的 SQL 秒级返回，Hive 的 SQL 提交为 MapReduce/Spark 任务，可能要分钟级甚至更久。
-
-**事务支持**：MySQL 完整 ACID 事务，Hive 3.0+ 有限支持 ACID（ORC 格式 + 分桶表）。
-
-**索引**：MySQL 依赖 B+ 树索引，Hive 几乎不用传统索引（靠分区裁剪 + 列式存储 + 统计信息）。
-
-**分区（PARTITION）**：Hive 的分区是物理目录（`/year=2024/month=06/`），查询时通过分区裁剪跳过无关数据，是 Hive 最重要的优化手段。
-
-</details>
-
----
-
-## 五、面试深度剖析：SQL 高频考点
+## 四、面试深度剖析：SQL 高频考点
 
 ### 考点 1：SQL 执行顺序
 
