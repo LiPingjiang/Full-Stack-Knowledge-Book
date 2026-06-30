@@ -20,11 +20,11 @@
 
 ---
 
-## 全书脉络：五章递进
+## 全书脉络：七章递进
 
-这本书的五章是一条精心设计的学习路径，环环相扣：
+这本书的七章是一条精心设计的学习路径，环环相扣：
 
-> **先重装思维 → 补齐前端短板 → 夯实 Java 基准 → 横向对比拓宽语言视野 → 用 AI 加速整个过程。**
+> **先重装思维 → 补齐前端短板 → 夯实 Java 基准 → 横向对比拓宽语言视野 → 用 AI 加速整个过程 → 掌握大数据与 AI 工程。**
 
 ```mermaid
 flowchart LR
@@ -32,6 +32,8 @@ flowchart LR
     C2 --> C3["第三章<br/>Java 深度知识<br/>(磨利对比标尺)"]
     C3 --> C4["第四章<br/>多语言对比<br/>(拓宽视野)"]
     C4 --> C5["第五章<br/>AI Coding 方法论<br/>(加速学习)"]
+    C5 --> C6["第六章<br/>大数据基础<br/>(数据视野)"]
+    C6 --> C7["第七章<br/>AI 工程基础<br/>(理解大模型)"]
     REF["并发模型引用库<br/>(被三、四章共享引用)"] -.被引用.- C3
     REF -.被引用.- C4
 ```
@@ -141,15 +143,28 @@ flowchart LR
 - [6.7 数据仓库设计：维度建模 / 星型 & 雪花模型 / 拉链表 / 数据质量](./part6-bigdata/07-数据仓库设计.md)
 - [6.8 大模型数据工程：预训练数据处理 / 多模态图文视频音频 / MinHash 去重 / Spark+Ray](./part6-bigdata/08-大模型数据工程.md)
 
+### 第七章 · AI 工程基础 〔理解大模型才能用好大模型〕
+
+第五章教你"如何用 AI 工具"，这一章教你"AI 工具背后的工程原理"。每个主题都用 Java 后端的已有知识做类比：RAG ≈ 带缓存的微服务调用，KV Cache ≈ Redis，Agent ≈ 微服务编排器。
+
+- [本章导读](./part7-ai-engineering/README.md)
+- [7.1 RAG 实战：向量检索 / Embedding / 分块策略 / 企业级 RAG 架构](./part7-ai-engineering/01-RAG实战.md)
+- [7.2 Prompt Engineering：CoT 思维链 / 结构化输出 / Function Calling](./part7-ai-engineering/02-Prompt-Engineering.md)
+- [7.3 模型部署基础：Prefill-Decode 两阶段 / KV Cache / vLLM / 量化选型](./part7-ai-engineering/03-模型部署基础.md)
+- [7.4 Transformer 核心：Self-Attention / MHA→GQA 演进 / 位置编码 RoPE](./part7-ai-engineering/04-Transformer核心.md)
+- [7.5 微调入门：LoRA / QLoRA / PEFT / 微调 vs RAG 选型](./part7-ai-engineering/05-微调入门.md)
+- [7.6 Agent 基础：Function Calling / MCP 协议 / Multi-Agent / NL2SQL](./part7-ai-engineering/06-Agent基础.md)
+- [7.7 分布式训练：数据并行 / 流水线并行 / 张量并行 / 3D 混合并行](./part7-ai-engineering/07-分布式训练.md)
+
 ---
 
 ## 如何阅读
 
 推荐两种路径：
 
-**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章 → 第六章。前三章是地基，第四章是融会贯通，第五章是加速器，第六章是视野拓展。
+**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章 → 第六章 → 第七章。前三章是地基，第四章是融会贯通，第五章是加速器，第六章是数据视野，第七章是 AI 工程认知。
 
-**路径 B · 问题驱动（带着具体问题查阅）**：直接从第四章的对比案例切入，遇到 Java 基准不熟就回溯第三章，遇到前端概念不懂就回溯第二章，遇到思维卡壳就回第一章。
+**路径 B · 问题驱动（带着具体问题查阅）**：直接从第四章的对比案例切入，遇到 Java 基准不熟就回溯第三章，遇到前端概念不懂就回溯第二章，遇到思维卡壳就回第一章。AI 相关问题直接查第七章。
 
 全书所有 `.md` 文件之间用相对路径超链接互相串联，你可以在任意支持 Markdown 渲染的编辑器（VS Code、Typora、Obsidian）或 Git 平台中点击跳转，像在网页里冲浪一样阅读。
 
