@@ -317,9 +317,75 @@ JOIN dim_product dim ON fact.prod_key = dim.prod_key;
 
 也可以通过 AQE 动态广播：`SET spark.sql.adaptive.autoBroadcastJoinThreshold=100MB`，让 Spark 在运行时根据实际数据量自动决定是否广播。
 
-**SortMergeJoin** 是 Spark 大表 JOIN 大表的默认策略。两张表按 JOIN key 各自 Shuffle + 排序后，用归并算法做匹配。优点是不受数据量限制（不需要把任何一张表放进内存），缺点是需要两次 Shuffle + 两次排序。
+**SortMergeJoin 和 ShuffleHashJoin 的深入对比**
 
-**ShuffleHashJoin** 只 Shuffle 不排序——Shuffle 后对小表那侧构建 Hash 表，大表那侧做探测。比 SortMergeJoin 少了排序开销，但要求小表的每个分区能放进内存。Spark 默认优先 SortMergeJoin（更稳定），需要手动开启或用 Hint。
+这两种策略的第一步都是 Shuffle——按 JOIN key 重新分区，让相同 key 的数据落到同一个分区。区别在于 Shuffle 之后怎么在分区内做匹配。
+
+**SortMergeJoin 为什么要排序？**
+
+排序是为了用**归并算法**做匹配——两个有序序列各用一个指针从头往后扫，O(N+M) 线性扫完，内存中只需要持有两个指针当前指向的行。这和 Java 中 `Arrays.sort()` + 双指针合并的思路一模一样。
+
+```
+SortMergeJoin 的执行过程（以 A JOIN B ON A.id = B.id 为例）：
+
+① Shuffle：A 和 B 各自按 id 重新分区（相同 id 到同一个分区）
+② Sort：每个分区内，A 和 B 各自按 id 排序
+③ Merge：双指针归并扫描
+
+分区内数据（已排序）：
+A 侧: id = [1, 3, 5, 7, 9]     指针 →
+B 侧: id = [2, 3, 5, 6, 8]     指针 →
+
+指针 A=1, B=2 → A < B → A 指针右移
+指针 A=3, B=2 → A > B → B 指针右移
+指针 A=3, B=3 → 匹配！输出 (3,3)
+指针 A=5, B=5 → 匹配！输出 (5,5)
+... 线性扫完，时间复杂度 O(N+M)
+
+关键优势：内存中只需要两个指针，不需要把任何一侧的数据全部加载到内存
+→ 两张表都是 TB 级也能跑，只要磁盘够大
+```
+
+**ShuffleHashJoin 为什么可以不排序？**
+
+因为它用的是**哈希表**做匹配——把较小那侧的数据构建成一个 HashMap（key = JOIN key，value = 行数据），然后逐行扫描较大那侧，用 JOIN key 去 HashMap 里 O(1) 查找。不需要排序，因为哈希表本身就支持快速查找。
+
+```
+ShuffleHashJoin 的执行过程：
+
+① Shuffle：A 和 B 各自按 id 重新分区（和 SortMergeJoin 相同）
+② Build：对较小的一侧（假设 B）构建 HashMap
+   HashMap = {2: row_B2, 3: row_B3, 5: row_B5, 6: row_B6, 8: row_B8}
+③ Probe：逐行扫描较大的一侧（A），用 id 去 HashMap 查找
+   A.id=1 → HashMap.get(1) → null → 不匹配
+   A.id=3 → HashMap.get(3) → row_B3 → 匹配！输出
+   A.id=5 → HashMap.get(5) → row_B5 → 匹配！输出
+   ...
+
+关键限制：Build 阶段需要把 B 侧整个分区的数据放进内存构建 HashMap
+→ 如果 B 侧某个分区太大放不进内存 → OOM
+→ 这就是为什么 ShuffleHashJoin 要求"小表的每个分区能放进内存"
+```
+
+**不只是"排不排序"——完整的差异对比**
+
+| 维度 | SortMergeJoin | ShuffleHashJoin |
+|------|---------------|-----------------|
+| 分区内匹配算法 | 排序 + 双指针归并 | 构建 HashMap + 探测 |
+| 时间复杂度 | O(N log N + M log M)（排序占大头） | O(N + M)（HashMap 构建 + 探测） |
+| 内存要求 | 极低（只需两个指针） | 需要把小表分区放进内存 |
+| 大数据安全性 | 非常安全，两侧都可以 Spill 到磁盘 | 有 OOM 风险（分区 > 内存时） |
+| 排序开销 | 有，且通常是性能瓶颈 | 无 |
+| 适合场景 | 两张大表（默认策略，最稳定） | 一大一中（中表分区能放进内存） |
+| Spark 默认 | 是（`preferSortMergeJoin=true`） | 否（需手动开启或 Hint） |
+
+**两者有实现上的依赖关系吗？**
+
+没有依赖关系，它们是两种独立的 JOIN 实现，共享的只是 Shuffle 这一步（按 JOIN key 重新分区）。Shuffle 是 Spark 的通用基础设施，和具体的 JOIN 策略无关。你可以这样理解：Shuffle 是"把数据送到正确的分区"（相当于快递分拣），SortMergeJoin 和 ShuffleHashJoin 是"在分区内怎么找匹配"（相当于收到快递后怎么查件），两者在"查件"的方法上完全独立。
+
+实际上，这两种算法在数据库领域早于 Spark 存在——SortMergeJoin 来自传统关系型数据库的归并连接（Oracle/PostgreSQL 都有），HashJoin 来自哈希连接（MySQL 8.0+ 才支持）。Spark 只是把它们搬到了分布式场景下，前面加了一步 Shuffle。
+
+> **什么时候考虑从 SortMergeJoin 切换到 ShuffleHashJoin？** 当你在 Spark UI 中发现 SortMergeJoin Stage 的排序耗时占比很高（比如排序花了 5 分钟，归并只花了 30 秒），而且 JOIN 的一侧表不算太大（Shuffle 后每个分区 < 可用内存），就可以尝试用 `/*+ SHUFFLE_HASH(small_side) */` 切换，跳过排序直接走 HashMap 匹配。
 
 ```sql
 -- 用 Hint 指定 ShuffleHashJoin
