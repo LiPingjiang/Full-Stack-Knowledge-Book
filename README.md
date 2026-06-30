@@ -86,7 +86,7 @@ flowchart LR
 - [3.15 Java 集合框架：ArrayList / HashMap / ConcurrentHashMap 源码](./part3-java-deep/15-Java集合框架.md)
 - [3.16 Java 8+ 新特性：Lambda / Stream / Optional / Record / 虚拟线程](./part3-java-deep/16-Java8+新特性.md)
 - [3.17 设计模式：23 种经典模式 / SOLID / Spring 实战](./part3-java-deep/17-设计模式.md)
-- [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash / HashMap / B+ 树](./part3-java-deep/A1-核心数据结构原理.md)
+- [附录 A1：核心数据结构原理——跳表 / 红黑树 / 布隆过滤器 / 一致性 Hash / HashMap / B+ 树 / MinHash / SimHash](./part3-java-deep/A1-核心数据结构原理.md)
 - [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
 - [附录 A3：两阶段提交——MySQL 内部 2PC / 分布式 2PC / Flink 2PC](./part3-java-deep/A3-两阶段提交.md)
 - [附录 A4：SQL 语言与查询优化——执行顺序 / JOIN / 窗口函数 / EXPLAIN / 慢 SQL](./part3-java-deep/A4-SQL语言与数据处理.md)
