@@ -1359,17 +1359,92 @@ FROM orders;
 
 **⑤ 多窗口规格拆分为独立 CTE**
 
-不同的 OVER 规格（不同的 PARTITION BY + ORDER BY 组合）各自触发独立的 Shuffle。拆成独立 CTE 后，每次 Shuffle 的数据量更小，也更容易被 AQE 优化。
+不同的 OVER 规格（不同的 PARTITION BY + ORDER BY 组合）各自触发独立的 Shuffle。拆成独立 CTE 后，每次 Shuffle 携带的列更少，数据量更小。
+
+**为什么拆分能减少 Shuffle 数据量？——链式执行 vs 独立执行**
+
+关键在于理解单 SELECT 中多个窗口是**串行链式执行**的：第一个窗口的输出是第二个窗口的输入，第二个窗口不得不拖着第一个窗口的结果一起 Shuffle。
+
+```
+假设 orders 表有 5 列：order_id, user_id, category, order_date, amount
+
+═══════════════════════════════════════════════════════════════════
+单 SELECT 版本（两个窗口串行链式执行）
+═══════════════════════════════════════════════════════════════════
+
+输入：orders 表的全部 5 列
+  order_id | user_id | category | order_date | amount
+  001      | U1      | C1       | 2024-01-01 | 100
+  002      | U1      | C2       | 2024-01-02 | 200
+  003      | U2      | C1       | 2024-01-03 | 150
+
+① Shuffle by user_id（携带全部 5 列）
+   输入：order_id, user_id, category, order_date, amount（5 列）
+   输出：order_id, user_id, category, order_date, amount（5 列，按 user_id 重新分区）
+
+② WindowExec #1：按 user_id 分区，amount DESC 排序，算 RANK
+   输入：上面 Shuffle 后的 5 列
+   输出：order_id, user_id, category, order_date, amount, user_rank（6 列）
+                                                    ↑ 新增的列
+
+③ Shuffle by category（必须携带 6 列！）
+   输入：order_id, user_id, category, order_date, amount, user_rank（6 列）
+                                                         ↑ 被迫带着
+   因为 WindowExec #2 的输入是 WindowExec #1 的输出
+   → 第一个窗口的结果 user_rank 被"裹挟"进了第二次 Shuffle
+   → 如果有 10 个窗口，最后一次 Shuffle 会拖着前面所有窗口的结果列
+
+④ WindowExec #2：按 category 分区，amount DESC 排序，算 RANK
+   输入：上面 6 列
+   输出：order_id, user_id, category, order_date, amount, user_rank, category_rank（7 列）
+
+⑤ 输出 7 列结果
+
+═══════════════════════════════════════════════════════════════════
+CTE 拆分版本（两个窗口各自独立执行，最后 JOIN）
+═══════════════════════════════════════════════════════════════════
+
+分支 A：user_ranked CTE
+  ① 读 orders → 只取 3 列：user_id, order_id, amount
+  ② Shuffle by user_id（只携带 3 列）
+  ③ WindowExec：算 RANK
+     输入：user_id, order_id, amount（3 列）
+     输出：user_id, order_id, amount, user_rank（4 列）
+
+分支 B：category_ranked CTE
+  ① 读 orders → 只取 3 列：category, order_id, amount
+  ② Shuffle by category（只携带 3 列）
+  ③ WindowExec：算 RANK
+     输入：category, order_id, amount（3 列）
+     输出：category, order_id, amount, category_rank（4 列）
+
+合并：JOIN 两个结果
+  ④ Shuffle by order_id（JOIN user_ranked，携带 order_id, user_rank = 2 列）
+  ⑤ Shuffle by order_id（JOIN category_ranked，携带 order_id, category_rank = 2 列）
+  ⑥ 输出：order_id, user_id, ..., user_rank, category_rank
+
+═══════════════════════════════════════════════════════════════════
+对比
+═══════════════════════════════════════════════════════════════════
+
+                    单 SELECT 版本              CTE 拆分版本
+窗口 Shuffle 次数    2 次                        2 次（一样）
+窗口 Shuffle 列数    5 列 → 6 列（越滚越大）     3 列 → 3 列（各自独立）
+JOIN Shuffle         无                          2 次（额外开销）
+读表次数             1 次                        2 次（多读一次）
+```
+
+> **trade-off**：CTE 拆分不是无条件优化——它用"多读一次表 + 多两次 JOIN Shuffle"换"每次窗口 Shuffle 携带的列更少"。如果 orders 是宽表（几十列），列裁剪的收益远大于 JOIN 的开销，拆分划算。如果 orders 本身列就不多，或者数据量小，单 SELECT 反而更快。**本质是数据量 vs 次数的 trade-off**。
 
 ```sql
--- ✗ 混合窗口规格：两种不同的 PARTITION BY 在同一个 SELECT 中
-SELECT user_id, order_date, amount,
+-- ✗ 单 SELECT：两个窗口串行链式，第二次 Shuffle 携带第一次的结果
+SELECT user_id, order_date, amount, category,
        RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) as user_rank,
        RANK() OVER (PARTITION BY category ORDER BY amount DESC) as category_rank
 FROM orders;
--- 产生两次 Shuffle，且 Spark 可能难以同时优化两种分布
+-- 两次窗口 Shuffle，且第二次拖着 user_rank 一起 Shuffle
 
--- ✓ 拆分为两个 CTE，各自独立 Shuffle
+-- ✓ CTE 拆分：两个窗口各自独立，每次 Shuffle 只携带需要的列
 WITH user_ranked AS (
     SELECT user_id, order_id,
            RANK() OVER (PARTITION BY user_id ORDER BY amount DESC) as user_rank
@@ -1384,6 +1459,7 @@ SELECT o.user_id, o.order_date, o.amount, u.user_rank, c.category_rank
 FROM orders o
 JOIN user_ranked u ON o.order_id = u.order_id
 JOIN category_ranked c ON o.order_id = c.order_id;
+-- 两次窗口 Shuffle（列少）+ 两次 JOIN Shuffle，适合宽表场景
 ```
 
 #### reduceByKey vs groupByKey——从源码看本质区别
