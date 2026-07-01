@@ -1853,6 +1853,139 @@ spark.sql.shuffle.partitions = 200（默认值，通常偏小）
 写入端小文件（输出文件过多）：
   开启 AQE 自动合并：spark.sql.adaptive.coalescePartitions.enabled=true
   或在写出前加 DISTRIBUTE BY 控制输出文件数
+
+动态分区插入的小文件（最容易踩坑）：
+  INSERT OVERWRITE TABLE A PARTITION (aa) SELECT * FROM B;
+  → 最差情况：每个 Task 都包含多个分区的数据
+  → 文件数 = Task 数 × 分区数（如 200 Task × 50 分区 = 10000 个小文件）
+
+  解决方案：用 DISTRIBUTE BY 把同一分区的数据路由到同一个 Task
+  INSERT OVERWRITE TABLE A PARTITION (aa)
+  SELECT * FROM B DISTRIBUTE BY aa;
+  → 同一分区的数据被 hash 到同一个 Task，只产生 N 个文件（N = 分区数）
+
+  如果分区键本身倾斜（某个分区数据量远大于其他）：
+  → 拆成两部分分别处理
+  -- 非倾斜分区：正常 DISTRIBUTE BY 分区字段
+  INSERT OVERWRITE TABLE A PARTITION (aa)
+  SELECT * FROM B WHERE aa != '大key' DISTRIBUTE BY aa;
+
+  -- 倾斜分区：DISTRIBUTE BY 随机数打散
+  INSERT OVERWRITE TABLE A PARTITION (aa)
+  SELECT * FROM B WHERE aa = '大key' DISTRIBUTE BY cast(rand() * 5 as int);
+
+  Spark 3.2+ 补充：AQE 的 Rebalance 操作可以自动平衡分区
+  SET spark.sql.adaptive.coalescePartitions.enabled=true;
+  → AQE 会在写入前自动合并过小分区，配合 DISTRIBUTE BY 效果更好
+```
+
+#### spark.default.parallelism vs spark.sql.shuffle.partitions——两个最容易混淆的参数
+
+```
+spark.default.parallelism：
+  → 控制 RDD API 的默认分区数（join、reduceByKey、parallelize 等）
+  → 不影响 Spark SQL / DataFrame
+  → 推荐值：总 CPU core 数的 2-3 倍
+
+spark.sql.shuffle.partitions：
+  → 控制 Spark SQL / DataFrame 的 Shuffle 后分区数
+  → 不影响 RDD API
+  → 默认 200，推荐根据数据量调整（每分区 128MB-256MB）
+
+关键区别：
+  RDD 操作（reduceByKey 等）→ 用 spark.default.parallelism
+  Spark SQL / DataFrame 操作（JOIN、GROUP BY 等）→ 用 spark.sql.shuffle.partitions
+  两者互不干扰，各管各的
+
+Spark SQL 的并行度陷阱：
+  Spark SQL 读取 Hive 表时，并行度由 HDFS Block 数决定（不受 parallelism 控制）
+  如果 Hive 表只有 20 个 Block → Spark SQL 的 Stage 只有 20 个 Task
+  即使你设置了 spark.default.parallelism=1000 也没用
+  → 如果这个 Stage 有复杂计算，20 个 Task 可能极慢
+
+  解决：用 repartition 打散
+  val df = spark.sql("SELECT * FROM big_hive_table")
+  val repartitioned = df.repartition(200)  // 强制重新分区为 200
+  → 后续操作就有 200 个 Task 了
+  → 代价：多一次 Shuffle
+```
+
+#### 算子级优化
+
+**mapPartitions vs map——减少函数调用开销**
+
+```
+map：对每条记录调用一次函数
+  partition 有 10000 条 → 函数被调用 10000 次
+  → 每次调用有函数调用开销 + 资源初始化开销（如创建连接）
+
+mapPartitions：对每个分区调用一次函数，传入整个分区的迭代器
+  partition 有 10000 条 → 函数只调用 1 次，接收 Iterator[10000 条]
+  → 减少函数调用开销
+  → 资源初始化只做一次（如数据库连接、外部服务客户端）
+
+适用场景：
+  ① 需要初始化外部资源（数据库连接、HTTP 客户端）→ mapPartitions 初始化一次复用
+  ② 分区数据量适中（不会 OOM）
+
+风险：
+  分区数据量过大 → 一次加载整个分区到内存 → OOM
+  如果分区有 100 万条数据，mapPartitions 一次性接收 100 万条 → 可能 OOM
+  → map 是流式处理（一条处理完 GC 回收），mapPartitions 是批量加载
+```
+
+> **Spark 3.x 注意**：对于 DataFrame API，Tungsten 的全阶段代码生成已经自动融合了多个算子，map 和 mapPartitions 的性能差距比 RDD 时代小很多。但在需要初始化外部资源（DB 连接、HTTP 客户端）的场景，mapPartitions 仍有不可替代的优势。
+
+**foreachPartition 优化写数据库**
+
+```
+foreach（逐条写）：
+  100 万条数据 → 100 万次函数调用
+  → 每条数据获取一个数据库连接 + 发送一条 SQL
+  → 性能极差（连接创建/销毁是最大瓶颈）
+
+foreachPartition（按分区批量写）：
+  100 万条数据 / 200 分区 = 每分区 5000 条
+  → 每个分区获取一个数据库连接 + 批量 INSERT
+  → 连接数 = 分区数（200 个），SQL 执行次数大幅减少
+
+  典型写法：
+  df.foreachPartition { partition: Iterator[Row] =>
+    val conn = DriverManager.getConnection(url)  // 每分区一个连接
+    val pstmt = conn.prepareStatement("INSERT INTO t VALUES (?, ?)")
+    partition.grouped(1000).foreach { batch =>
+      batch.foreach { row =>
+        pstmt.setString(1, row.getString(0))
+        pstmt.setInt(2, row.getInt(1))
+        pstmt.addBatch()                          // 攒批
+      }
+      pstmt.executeBatch()                        // 每 1000 条执行一次
+    }
+    conn.close()
+  }
+```
+
+> **Spark 3.x 推荐做法**：如果写 MySQL 等关系型数据库，优先用 `df.write.jdbc()` —— Spark 内部已做批量写入优化，比手动 foreachPartition 更简洁可靠。只有需要自定义写入逻辑（如 UPSERT、多表联动、复杂映射）时才用 foreachPartition。注意：JDBC 连接对象不可序列化，不能在 Driver 端创建后传给 Executor，必须在 foreachPartition 内部创建。
+
+**filter 后用 coalesce 减少分区**
+
+```
+filter 过滤掉 80% 数据后：
+  原本 200 个分区，每分区 10000 条
+  filter 后每分区只剩 2000 条，但分区数还是 200
+  → 200 个 Task 各处理 2000 条，Task 调度开销 > 计算开销
+  → 而且各分区数据量不均匀（filter 条件对不同分区影响不同）→ 轻度数据倾斜
+
+用 coalesce 压缩分区：
+  rdd.filter(...).coalesce(40)   // 200 分区 → 40 分区
+  → 40 个 Task 各处理 10000 条，调度开销减少 5 倍
+  → coalesce 默认不触发 Shuffle（narrow dependency），开销极小
+
+coalesce vs repartition：
+  coalesce(40)    → 默认 shuffle=false，不触发 Shuffle，只是合并相邻分区
+  repartition(40) → 内部调用 coalesce(40, shuffle=true)，触发 Shuffle，数据更均匀
+  → 减少 partition 数用 coalesce（不 Shuffle，快）
+  → 增加 partition 数或需要均匀分布用 repartition（Shuffle，慢但均匀）
 ```
 
 #### OOM / Spill 排查路径
