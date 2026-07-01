@@ -1018,7 +1018,7 @@ SELECT user_id, SUM(amount) as total FROM orders WHERE dt = '2024-06-29' GROUP B
 
 ```sql
 函数名(参数) OVER (
-    [PARTITION BY 分区字段, ...]     -- 按哪个维度分组（类似 GROUP BY，但不合并行）
+    [PARTITION BY 分区字段, ...]     -- 按哪个维度划分窗口（不合并行，不丢失行）
     [ORDER BY 排序字段 [ASC|DESC]]   -- 分区内按什么排序
     [窗口框架子句]                    -- 计算范围：哪些行参与计算
 )
@@ -1047,9 +1047,9 @@ SELECT * FROM (
            ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) as rn
     FROM employees
 ) t WHERE rn <= 3;
--- PARTITION BY dept_id → 按 dept_id 分组（每个部门一个独立窗口）
--- ORDER BY salary DESC → 在每个组内按薪资降序排列
--- ROW_NUMBER() → 在每个组内从 1 开始编号，编号不跨组
+-- PARTITION BY dept_id → 按 dept_id 划分窗口（每个部门一个独立窗口）
+-- ORDER BY salary DESC → 在每个窗口内按薪资降序排列
+-- ROW_NUMBER() → 在每个窗口内从 1 开始编号，编号不跨窗口
 -- 外层 WHERE rn <= 3 → 选出每个部门薪资前 3 名
 --
 -- 结果示例：
@@ -1060,6 +1060,52 @@ SELECT * FROM (
 -- 赵六     1         8000   4     ← rn=4，被 WHERE 过滤掉
 -- 孙七     2        20000   1     ← 部门 2 重新从 1 开始编号
 -- 周八     2        18000   2
+--
+-- PARTITION BY vs WHERE vs GROUP BY 的区别：
+-- WHERE dept_id = 1   → 过滤行，只留部门 1，其他部门数据丢掉
+-- GROUP BY dept_id    → 聚合行，每个部门合并成一行，逐行信息丢失
+-- PARTITION BY dept_id → 划窗口，所有行保留，每行多一个 rn 列
+--
+-- 原始数据（5 行）：
+-- name   dept_id  salary
+-- 张三   1        15000
+-- 李四   1        12000
+-- 王五   1        10000
+-- 孙七   2        20000
+-- 周八   2        18000
+--
+-- WHERE dept_id = 1 的结果（过滤，剩 3 行）：
+-- 张三   1        15000
+-- 李四   1        12000
+-- 王五   1        10000
+--
+-- GROUP BY dept_id 的结果（聚合，剩 2 行，逐行信息丢失）：
+-- dept_id  SUM(salary)
+-- 1        37000
+-- 2        38000
+--
+-- PARTITION BY dept_id + ROW_NUMBER() 的结果（划窗口，5 行全在，多了 rn 列）：
+-- name   dept_id  salary  rn
+-- 张三   1        15000   1
+-- 李四   1        12000   2
+-- 王五   1        10000   3
+-- 孙七   2        20000   1     ← 编号重新开始
+-- 周八   2        18000   2
+--
+-- 类比：WHERE 是"选人"——只留部门 1，其他人赶走。
+--       GROUP BY 是"汇报"——每个部门派代表报总数，人员信息没了。
+--       PARTITION BY 是"分组排队"——所有人都在，按部门分成两队，每队内部各自排名。
+--
+-- ROW_NUMBER 的内部实现（非每行独立计算，也非先算再 JOIN）：
+-- ① Shuffle：按 PARTITION BY 的 dept_id 重新分区（相同部门去同一 Executor）
+-- ② Sort：分区内按 (dept_id, salary DESC) 排序
+-- ③ WindowExec：流式遍历排序后的行，维护一个计数器
+--    - 每读一行，计数器 +1，作为 rn 附加到该行
+--    - 检测到 dept_id 变了（新部门），计数器重置为 1
+--    - 全程一次顺序扫描，没有 JOIN，没有回头查找
+-- 源码依据：WindowExec.doExecute() 用 mapPartitions 逐行迭代，
+-- ROW_NUMBER 对应 UnboundedPrecedingWindowFunctionFrame，
+-- 框架范围为 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 
 -- 面试高频场景 2：同比/环比——取上一期的值做对比
 SELECT dt, gmv,
