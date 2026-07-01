@@ -1402,6 +1402,56 @@ Stage 8 每个 Task 平均输入 344MB，但执行内存只有 2.4G
 
 修复前的**必做前置步骤**：先判断是 JOIN 倾斜还是聚合倾斜——两类倾斜的修复方向完全不同，混用无效。对 JOIN Key 和 GROUP BY Key 分别做分布分析，找出热点 Key。
 
+**诊断流程四步法：**
+
+**Step 1：通过 Spark UI 定位倾斜 Stage**
+
+打开 Spark UI → Stages 页面，观察每个 Stage 的 Task 耗时分布（Duration）和数据量分布（Shuffle Read Size / Input Size）。倾斜的典型表现：
+
+- 数据倾斜：大部分 Task 在 30s 内完成，但 1~2 个 Task 耗时 10min+，Shuffle Read Size 是中位数的 10 倍以上
+- 数据量过大导致 OOM：Task 直接 Failed，错误信息包含 `java.lang.OutOfMemoryError` 或 `Container killed by YARN for exceeding memory limits`
+
+**Step 2：从 Stage 编号推算对应代码**
+
+Spark 以 Shuffle 算子为边界划分 Stage。代码中每遇到一个宽依赖算子（`join`、`groupByKey`、`reduceByKey`、`repartition`、`distinct` 等），就会产生新的 Stage。
+
+```
+-- 假设 SQL 如下：
+SELECT a.id, b.name, count(*)      -- Stage 2: 最终聚合
+FROM table_a a
+JOIN table_b b ON a.key = b.key    -- Stage 1: Shuffle JOIN（第一个 shuffle 边界）
+GROUP BY a.id, b.name              -- Stage 2: Shuffle 聚合（第二个 shuffle 边界）
+
+-- 如果 Spark UI 显示 Stage 1 倾斜 → 问题出在 JOIN
+-- 如果 Stage 2 倾斜 → 问题出在 GROUP BY
+```
+
+**Step 3：分析 Key 分布**
+
+```scala
+// 方法 1：直接统计（数据量 < 1 亿时）
+val keyCount = rdd.countByKey()
+keyCount.toSeq.sortBy(-_._2).take(20).foreach(println)
+
+// 方法 2：采样统计（数据量大时，采样 10%）
+val sampled = rdd.sample(false, 0.1)
+sampled.countByKey().toSeq.sortBy(-_._2).take(20).foreach(println)
+
+// 方法 3：Spark SQL
+SELECT join_key, count(*) as cnt
+FROM table_a
+GROUP BY join_key
+ORDER BY cnt DESC
+LIMIT 20
+```
+
+**Step 4：区分两种表现，选择不同修复路径**
+
+| 表现 | 现象 | 根因 | 修复方向 |
+|------|------|------|---------|
+| Task 执行极慢 | Task 耗时是中位数的 5~100 倍，但最终能完成 | 少数 key 数据量远超其他 key | 打散热点 key（方案 4/7/8） |
+| Task OOM | Task 直接失败，报 OOM 或被 YARN kill | 单个 key 的数据超过单 Task 可用内存 | 增大内存 + 打散（先调参再改代码） |
+
 | 优先级 | 方案 | 适用场景 | 改动成本 |
 |--------|------|---------|---------|
 | 1 | 过滤倾斜 Key | null 值、测试数据等可丢弃的异常 key | 最低 |
@@ -1415,6 +1465,171 @@ Stage 8 每个 Task 平均输入 344MB，但执行内存只有 2.4G
 
 > **经验法则**：优先用纯参数方案（方案 1-3），再考虑 SQL 改写（方案 4-8）。AQE Skew Join 开启方式：`SET spark.sql.adaptive.skewJoin.enabled=true`。
 
+---
+
+#### 方案 0：Hive ETL 预处理（上游聚合）
+
+**适用场景**：数据源是 Hive 表，且数据本身分布不均匀。在 Hive 层提前完成聚合或 JOIN，Spark 直接读预处理后的中间表，从根源上避免 Shuffle。
+
+两种思路：
+
+```sql
+-- 思路 1：缩小 key 粒度（预聚合，减少数据量）
+-- Hive ETL 中提前按天聚合，Spark 读聚合后的结果
+INSERT OVERWRITE TABLE dw.order_daily_agg PARTITION(dt)
+SELECT user_id, count(*) as order_cnt, sum(amount) as total_amount, dt
+FROM ods.order_detail
+GROUP BY user_id, dt;
+
+-- 思路 2：增大 key 粒度（预 JOIN，避免 Spark 中大表 JOIN）
+-- Hive ETL 中提前完成大表 JOIN，Spark 读 JOIN 后的宽表
+INSERT OVERWRITE TABLE dw.order_user_wide PARTITION(dt)
+SELECT a.*, b.user_name, b.city
+FROM ods.order_detail a
+JOIN dim.user_info b ON a.user_id = b.user_id
+WHERE a.dt = '${bizdate}';
+```
+
+- 优点：完全规避 Spark 中的数据倾斜，Spark 任务逻辑简化
+- 缺点：治标不治本，Hive ETL 中仍然会倾斜；增加存储和链路维护成本
+
+---
+
+#### 方案 4：两阶段聚合（局部聚合 + 全局聚合）
+
+**适用场景**：聚合类 Shuffle（reduceByKey、groupByKey、GROUP BY）出现倾斜。**不适用于 JOIN 类 Shuffle。**
+
+**核心思路**：给 key 加随机前缀打散 → 局部聚合 → 去前缀 → 全局聚合。
+
+```
+数值示例：原始数据 (hello,1)(hello,1)(hello,1)(hello,1)
+  ↓ 加随机前缀（范围 1~2）
+(1_hello,1)(1_hello,1)(2_hello,1)(2_hello,1)
+  ↓ 局部聚合（reduceByKey）
+(1_hello,2)(2_hello,2)
+  ↓ 去前缀
+(hello,2)(hello,2)
+  ↓ 全局聚合（reduceByKey）
+(hello,4)
+```
+
+Spark SQL 实现：
+
+```sql
+-- 第一阶段：加随机前缀，局部聚合
+SELECT split(prefix_key, '_')[1] AS real_key, sum(partial_cnt) AS cnt
+FROM (
+    -- 局部聚合：加前缀后聚合，将热点 key 打散到多个 Task
+    SELECT concat(cast(floor(rand() * 10) as string), '_', group_key) AS prefix_key,
+           count(*) AS partial_cnt
+    FROM source_table
+    GROUP BY concat(cast(floor(rand() * 10) as string), '_', group_key)
+) tmp
+-- 第二阶段：去前缀，全局聚合
+GROUP BY split(prefix_key, '_')[1]
+```
+
+---
+
+#### 方案 7：热点 Key 单独 JOIN
+
+**适用场景**：少量热点 key（≤ 10 个）导致 JOIN 倾斜，且这些 key 不能过滤。**不适用于大量 key 都倾斜的情况。**
+
+五步流程：
+
+```scala
+// Step 1：采样找出倾斜 key
+val skewKeys = rdd.sample(false, 0.1)
+  .countByKey()
+  .filter(_._2 > threshold)
+  .keys.toList  // 例如找到 key = "hot_user_001"
+
+// Step 2：从大表中拆分倾斜 key 数据，打随机前缀
+val skewRDD = bigRDD.filter(x => skewKeys.contains(x._1))
+  .map(x => (s"${Random.nextInt(100)}_${x._1}", x._2))
+val normalRDD = bigRDD.filter(x => !skewKeys.contains(x._1))
+
+// Step 3：从小表中过滤对应 key 的数据，扩容 100 倍
+val skewSmallRDD = smallRDD.filter(x => skewKeys.contains(x._1))
+  .flatMap(x => (0 until 100).map(i => (s"${i}_${x._1}", x._2)))
+val normalSmallRDD = smallRDD
+
+// Step 4：分别 JOIN
+val skewResult = skewRDD.join(skewSmallRDD)
+  .map { case (k, v) => (k.split("_", 2)(1), v) }  // 去前缀
+val normalResult = normalRDD.join(normalSmallRDD)
+
+// Step 5：union 合并结果
+val finalResult = skewResult.union(normalResult)
+```
+
+---
+
+#### 方案 8：加盐打散（随机前缀扩容 JOIN）
+
+**适用场景**：大量 key 倾斜，方案 7 不适用时的兜底方案。
+
+**核心思路**：一侧打随机前缀（1~N），另一侧扩容 N 倍（打 0~N 顺序前缀），JOIN 后去前缀。
+
+```sql
+-- 大表：每条数据打随机前缀（1~10）
+SELECT /*+ SHUFFLE_HASH(b) */
+    a.id, a.amount, b.user_name
+FROM (
+    SELECT concat(cast(floor(rand() * 10) as string), '_', user_id) AS salted_key,
+           id, amount
+    FROM big_table
+) a
+JOIN (
+    -- 小表：每条数据扩容 10 倍（打 0~9 顺序前缀）
+    SELECT concat(cast(idx as string), '_', user_id) AS salted_key,
+           user_name
+    FROM small_table
+    LATERAL VIEW explode(array(0,1,2,3,4,5,6,7,8,9)) t AS idx
+) b
+ON a.salted_key = b.salted_key
+```
+
+- 适用：大量 key 倾斜，无法逐一处理
+- 局限性：只能缓解不能彻底解决；内存消耗大（小表膨胀 N 倍）；N 值需要调优
+- 实际案例：优化前 60 分钟 → 优化后 10 分钟
+
+---
+
+#### 方案 6+8 组合优化（实际项目最常用）
+
+实际项目中，通常只有少数 key 严重倾斜、大部分 key 分布相对均匀。最实用的策略是组合使用：提取倾斜 key 用加盐打散处理，普通 key 正常 JOIN，最后 union。
+
+```sql
+-- Step 1：识别倾斜 key（提前统计或采样）
+-- 假设已知倾斜 key 列表存入临时表 skew_keys
+
+-- Step 2：倾斜部分——加盐打散 JOIN
+SELECT id, amount, user_name
+FROM (
+    SELECT concat(cast(floor(rand() * 10) as string), '_', user_id) AS salted_key,
+           id, amount
+    FROM big_table
+    WHERE user_id IN (SELECT key FROM skew_keys)
+) a
+JOIN (
+    SELECT concat(cast(idx as string), '_', user_id) AS salted_key, user_name
+    FROM small_table
+    LATERAL VIEW explode(array(0,1,2,3,4,5,6,7,8,9)) t AS idx
+    WHERE user_id IN (SELECT key FROM skew_keys)
+) b ON a.salted_key = b.salted_key
+
+UNION ALL
+
+-- Step 3：正常部分——直接 JOIN
+SELECT id, amount, user_name
+FROM big_table a
+JOIN small_table b ON a.user_id = b.user_id
+WHERE a.user_id NOT IN (SELECT key FROM skew_keys)
+```
+
+这种组合策略的优势：只对倾斜 key 做扩容，避免全量数据膨胀；普通 key 走正常 JOIN 路径，不引入额外开销。
+
 ### 6.6 优化效果评估
 
 优化有两个方向——节约资源和加快速度——但它们不总是一致的（比如增加 Executor 可以加速但会消耗更多 CU）。评估标准要根据任务的重要性来定：
@@ -1424,6 +1639,116 @@ Stage 8 每个 Task 平均输入 344MB，但执行内存只有 2.4G
 SLA 任务（有承诺就绪时间）：以按时就绪为主，在保证 buffer 的前提下优化资源
 普通任务：以节省资源为主，使用默认参数即可
 ```
+
+### 6.7 Shuffle 底层机制与调优参数
+
+Shuffle 是 Spark 性能的关键分水岭——理解 ShuffleManager 的演进和调优参数，是从"会写 Spark SQL"到"能调优 Spark 任务"的必经之路。前面几节讲了"怎么调"，这一节讲"为什么这么调"。
+
+#### ShuffleManager 演进历史
+
+Spark 的 Shuffle 管理器经历了三代演进，每一代的核心目标都是减少磁盘文件数量、降低随机 I/O。
+
+**第一代：HashShuffleManager（Spark 1.2 以前默认）**
+
+每个 Map Task 为下游每个 Reduce Task 创建一个独立的磁盘文件。文件数量公式：
+
+```
+文件数 = Map Task 数 × Reduce Task 数
+```
+
+举例：上游 Stage 有 50 个 Map Task，下游 Stage 有 100 个 Reduce Task，则产生 50 × 100 = 5000 个磁盘文件。大量小文件导致频繁的随机磁盘 I/O 和文件句柄开销，是这一代 Shuffle 的核心瓶颈。
+
+**优化版：HashShuffleManager + consolidate 机制**
+
+开启 `spark.shuffle.consolidateFiles=true` 后，引入 shuffleFileGroup 复用机制：同一 Executor 上同一 CPU Core 先后执行的多个 Task 复用同一批磁盘文件。文件数量公式变为：
+
+```
+文件数 = 总 Core 数 × Reduce Task 数
+（总 Core 数 = Executor 数 × 每个 Executor 的 Core 数）
+```
+
+关键区别：未优化时每个 Task 创建一组文件，consolidate 后每个 Core 创建一组文件（同一 Core 上先后执行的多批 Task 共享）。
+
+举例：10 个 Executor，每个 1 个 Core（共 10 个 Core），50 个 Map Task 分 5 批执行，100 个 Reduce Task：
+
+| 对比项 | 未优化 | consolidate 后 |
+|--------|--------|----------------|
+| 每组文件数 | 100（= Reduce Task 数） | 100（= Reduce Task 数） |
+| 每组被几个 Task 使用 | 1 个 Task | 5 个 Task（同 Core 上的 5 批） |
+| 每 Executor 文件数 | 5 × 100 = 500 | 1 × 100 = 100 |
+| 总文件数 | 10 × 500 = 5000 | 10 × 100 = 1000 |
+| 减少比例 | — | 80% |
+
+> **注意**：consolidate 的收益取决于 Map Task 数与总 Core 数的比值（即批次数）。上例中 50 Task / 10 Core = 5 批，所以文件数减少为原来的 1/5。如果 Map Task 数 = 总 Core 数（每个 Core 只跑一个 Task），consolidate 不会减少文件数。
+
+**第二代：SortShuffleManager（Spark 1.2 以后默认）**
+
+每个 Map Task 只产生一个数据文件（data file）和一个索引文件（index file），文件数量大幅减少：
+
+```
+文件数 = Map Task 数 × 2（1 个数据文件 + 1 个索引文件）
+```
+
+同样以 50 个 Map Task、100 个 Reduce Task 为例：50 × 2 = 100 个文件（对比 HashShuffleManager 的 5000 个，减少 98%）。
+
+SortShuffleManager 有两种运行机制：
+
+**普通机制（Normal Sort Shuffle）**：
+1. 每个 Map Task 将数据写入内存数据结构（PartitionedAppendOnlyMap 或 PartitionedPairBuffer）
+2. 当内存不足时，按 Partition ID 排序后溢写到磁盘（spill），生成临时文件
+3. 所有数据写入完成后，将多个溢写文件 merge 成一个最终数据文件，并生成对应的索引文件
+4. 下游 Reduce Task 通过索引文件定位自己对应的数据区间
+
+**bypass 机制（Bypass Merge Shuffle）**：
+- 触发条件：Reduce Task 数 ≤ `spark.shuffle.sort.bypassMergeThreshold`（默认 200）且不需要 Map 端聚合
+- 与普通机制的区别：跳过排序步骤，直接为每个 Partition 写一个临时文件，最后 merge 成一个输出文件
+- 优势：省去排序开销，适合小规模 Shuffle 场景
+
+**三种 ShuffleManager 文件数量对比**：
+
+| ShuffleManager | 文件数量公式 | 示例（50 Map Task, 100 Reduce Task, 10 Executor × 1 Core） | 核心优势 / 问题 |
+|----------------|-------------|-----------------------------------------------------------|----------------|
+| HashShuffleManager | Map Task 数 × Reduce Task 数 | 50 × 100 = 5000 | 实现简单；磁盘文件爆炸，随机 I/O 严重 |
+| HashShuffleManager (consolidate) | 总 Core 数 × Reduce Task 数 | 10 × 100 = 1000 | 减少 80%；仍依赖 Core 数，文件可能仍多 |
+| SortShuffleManager | Map Task 数 × 2 | 50 × 2 = 100 | 文件数最少；引入排序开销 |
+
+> **演进本质**：从"每 Task 每分区一个文件"到"每 Core 每分区一个文件"再到"每 Task 一个文件"，每次演进都将文件数量降了一个量级。SortShuffleManager 用"排序 + 索引"的确定性开销换来了文件数量的指数级下降，在工程上几乎总是划算的——这也是它成为默认方案的原因。
+
+#### Shuffle 调优参数
+
+以下参数按 Shuffle Write 侧、Shuffle Read 侧、通用配置三类组织，覆盖日常调优中最常用的 7 个参数。
+
+| 参数 | 默认值 | 说明 | 调优建议 | 预期效果 |
+|------|--------|------|---------|---------|
+| `spark.shuffle.file.buffer` | 32k | Shuffle Write 阶段每个 Shuffle 文件的内存缓冲区。缓冲区越大，溢写磁盘的次数越少 | 调大到 64k–128k，减少磁盘写次数。对 I/O 密集型任务效果显著 | 磁盘写次数减少 30%–50%，Shuffle Write 耗时降低 10%–20% |
+| `spark.reducer.maxSizeInFlight` | 48m | Shuffle Read 阶段每个 Reduce Task 从远程拉取数据的最大并行缓冲区。决定每次能并行拉取多少数据 | 适当调大到 96m 可减少拉取轮次，但会占用更多内存。注意：每对节点间会分配该大小的缓冲区，总内存 = 缓冲区 × 并行连接数 | 拉取轮次减少，Shuffle Read 耗时降低 5%–15% |
+| `spark.shuffle.io.maxRetries` | 3 | Shuffle Read 拉取数据失败时的最大重试次数。GC 停顿或网络抖动可能导致拉取失败 | 调大到 5–8，应对 GC 长停顿场景。配合 retryWait 一起调整 | 减少因瞬时故障导致的任务失败，避免整 Stage 重试 |
+| `spark.shuffle.io.retryWait` | 5s | 每次重试的等待间隔，给被拉取方恢复的时间 | 适当增大到 10s–15s，避免对端 GC 未恢复就重试 | 配合 maxRetries 使用，显著降低拉取失败率 |
+| `spark.shuffle.memoryFraction` | 0.2 | Shuffle 聚合操作（如 reduceByKey 的 combine）可使用的执行内存比例 | 聚合密集型任务可调到 0.3，但需确保留足执行内存。Spark 3.x 统一内存管理下此参数已被 `spark.memory.fraction` 体系取代 | 减少聚合阶段的溢写次数，降低 10%–30% 磁盘 I/O |
+| `spark.shuffle.sort.bypassMergeThreshold` | 200 | 当 Reduce 分区数 ≤ 该阈值且无 Map 端聚合时，SortShuffleManager 使用 bypass 机制（跳过排序） | 小规模 Shuffle（分区数 < 200）时，bypass 可省排序开销。若分区数略超阈值，可适当调大到 300–400 | 减少排序 CPU 开销，小任务提升 5%–10% |
+| `spark.sql.shuffle.partitions` | 200 | Spark SQL / DataFrame 操作的 Shuffle 分区数（非 RDD API） | 根据数据量调整：每分区 128MB–256MB 为宜。1TB 数据约需 4000–8000 分区。开启 AQE 后可设较大值由 AQE 自动合并 | 分区过多导致调度开销大，分区过少有 OOM 风险。合理设置可提升 10%–30% |
+
+**调优实践要点**：
+
+```
+1. 优先调 spark.sql.shuffle.partitions——性价比最高
+   - 分区数 = 数据量 / 目标单分区大小（128MB-256MB）
+   - 开启 AQE 后，初始分区可设大，让 AQE 自动合并
+
+2. shuffle.file.buffer 和 reducer.maxSizeInFlight 是 I/O 层调优
+   - 磁盘 I/O 是瓶颈时优先调 shuffle.file.buffer（Write 侧）
+   - 网络拉取是瓶颈时优先调 reducer.maxSizeInFlight（Read 侧）
+
+3. maxRetries 和 retryWait 是稳定性调优，不影响正常性能
+   - 只在出现 FetchFailed 异常时才需要调整
+   - 常见于 Executor GC 长停顿或集群负载高的场景
+
+4. bypassMergeThreshold 是小任务优化，大任务无需关注
+   - 只对分区数 < 200 的小 Shuffle 生效
+   - 开启 AQE 后该参数影响减小
+```
+
+> **经验总结**：Shuffle 调优的本质是在"磁盘 I/O、网络传输、内存占用"三者间找平衡。没有万能参数，但 `spark.sql.shuffle.partitions` + AQE 的组合能解决 80% 的 Shuffle 性能问题。理解 ShuffleManager 演进的意义在于：知道为什么 SortShuffleManager 是默认的——它用排序的确定性开销换来了文件数量的量级下降，这在工程上几乎总是划算的。
 
 ---
 
