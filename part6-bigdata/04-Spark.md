@@ -2008,6 +2008,146 @@ YARN kill（exitCode 143）：
   → 调大 spark.executor.memoryOverhead，不是调 executor.memory
 ```
 
+#### executor.cores 与内存的竞争关系
+
+上面 OOM 排查路径中提到"检查 executor.cores 是否过大"，这里展开解释原因。
+
+```
+executor.cores 决定同一 Executor 内同时运行的 Task 数量：
+  executor.cores = 4 → 4 个 Task 共享同一个 Executor 的 JVM 堆内存
+  executor.memory = 8G → 每个 Task 平均可用 8G / 4 = 2G
+
+如果 executor.cores = 1 → 1 个 Task 独占 8G，几乎不可能 OOM
+如果 executor.cores = 8 → 8 个 Task 共享 8G，每个只有 1G，容易 OOM
+
+这就是为什么"调大 cores 提高并行度"有时反而引发 OOM——
+cores 越多，单 Task 可用内存越少，大表 JOIN 或聚合时更容易触发 Spill 甚至 OOM。
+
+推荐配置思路：
+  内存密集型（JOIN、聚合、排序）→ executor.cores 2-3，每核内存充裕
+  CPU 密集型（UDF、正则、JSON 解析）→ executor.cores 4-5，CPU 利用率高
+  不要盲目调大 cores，cores × 每 Task 数据量 = 实际内存压力
+```
+
+#### 常见运行时错误速查
+
+除了 OOM 和 Spill，Spark 任务还有几个高频运行时错误，下面按错误类型逐一说明。
+
+**广播超时（Broadcast Join Timeout）**
+
+```
+报错信息：org.apache.spark.SparkException: Could not execute broadcast in 300 secs.
+         You can increase the timeout for broadcasts via spark.sql.broadcastTimeout
+         or disable broadcast join by setting spark.sql.autoBroadcastJoinThreshold to -1
+
+原因：
+  Broadcast Join 需要把小表全量数据从 Driver 广播到所有 Executor
+  如果"小表"其实不小（如 autoBroadcastJoinThreshold 设得过大，或手动用了 broadcast hint）
+  → 广播数据量大 → 传输时间超过 spark.sql.broadcastTimeout（默认 300 秒）→ 超时报错
+
+解决：
+  ① 增大超时时间：SET spark.sql.broadcastTimeout=600（治标）
+  ② 真正的问题是小表不够小——检查 autoBroadcastJoinThreshold 是否设得过大
+  ③ 如果表确实大，禁用广播：SET spark.sql.autoBroadcastJoinThreshold=-1
+     → 让 Spark 走 SortMergeJoin（安全但慢）
+  ④ broadcast hint 打在大表上 → 移除 hint，让 Catalyst 自行选择 JOIN 策略
+```
+
+> **经验法则**：广播超时通常是"症状"而非"病因"。真正的问题是把不该广播的大表广播了。增大 timeout 只是给错误更多时间发生，正确做法是减小广播数据量或禁用广播。
+
+**Executor 心跳超时（Heartbeat Timeout）**
+
+```
+报错信息：Executor heartbeat timed out after xxxms
+         → 随后 Driver 标记该 Executor 为 Lost，任务重试或失败
+
+原因（按频率排序）：
+  ① Full GC 停顿（最常见）
+     → Executor JVM 长时间 Full GC，STW 期间所有线程暂停，心跳线程无法发送
+     → 查 Executor 日志搜索 "Full GC" 或 "real=" 确认
+  ② Executor 内存不足被 OOM Killer 杀死
+     → 进程直接消失，心跳自然断
+  ③ 网络问题
+     → Executor 和 Driver 之间网络不通或延迟过高
+  ④ Executor 负载过重
+     → 大量 Task 同时运行，CPU 被占满，心跳线程得不到调度
+
+关键参数（三者必须递增）：
+  spark.executor.heartbeatInterval  = 10s   （心跳发送间隔，默认 10s）
+  spark.storage.blockManagerSlaveTimeoutMs = 120s  （BlockManager 超时）
+  spark.network.timeout             = 120s  （网络超时，必须 > heartbeatInterval）
+
+注意：增大 heartbeatInterval 不能解决根本问题——
+  如果是 Full GC 导致的，增大间隔只是延迟报错，GC 问题依然存在。
+  正确做法：排查 GC 原因（内存不足、数据倾斜），而不是调大超时时间。
+```
+
+**Shuffle 文件丢失（FileNotFoundException / Shuffle file lost）**
+
+```
+报错信息：java.io.FileNotFoundException: /path/to/shuffle/block (No such file or directory)
+         或：Lost executor X on host: Container killed by YARN
+
+原因：
+  Spark 的 Shuffle 中间文件存在 Executor 的本地临时目录中
+  ① Executor 被 YARN kill（内存超限）→ NodeManager 清理 Container 临时目录
+     → 其他 Executor 来读 Shuffle 文件时发现文件不存在
+  ② Executor 崩溃（OOM、JVM crash）
+     → 同上，临时目录可能被清理
+  ③ 磁盘故障
+     → 本地磁盘损坏导致 Shuffle 文件丢失
+
+解决：
+  ① 根本解法：开启 External Shuffle Service（ESS）
+     → Shuffle 文件由独立服务管理，Executor 崩溃不影响 Shuffle 文件读取
+     → 动态资源分配也依赖 ESS
+  ② 治标：增大 Executor 内存，避免被 YARN kill
+  ③ 调大 spark.shuffle.io.maxRetries（默认 3）和 retryWait（默认 5s）
+     → 给 Spark 更多重试机会
+  ④ 如果频繁出现，检查磁盘健康状态和磁盘空间
+```
+
+**Metaspace OOM（Spark 3.x / Java 8+）**
+
+```
+报错信息：java.lang.OutOfMemoryError: Metaspace
+
+原因：
+  Metaspace 存储类的元数据（类名、方法、常量池等）
+  Spark 任务中大量使用反射、CGLIB 动态代理、UDF 编译等会动态生成类
+  → 加载的类数量超出 Metaspace 上限
+
+注意（Spark 3.x 关键变化）：
+  Java 8 移除了永久代（PermGen），替换为元空间（Metaspace）
+  → MaxPermSize 已废弃（Java 7 及之前用），Spark 3.x 必须 Java 8+
+  → 正确参数：-XX:MaxMetaspaceSize=512m
+  → 通过 spark.executor.extraJavaOptions 设置：
+     spark.executor.extraJavaOptions="-XX:MaxMetaspaceSize=512m"
+
+  Metaspace 与 PermGen 的关键区别：
+    PermGen：在 JVM 堆内，有固定上限，容易 OOM
+    Metaspace：在本地内存（Native Memory），默认无上限，使用物理内存
+    → 不设 MaxMetaspaceSize 可能吃光物理内存导致进程被 OOM Killer 杀死
+
+什么时候需要调：
+  ① 任务有大量 UDF / 自定义函数 → 类加载多
+  ② 报 OutOfMemoryError: Metaspace
+  ③ 一般设 256m-512m 足够，除非有极端的动态类生成场景
+```
+
+<details>
+<summary><b>展开：三种 OOM 的区分速查表</b></summary>
+
+| 错误类型 | 报错关键词 | 发生位置 | 根因 | 修复方向 |
+|---------|-----------|---------|------|---------|
+| Executor 堆内 OOM | `OutOfMemoryError: Java heap space` | Executor JVM | 执行内存不足（JOIN/聚合数据过大） | 调 memory.fraction、增大 shuffle.partitions、减少 executor.cores |
+| YARN kill（物理内存超限） | `Container killed by YARN` / `exitCode 143` | YARN NodeManager | 堆 + 堆外总物理内存超限 | 调大 `executor.memoryOverhead` |
+| Metaspace OOM | `OutOfMemoryError: Metaspace` | Executor JVM | 类元数据过多（UDF/反射/CGLIB） | 设置 `-XX:MaxMetaspaceSize=512m` |
+| Driver OOM | `OutOfMemoryError` in Driver | Driver JVM | collect() 拉大数据 / 广播大表 / 动态分区过多 | 改用 write 写出、检查 broadcast threshold |
+| StackOverflow | `StackOverflowError` | Executor / Driver | 递归过深（UDF 或 Spark 内部） | `-XX:ThreadStackSize=1m`（通过 extraJavaOptions） |
+
+</details>
+
 ### 6.4 Spark UI 分析方法——ETL 优化的第一步
 
 在优化 Spark 任务之前，先用 Spark UI 定位瓶颈，避免"凭感觉调参"。
