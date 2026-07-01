@@ -340,45 +340,7 @@ Driver 启动 → 向资源管理器申请 Executor
 
 **一台物理机上多个 Executor 的隔离**：在 YARN 模式下，每个 Executor 运行在独立的 YARN Container 中，YARN 用 cgroup 限制每个 Container 的 CPU 和内存——同一台物理机上的两个 Executor 互相隔离，CPU 时间片按配额分配，内存不能越界。Standalone 模式下隔离较弱，主要靠操作系统进程级隔离，没有 cgroup 级别的资源硬限制。
 
-#### cgroup 是什么
-
-cgroup（Control Groups）是 **Linux 内核功能**，不是系统调用（虽然它通过系统调用来配置），也不是用户态软件。它是 Linux 内核 2.6.24（2008 年）引入的资源隔离机制，Docker 容器技术的底层基石就是 cgroup + namespace。
-
-```
-cgroup 能做什么（核心功能）：
-
-① CPU 限制：限制一组进程最多用多少 CPU 时间片
-   例：cgroup 规定 Container 最多用 4 核 → 里面所有线程的 CPU 总和不超过 4 核
-
-② 内存限制：限制一组进程最多用多少内存
-   例：cgroup 规定 Container 最多用 8GB → 超过就被 OOM Kill（YARN kill 的底层原因）
-
-③ 磁盘 I/O 限制：限制读写带宽
-   例：限制 Container 磁盘吞吐 100MB/s
-
-④ 网络限制：限制网络带宽（较少用于 YARN，更多用于 Docker）
-
-⑤ 设备访问控制：禁止访问某些硬件设备
-```
-
-> **"资源分配单位"是什么意思？** 说 Container 是"资源分配单位"，意思是 YARN 在调度时以 Container 为粒度分配资源——"给你一个 Container，里面有 4 vcore、8GB 内存"。这个"分配"不是凭空造出来的，而是通过 cgroup 在内核层面强制执行：Container 里的进程（Executor JVM）如果试图使用超过配额的 CPU，会被内核限流；如果使用超过配额的内存，会被内核 OOM Kill。所以"资源分配单位"不是一个抽象概念，而是有 cgroup 在底层硬执行的物理约束。
-
-```
-从 Linux 内核视角看 YARN Container 的资源隔离：
-
-物理机（32 核 CPU，128GB 内存）
-  ├── cgroup A（限制：4 vcore，8GB 内存）
-  │     └── Executor 1（JVM 进程）→ 最多用 4 核 CPU、8GB 内存
-  ├── cgroup B（限制：4 vcore，8GB 内存）
-  │     └── Executor 2（JVM 进程）→ 最多用 4 核 CPU、8GB 内存
-  └── cgroup C（限制：2 vcore，4GB 内存）
-        └── 其他任务的 Executor
-
-三个 Executor 互不影响：
-  - Executor 1 OOM 不会影响 Executor 2（内存隔离）
-  - Executor 1 跑满 CPU 不会拖慢 Executor 2（CPU 隔离）
-  - 这是通过内核级 cgroup 强制执行的，不是应用层协议
-```
+> **cgroup 是什么？** cgroup 是 Linux 内核的资源隔离机制，通过虚拟文件系统（`/sys/fs/cgroup/`）配置，写入数字就能限制进程的 CPU/内存/磁盘 I/O。它不是 shell 命令也不是进程监控，而是 VFS 回调机制——写文件时内核直接修改调度参数，立刻生效。cgroup 限制的是整个进程的物理内存，和 JVM 的 `-Xmx`（只管堆内存）是两层不同的限制。完整原理（VFS 回调机制、权限模型、内核执行方式、与 Docker/YARN 的关系）详见 **[附录 A8 · Linux 操作系统基础](../part3-java-deep/A8-Linux操作系统基础.md)**。
 
 **slot 是 Spark 的概念吗？** 严格来说 slot 是 YARN/Mesos 的概念。Spark 自己的概念是 `spark.executor.cores`，表示一个 Executor 能同时运行多少个 Task。在 YARN 部署模式下，YARN 给 Container 分配的 vcore 数对应 Spark 的 executor.cores，两个概念在实际使用中经常混用：
 

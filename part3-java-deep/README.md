@@ -44,6 +44,7 @@ graph TD
     A --> P4[3.17 设计模式<br/>23种模式/SOLID/Spring实战]
     A --> R[附录 A1 核心数据结构<br/>跳表/红黑树/布隆过滤器/B+树]
     A --> S[附录 A2 网络协议基础<br/>TCP握手/HTTP/DNS]
+    A --> T[附录 A8 Linux操作系统基础<br/>cgroup/VFS/进程线程/namespace]
 
     B -.为第四章并发对比筑基.-> G[第四章 多语言对比]
     C -.为内存模型对比筑基.-> G
@@ -122,6 +123,8 @@ graph TD
 **[附录 A6：代码规范与设计原则](./A6-代码规范与设计原则.md)** —— SOLID 五原则逐一拆解（每个原则一句话 + Java 正例/反例）、阿里巴巴 Java 编码规范精选要点（命名/异常处理/集合/并发/日志）、代码坏味道速查表。
 
 **[附录 A7：开发工具链](./A7-开发工具链.md)** —— Git 进阶（分支策略/rebase vs merge/cherry-pick/bisect/stash）、Maven 生命周期与依赖冲突排查、Maven vs Gradle、CI/CD 概念与工具选型、Linux 运维命令速查（文件/进程/网络/线上排查组合拳）。
+
+**[附录 A8：Linux 操作系统基础](./A8-Linux操作系统基础.md)** —— 不讲命令（命令速查见 A7），讲内核运行机制。进程与线程的内核表示（task_struct / clone / fork-exec）、cgroup 资源隔离（虚拟文件系统配置、权限模型、五大功能、YARN 如何用 cgroup 控制 Executor）、VFS 一切皆文件设计（回调机制、cgroup 文件为何写一下就生效、非轮询的事件驱动原理）、namespace 视图隔离（Docker Container vs YARN Container 的区别）、进程间通信 IPC 全家桶。*面试剖析覆盖：cgroup vs JVM -Xmx、Spark Task 为何用线程、cgroup 文件写一下生效的原理、Docker Container vs YARN Container。*
 
 ---
 
