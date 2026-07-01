@@ -1686,6 +1686,95 @@ groupByKey() + mapValues(_.sum)：
 
 ### 6.3 调整计算资源
 
+#### 静态资源分配的痛点
+
+spark-submit 时指定的资源是**静态固定**的——`--num-executors 10 --executor-memory 8G` 意味着整个 Application 生命周期内始终占用 10 个 Executor，不管实际需不需要。这带来两个问题：
+
+```
+问题 1：资源浪费
+  Stage 0 需要 10 个 Executor 并行计算 → 充分利用
+  Stage 1 只有 3 个分区 → 7 个 Executor 空闲摸鱼，但资源不释放
+  → 其他任务想用这些资源也用不了（被占着）
+
+问题 2：资源不足
+  提交时指定了 10 个 Executor，但某个 Stage 数据量暴增需要 20 个
+  → 没有更多的 Executor 可分配，只能慢慢排队跑
+  → 而且不能在运行中追加资源（除非重新提交任务）
+```
+
+#### 动态资源分配（Dynamic Resource Allocation）
+
+Spark 提供了 Dynamic Resource Allocation（动态资源分配），根据运行时负载自动增减 Executor 数量。默认关闭，需要手动开启：
+
+```bash
+# 开启动态资源分配
+spark-submit \
+  --conf spark.dynamicAllocation.enabled=true \           # 总开关
+  --conf spark.dynamicAllocation.minExecutors=2 \         # 最少保留几个 Executor
+  --conf spark.dynamicAllocation.maxExecutors=50 \        # 最多扩展到几个 Executor
+  --conf spark.dynamicAllocation.initialExecutors=10 \    # 初始 Executor 数
+  --conf spark.dynamicAllocation.executorIdleTimeout=60s \  # Executor 空闲超过 60s 就回收
+  --conf spark.dynamicAllocation.schedulerBacklogTimeout=5s \  # Task 排队超过 5s 就申请新 Executor
+  ...
+```
+
+**什么时候加资源？什么时候减资源？**
+
+```
+加资源的触发条件：
+  Driver 调度器发现有 Task 处于 pending（排队等待）状态
+  且等待时间超过 schedulerBacklogTimeout（默认 60s）
+  → 向集群管理器申请新 Executor
+  → 新增数量呈指数级增长（1 → 2 → 4 → 8），快速响应
+
+减资源的触发条件：
+  某个 Executor 空闲时间超过 executorIdleTimeout（默认 60s）
+  → 该 Executor 被 kill 释放
+  → 资源还给集群管理器供其他任务使用
+```
+
+**为什么需要 External Shuffle Service？**
+
+动态分配回收 Executor 时面临一个问题：被回收的 Executor 上可能还有 Shuffle 数据，下游 Task 正等着拉这些数据。如果直接 kill Executor，Shuffle 文件丢失，下游 Task 就会失败。
+
+```
+没有 External Shuffle Service：
+  Executor 2 被回收 → Executor 2 上的 Shuffle 文件被删除
+  → 下游 Task 去 Executor 2 拉数据 → 找不到 → 任务失败
+
+有 External Shuffle Service：
+  Executor 2 被回收 → Shuffle 文件由 External Shuffle Service 保管
+  → 下游 Task 去 External Shuffle Service 拉数据 → 正常获取
+  → External Shuffle Service 是每个节点上的独立守护进程，不随 Executor 生死
+```
+
+开启方式（二选一）：
+
+```bash
+# 方式 1：Shuffle Tracking（Spark 3.0+，无需额外服务）
+--conf spark.dynamicAllocation.enabled=true
+--conf spark.dynamicAllocation.shuffleTracking.enabled=true
+# Spark 自己跟踪 Shuffle 文件的生命周期，不需要额外部署服务
+# 简单但回收延迟略高（要等所有依赖的 Shuffle 都被消费完才回收）
+
+# 方式 2：External Shuffle Service（传统方式，需要在每个节点部署）
+--conf spark.dynamicAllocation.enabled=true
+--conf spark.shuffle.service.enabled=true
+# 需要在每个 NodeManager 上部署 Spark 的 External Shuffle Service
+# 配置稍复杂但回收更及时
+```
+
+> **Dynamic Allocation vs AQE——不要混淆**：这是两个完全不同的东西。Dynamic Allocation 调整的是** Executor 数量**（资源层面），根据 Task 排队情况增减工人。AQE（Adaptive Query Execution）调整的是**执行计划**（逻辑层面），根据真实数据量合并分区、切换 JOIN 策略、处理倾斜。两者可以同时开启、互不冲突——Dynamic Allocation 管"有多少工人"，AQE 管"工人怎么干活"。
+
+| 维度 | Dynamic Allocation | AQE |
+|------|-------------------|-----|
+| **调整对象** | Executor 数量（资源） | 执行计划（逻辑） |
+| **触发依据** | Task 排队等待 / Executor 空闲 | Shuffle 后真实数据量 |
+| **作用层面** | 资源管理 | 查询优化 |
+| **适用场景** | 长时间运行的 Application（多 Job） | 单个 SQL 查询的执行过程 |
+| **版本** | Spark 1.2+ | Spark 3.0+ |
+| **默认状态** | 关闭 | Spark 3.2+ 默认开启 |
+
 #### 内存模型与 memory.fraction
 
 Spark Executor 的 JVM 内存分为三个区域：
