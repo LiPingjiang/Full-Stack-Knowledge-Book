@@ -1464,36 +1464,82 @@ JOIN category_ranked c ON o.order_id = c.order_id;
 
 #### reduceByKey vs groupByKey——从源码看本质区别
 
-后端开发者可能觉得 reduceByKey 和 groupByKey 是两个独立的 API，但看 Spark 源码会发现：**所有 ByKey 聚合操作都收敛到同一个底层方法 `combineByKeyWithClassTag`**，它们的区别只是传入的三个函数参数不同。
+后端开发者可能觉得 reduceByKey 和 groupByKey 是两个独立的 API，但看 Spark 源码会发现：**所有 ByKey 聚合操作都收敛到同一个底层方法 `combineByKeyWithClassTag`**，它们的区别只是传入的三个函数参数不同。这三个函数控制了聚合的两个阶段：
+
+```
+三个函数参数的含义：
+
+createCombiner(v)          → 分区内遇到第一个 key 时，怎么初始化聚合容器
+mergeValue(buf, v)         → 分区内遇到后续相同 key 时，怎么把值合并进容器（Map 端 combine）
+mergeCombiners(buf1, buf2) → 跨分区合并两个聚合容器（Reduce 端）
+
+执行流程：
+  分区 1 内：  v1 → createCombiner(v1) → buf1 → mergeValue(buf1, v2) → buf1'
+  分区 2 内：  v3 → createCombiner(v3) → buf2 → mergeValue(buf2, v4) → buf2'
+  Shuffle + Reduce：  mergeCombiners(buf1', buf2') → 最终结果
+```
+
+五个 API 按灵活度从低到高排列：
+
+| API | createCombiner | mergeValue（分区内） | mergeCombiners（跨分区） | 灵活度 |
+|-----|---------------|-------------------|----------------------|--------|
+| **groupByKey** | 固定：创建列表 | 固定：追加到列表 | 固定：合并列表 | 最低（零自定义） |
+| **foldByKey** | 用零值 + func 初始化 | 自定义 func | **同 func** | 低 |
+| **reduceByKey** | 固定：值本身是初始值 | 自定义 func | **同 func** | 低 |
+| **aggregateByKey** | 用 zeroValue + seqOp 初始化 | 自定义 seqOp | 自定义 combOp（**可与 seqOp 不同**） | 高 |
+| **combineByKey** | 自定义 | 自定义 | 自定义（**三个全自定义**） | 最高 |
 
 ```scala
 // Spark 源码：PairRDDFunctions.scala（简化版）
 
-// reduceByKey 的底层调用
-def reduceByKey(func: (V, V) => V): RDD[(K, V)] =
-  combineByKeyWithClassTag[V](
-    (v: V) => v,          // createCombiner：值本身就是初始聚合结果
-    func,                 // mergeValue：分区内聚合（Map 端 combine）
-    func                  // mergeCombiners：跨分区聚合（Reduce 端）
-  )
-
-// groupByKey 的底层调用
+// ① groupByKey：三个函数全固定，零自定义
 def groupByKey(): RDD[(K, Iterable[V])] =
   combineByKeyWithClassTag[CompactBuffer[V]](
-    (v: V) => CompactBuffer(v),    // createCombiner：创建列表
-    (buf, v) => buf += v,          // mergeValue：往列表追加元素
-    (buf1, buf2) => buf1 ++= buf2  // mergeCombiners：合并两个列表
+    (v: V) => CompactBuffer(v),      // createCombiner：创建列表（固定）
+    (buf, v) => buf += v,            // mergeValue：往列表追加元素（固定）
+    (buf1, buf2) => buf1 ++= buf2    // mergeCombiners：合并两个列表（固定）
   )
+  // 你无法改变聚合方式——它永远是把值收集成列表
+  // Map 端不做任何聚合，Shuffle 传全量数据
 
-// aggregateByKey 的底层调用
+// ② foldByKey：自定义一个 func，分区内和跨分区用同一个 func
+def foldByKey(zeroValue: V)(func: (V, V) => V): RDD[(K, V)] =
+  combineByKeyWithClassTag[V](
+    (v: V) => func(zeroValue, v),    // createCombiner：用零值 + func 初始化
+    func,                             // mergeValue：分区内用 func 聚合
+    func                              // mergeCombiners：跨分区也用 func（和分区内相同）
+  )
+  // 比 groupByKey 灵活：可以自定义聚合逻辑（如 _ + _）
+  // 但分区内和跨分区必须是同一种操作
+
+// ③ reduceByKey：自定义一个 func，分区内和跨分区用同一个 func
+def reduceByKey(func: (V, V) => V): RDD[(K, V)] =
+  combineByKeyWithClassTag[V](
+    (v: V) => v,                      // createCombiner：值本身就是初始值（不需要零值）
+    func,                             // mergeValue：分区内用 func 聚合
+    func                              // mergeCombiners：跨分区也用 func（和分区内相同）
+  )
+  // 和 foldByKey 的区别：不需要零值，直接用第一个值做初始值
+  // 灵活度和 foldByKey 一样，只是少了零值参数
+
+// ④ aggregateByKey：分区内和跨分区可以用不同的 func
 def aggregateByKey[U](zeroValue: U)(seqOp: (U, V) => U, combOp: (U, U) => U): RDD[(K, U)] =
   combineByKeyWithClassTag[U](
-    (v: V) => seqOp(zeroValue, v), // createCombiner：用零值初始化
-    seqOp,                         // mergeValue：分区内聚合
-    combOp                         // mergeCombiners：跨分区聚合
+    (v: V) => seqOp(zeroValue, v),    // createCombiner：用零值 + seqOp 初始化
+    seqOp,                             // mergeValue：分区内用 seqOp 聚合
+    combOp                             // mergeCombiners：跨分区用 combOp（可以和 seqOp 不同！）
   )
+  // 比 reduceByKey 灵活：分区内和跨分区可以用不同的聚合逻辑
+  // 典型场景：求平均值——分区内用 seqOp 做 (sum, count)，跨分区用 combOp 合并后除
 
-// foldByKey 也是调用 combineByKeyWithClassTag，只是 seqOp = combOp = func
+// ⑤ combineByKey：三个函数全自定义
+def combineByKey[C](
+    createCombiner: V => C,            // 自定义初始值逻辑
+    mergeValue: (C, V) => C,           // 自定义分区内聚合
+    mergeCombiners: (C, C) => C        // 自定义跨分区聚合
+  ): RDD[(K, C)]
+  // 最灵活：三个函数各自独立定义
+  // aggregateByKey 其实就是 combineByKey 的 createCombiner = seqOp(zeroValue, v) 的特例
 ```
 
 **关键区别在于 `mergeValue`（Map 端 combine 时做什么）**：
@@ -1526,7 +1572,7 @@ groupByKey() + mapValues(_.sum)：
   Reduce 端：(hello, [1,1,1,1].sum=4)(world, [1,1].sum=2)(spark, [1].sum=1)
 ```
 
-> **经验法则**：能用 `reduceByKey` / `aggregateByKey` / `foldByKey` 就不用 `groupByKey`——它们底层都是 `combineByKeyWithClassTag`，但前三个在 Map 端就做了聚合（combiner），过网络的数据量远小于 groupByKey。
+> **经验法则**：灵活度从低到高：groupByKey < foldByKey ≈ reduceByKey < aggregateByKey < combineByKey。但**灵活度越高不代表越好**——选你能用的最低灵活度。能用 `reduceByKey` 就别用 `aggregateByKey`，能用 `aggregateByKey` 就别用 `combineByKey`。唯一不要用的是 `groupByKey`——它灵活度最低且性能最差（Map 端不做任何聚合）。只有在确实需要保留原始值列表（如 `groupByKey().flatMap(...)`）时才用 groupByKey。
 
 ### 6.3 调整计算资源
 
