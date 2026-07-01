@@ -1169,7 +1169,37 @@ FROM daily_gmv;
   → 相当于"整个分区"，SUM 变成分区内总和
 ```
 
-这就是为什么同样是 `SUM() OVER(PARTITION BY ...)`，加不加 ORDER BY 结果完全不同的原因。
+这就是为什么同样是 `SUM() OVER(PARTITION BY ...)`，加不加 ORDER BY 结果完全不同的原因。具体例子：
+
+```
+原始数据（部门 1 的 3 个员工）：
+name   dept_id  salary
+张三   1        3000
+李四   1        5000
+王五   1        2000
+
+① SUM(salary) OVER (PARTITION BY dept_id)  — 不加 ORDER BY
+   → 默认框架：ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+   → 整个分区参与计算，每行的结果都是同一个值（部门总和）
+
+   name   dept_id  salary  sum
+   张三   1        3000    10000   ← 3000+5000+2000
+   李四   1        5000    10000   ← 3000+5000+2000（和上面一样）
+   王五   1        2000    10000   ← 3000+5000+2000（和上面一样）
+
+② SUM(salary) OVER (PARTITION BY dept_id ORDER BY salary)  — 加 ORDER BY
+   → 默认框架：RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+   → 从分区第一行累计到当前行，每行的结果不同（累计求和）
+
+   name   dept_id  salary  running_sum
+   王五   1        2000    2000        ← 按 salary 排序后第一行，累计 = 2000
+   张三   1        3000    5000        ← 累计 = 2000 + 3000
+   李四   1        5000    10000       ← 累计 = 2000 + 3000 + 5000
+
+   注意：加了 ORDER BY 后数据会按 salary 排序，且每行的 SUM 值不同（逐行累加）
+```
+
+> **一句话记忆**：不加 ORDER BY，聚合函数对整个分区算一遍（每行结果相同）；加了 ORDER BY，聚合函数变成从第一行累计到当前行（每行结果不同）。如果你要的是"部门总薪资"而不是"累计薪资"，就不要加 ORDER BY。
 
 #### 窗口函数优化
 
