@@ -215,7 +215,117 @@ graph TD
 | **Executor** | 集群节点上的 JVM 进程，负责执行 Task 和缓存 RDD 数据 |
 | **Task** | 最小执行单元，一个 Task 处理一个 RDD 分区 |
 
-### 3.1 Job → Stage → Task 的划分
+### 3.1 部署模式与提交流程
+
+Driver 和 Executor 本质上都是 JVM 进程，不关心运行在哪里——只要能启动 Java 进程、能互相通信即可。根据它们运行位置的不同，Spark 支持多种部署模式。
+
+#### 四种部署模式
+
+```
+Local（本地模式）
+  Driver 和 Executor 运行在同一个 JVM 进程中
+  只启动 1 个 Executor，通过多线程模拟并行
+  → 开发测试用，Spark Shell / Notebook 默认就是 Local
+
+Spark Standalone（独立集群）
+  Spark 自带的资源管理器，由 Master + Worker 组成
+  Master 负责资源分配，Worker 负责在本机启动/停止 Executor
+  → 轻量级，适合小团队快速搭集群，但资源隔离弱（无 cgroup）
+
+YARN（Hadoop 集群）
+  借用 Hadoop YARN 做资源管理，Spark 和 Hadoop 生态共享集群
+  → 生产环境最常用，资源隔离强（cgroup），多框架共享资源
+
+Kubernetes（云原生）
+  Driver 和 Executor 运行在 K8s Pod 中
+  → 云原生趋势，适合容器化部署，Spark 3.x 后逐渐成熟
+```
+
+| 维度 | Local | Standalone | YARN | K8s |
+|------|-------|-----------|------|-----|
+| **资源管理** | 无 | Master/Worker | YARN ResourceManager/NodeManager | K8s Scheduler |
+| **资源隔离** | 无 | OS 进程级（弱） | cgroup（强） | Pod 级（强） |
+| **多框架共享** | 不支持 | 仅 Spark | Spark/Flink/Hadoop 共享 | 任意容器化应用 |
+| **适用场景** | 开发测试 | 小团队快速搭建 | 生产环境主流 | 云原生部署 |
+| **Driver 位置** | 本地 JVM | 可选 client/cluster | 可选 client/cluster | 主要 cluster |
+
+> **为什么生产环境通常用 YARN 而不是 Standalone？** 三个原因：一是 YARN 是通用资源管理器，Spark、Flink、Hadoop MapReduce 可以共享同一批机器，白天跑 Spark 分析、晚上跑 Flink 实时任务；二是 YARN 用 cgroup 做资源隔离，一个 Executor OOM 不影响其他 Executor，Standalone 只有 OS 进程级隔离；三是 YARN 有完善的队列和优先级调度，可以按部门/项目分配资源配额，Standalone 的调度能力较弱。
+
+#### Client vs Cluster 模式
+
+不管用哪种集群，Driver 可以运行在两个地方——这就是 client 模式和 cluster 模式的区别：
+
+```
+Client 模式：Driver 运行在提交任务的机器上
+  你在机器 A 上执行 spark-submit → Driver 进程在机器 A 上启动
+  → 机器 A 必须一直在线，关机/断网 = 任务挂
+  → 日志直接在机器 A 的终端输出，方便调试
+  → Spark Shell / Notebook 天然是 client 模式
+
+Cluster 模式：Driver 运行在集群内部
+  你在机器 A 上执行 spark-submit → 机器 A 只负责"提交"
+  → Driver 进程被调度到集群中的某个节点上运行
+  → 提交后机器 A 可以关机，任务不受影响
+  → 日志要去集群内部查看（YARN 的 ApplicationMaster 日志）
+  → 生产环境的定时任务必须用 cluster 模式
+```
+
+| 维度 | Client 模式 | Cluster 模式 |
+|------|------------|-------------|
+| **Driver 位置** | 提交任务的机器上 | 集群内部某个节点 |
+| **提交机器是否需要在线** | 是（关机任务就挂） | 否（提交后可以关机） |
+| **日志查看** | 直接在终端看 | 去集群内部看（yarn logs） |
+| **适用场景** | 交互式分析、开发调试 | 生产定时任务、长时间运行作业 |
+| **Spark Shell** | 天然 client（Shell 就是 Driver） | 不支持（Shell 需要交互） |
+
+> **一句话记忆**：client 模式 Driver 在你手边（方便调试但机器不能关），cluster 模式 Driver 在集群里（机器能关但日志要去集群找）。生产环境定时任务必须用 cluster，因为提交任务的机器（如调度机）可能在任务执行期间重启。
+
+#### spark-submit 提交流程
+
+```bash
+# 典型的 spark-submit 命令
+spark-submit \
+  --master yarn \                    # 资源管理器：yarn / spark://host:7077 / k8s://...
+  --deploy-mode cluster \            # 部署模式：client / cluster
+  --executor-memory 8G \             # 每个 Executor 内存
+  --executor-cores 4 \               # 每个 Executor CPU 核数
+  --num-executors 10 \               # Executor 数量
+  --class com.example.MySparkApp \   # 主类
+  my-app.jar \                       # 应用 JAR
+  --input /data/input --output /data/output  # 应用参数
+```
+
+提交流程的完整链路（以 YARN Cluster 模式为例）：
+
+```
+① spark-submit 提交任务
+   → 在提交机器上启动一个临时进程
+   → 向 YARN ResourceManager 申请 ApplicationMaster 资源
+
+② YARN 分配 Container，启动 ApplicationMaster（就是 Driver）
+   → Driver 运行在集群内部某个 NodeManager 上
+   → 提交机器上的临时进程退出，不再参与
+
+③ Driver 初始化 SparkContext
+   → 向 YARN ResourceManager 申请 Executor 资源
+   → "我需要 10 个 Container，每个 4 核 8GB"
+
+④ YARN 在各 NodeManager 上分配 Container，启动 Executor JVM
+   → Executor 启动后，反向注册到 Driver
+   → "我是 Executor 1，我有 4 个 slot，随时可以接活"
+
+⑤ Driver 开始调度 Task
+   → 根据 DAG 划分 Stage，生成 Task
+   → 将 Task 分发给已注册的 Executor 执行
+   → Task 完成后 Executor 汇报结果，Driver 分发下一批
+
+⑥ Application 结束
+   → Driver 向 YARN 注销，所有 Executor 被关闭，Container 释放
+```
+
+> **不同集群的差异仅在步骤 ① ~ ④**——向谁申请资源、在哪里启动 Driver/Executor。步骤 ⑤ 之后的 Task 调度和执行完全一样，这就是 Spark 跨集群可移植的原因：通过 SchedulerBackend 接口的不同实现类适配不同集群管理器，上层执行逻辑不变。
+
+### 3.2 Job → Stage → Task 的划分
 
 ```
 包含关系：1 Job ⊃ 若干 Stage ⊃ 若干 Task
