@@ -274,6 +274,72 @@ Executor → 分区：多对多（一个 Executor 可以持有多个分区的数
 
 > **关键**：分区数决定了 Task 数（并行度的上限），Executor 核数决定了同时能跑多少个 Task（实际并行度）。如果分区数远大于总核数，Task 会分批调度；如果分区数小于总核数，有些核会空闲——所以分区数通常建议设为总核数的 2-3 倍。
 
+#### Executor、Task、Container 到底是什么——进程、线程还是资源配额
+
+上面的描述用了"核"和"Executor"等概念，这里把它们的物理形态说清楚：
+
+```
+一个 Spark 应用的进程/线程结构（从外到内）：
+
+YARN Container（资源隔离单位，cgroup 限制 CPU/内存）
+  └── Executor（JVM 进程，就是 java -Xmx8G ... 启动的普通 JVM）
+        ├── 核 0 / slot 0 → Task 线程 A（正在处理分区 0）
+        ├── 核 1 / slot 1 → Task 线程 B（正在处理分区 1）
+        ├── 核 2 / slot 2 → Task 线程 C（正在处理分区 2）
+        ├── 核 3 / slot 3 → Task 线程 D（正在处理分区 3）
+        └── 共享 JVM 堆内存（所有 Task 线程共用）
+              ├── RDD 缓存数据
+              ├── Shuffle 数据
+              └── 广播变量等
+```
+
+各概念的物理形态：
+
+| 概念 | 本质 | 生命周期 |
+|------|------|---------|
+| **Container** | YARN 的**资源配额**（不是进程），通过 cgroup 限制 CPU/内存 | 绑定 Executor |
+| **Executor** | 一个 **JVM 进程**（`java -cp ...` 启动） | 绑定整个 Application |
+| **Task** | Executor JVM 内的一个**线程** | 秒到分钟级，完成即销毁 |
+| **slot / core** | **逻辑概念**，表示"能同时跑几个 Task"的配额 | 随 Executor 存在 |
+
+> **为什么 Task 是线程而不是进程？** 这是 Spark 和 MapReduce 最大的架构差异。MapReduce 每个 Task 启动一个独立 JVM 进程，启动开销几秒钟，短任务甚至启动比计算还慢。Spark 让 Executor 常驻、Task 以线程方式运行，启动几乎零开销，而且同一个 Executor 内的 Task 共享 JVM 堆内存——RDD 缓存可以被复用，不用每个 Task 重新加载。
+
+**Executor 的生命周期**：Executor 绑定整个 Spark Application，不绑定某一批 Task。一批 Task 跑完后 Executor 不关闭，而是向 Driver 汇报"我空闲了"，Driver 继续分配下一批 Task。只有三种情况 Executor 会结束：Application 正常完成、被 kill、或因 OOM/心跳超时被 Driver 移除。
+
+```
+Application 生命周期内的时间线：
+
+Driver 启动 → 向资源管理器申请 Executor
+  → Executor 1 启动（JVM 进程，一直活着）
+  → Executor 2 启动（JVM 进程，一直活着）
+  → Executor 3 启动（JVM 进程，一直活着）
+
+  Stage 0: Executor 1 跑 Task A,B,C,D
+    → Task 完成 → Executor 不关闭，汇报"我空了"
+  Stage 1: Executor 1 跑 Task E,F,G,H（复用同一个 JVM）
+    → Task 完成 → 继续等待
+  ...
+  Application 结束 → 所有 Executor 关闭
+```
+
+**一台物理机上多个 Executor 的隔离**：在 YARN 模式下，每个 Executor 运行在独立的 YARN Container 中，YARN 用 cgroup 限制每个 Container 的 CPU 和内存——同一台物理机上的两个 Executor 互相隔离，CPU 时间片按配额分配，内存不能越界。Standalone 模式下隔离较弱，主要靠操作系统进程级隔离，没有 cgroup 级别的资源硬限制。
+
+**slot 是 Spark 的概念吗？** 严格来说 slot 是 YARN/Mesos 的概念。Spark 自己的概念是 `spark.executor.cores`，表示一个 Executor 能同时运行多少个 Task。在 YARN 部署模式下，YARN 给 Container 分配的 vcore 数对应 Spark 的 executor.cores，两个概念在实际使用中经常混用：
+
+```
+概念对应关系：
+
+YARN 层：       Container（vcore=4, memory=8GB）
+                           ↓ 启动
+Spark 层：      Executor（executor.cores=4, executor.memory=8GB）
+                           ↓ 分配
+Task 层：       4 个 task slot，同时跑 4 个 Task 线程
+
+OS 层：         1 个 JVM 进程，4 个工作线程，受 cgroup 约束
+```
+
+> **一个 slot 对应一个物理核吗？** 不对应。slot 是逻辑概念，对应 vcore（虚拟核），vcore 和物理核没有绑定关系。一台 32 物理核的机器，YARN 可以配 40 个 vcore（超分）或 16 个 vcore（欠分）。Task 线程跑在哪个物理核上由操作系统调度器决定，Spark 和 YARN 都不关心。
+
 ---
 
 ## 四、Spark SQL——最常用的模块
