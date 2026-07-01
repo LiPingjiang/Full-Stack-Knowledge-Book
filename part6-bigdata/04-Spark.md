@@ -302,7 +302,23 @@ YARN Container（资源隔离单位，cgroup 限制 CPU/内存）
 | **Task** | Executor JVM 内的一个**线程** | 秒到分钟级，完成即销毁 |
 | **slot / core** | **逻辑概念**，表示"能同时跑几个 Task"的配额 | 随 Executor 存在 |
 
-> **为什么 Task 是线程而不是进程？** 这是 Spark 和 MapReduce 最大的架构差异。MapReduce 每个 Task 启动一个独立 JVM 进程，启动开销几秒钟，短任务甚至启动比计算还慢。Spark 让 Executor 常驻、Task 以线程方式运行，启动几乎零开销，而且同一个 Executor 内的 Task 共享 JVM 堆内存——RDD 缓存可以被复用，不用每个 Task 重新加载。
+#### 四个常见疑问——逐个说清楚
+
+**Q1：Executor 是什么？**
+
+Executor 是一个实实在在的 **JVM 进程**，就是通过 `java -cp ... -Xmx8G ...` 启动的普通 Java 进程。它不是虚拟容器、不是线程、不是抽象概念——你用 `jps` 命令能在进程列表里看到它，用 `top` 能看到它占用的 CPU 和内存。在 YARN 模式下，YARN NodeManager 在物理机上启动这个 JVM 进程并把它关进 cgroup 里做资源限制。
+
+**Q2：Task 是进程还是线程？**
+
+Task 是 Executor JVM 进程内的一个**线程**，不是独立进程。这是 Spark 和 MapReduce 最大的架构差异——MapReduce 每个 Task 启动一个独立 JVM 进程，启动开销几秒钟，短任务甚至启动比计算还慢。Spark 让 Executor 常驻、Task 以线程方式运行，启动几乎零开销，而且同一个 Executor 内的 Task 共享 JVM 堆内存，RDD 缓存可以被复用，不用每个 Task 重新加载。
+
+**Q3：核跟 Task 是一对一吗？**
+
+是的。这里的"核"是 `spark.executor.cores` 配置的逻辑 slot，不是物理 CPU 核。一个 Executor 配了 4 个 core 就有 4 个 slot，可以同时跑 4 个 Task 线程。每个 slot 同一时刻只跑一个 Task，Task 完成后 slot 空出来给下一个排队的 Task。注意 4 个 Task 线程是并发执行（分到不同物理核的时间片），不是并行（不绑定物理核）。
+
+**Q4：核跟进程是一对一吗？**
+
+不是。一个 Executor（进程）可以有多个核。`spark.executor.cores=4` 表示一个 JVM 进程有 4 个逻辑 slot，可以同时跑 4 个 Task 线程。核是进程内部的并发配额，不是进程数。
 
 **Executor 的生命周期**：Executor 绑定整个 Spark Application，不绑定某一批 Task。一批 Task 跑完后 Executor 不关闭，而是向 Driver 汇报"我空闲了"，Driver 继续分配下一批 Task。只有三种情况 Executor 会结束：Application 正常完成、被 kill、或因 OOM/心跳超时被 Driver 移除。
 
@@ -323,6 +339,46 @@ Driver 启动 → 向资源管理器申请 Executor
 ```
 
 **一台物理机上多个 Executor 的隔离**：在 YARN 模式下，每个 Executor 运行在独立的 YARN Container 中，YARN 用 cgroup 限制每个 Container 的 CPU 和内存——同一台物理机上的两个 Executor 互相隔离，CPU 时间片按配额分配，内存不能越界。Standalone 模式下隔离较弱，主要靠操作系统进程级隔离，没有 cgroup 级别的资源硬限制。
+
+#### cgroup 是什么
+
+cgroup（Control Groups）是 **Linux 内核功能**，不是系统调用（虽然它通过系统调用来配置），也不是用户态软件。它是 Linux 内核 2.6.24（2008 年）引入的资源隔离机制，Docker 容器技术的底层基石就是 cgroup + namespace。
+
+```
+cgroup 能做什么（核心功能）：
+
+① CPU 限制：限制一组进程最多用多少 CPU 时间片
+   例：cgroup 规定 Container 最多用 4 核 → 里面所有线程的 CPU 总和不超过 4 核
+
+② 内存限制：限制一组进程最多用多少内存
+   例：cgroup 规定 Container 最多用 8GB → 超过就被 OOM Kill（YARN kill 的底层原因）
+
+③ 磁盘 I/O 限制：限制读写带宽
+   例：限制 Container 磁盘吞吐 100MB/s
+
+④ 网络限制：限制网络带宽（较少用于 YARN，更多用于 Docker）
+
+⑤ 设备访问控制：禁止访问某些硬件设备
+```
+
+> **"资源分配单位"是什么意思？** 说 Container 是"资源分配单位"，意思是 YARN 在调度时以 Container 为粒度分配资源——"给你一个 Container，里面有 4 vcore、8GB 内存"。这个"分配"不是凭空造出来的，而是通过 cgroup 在内核层面强制执行：Container 里的进程（Executor JVM）如果试图使用超过配额的 CPU，会被内核限流；如果使用超过配额的内存，会被内核 OOM Kill。所以"资源分配单位"不是一个抽象概念，而是有 cgroup 在底层硬执行的物理约束。
+
+```
+从 Linux 内核视角看 YARN Container 的资源隔离：
+
+物理机（32 核 CPU，128GB 内存）
+  ├── cgroup A（限制：4 vcore，8GB 内存）
+  │     └── Executor 1（JVM 进程）→ 最多用 4 核 CPU、8GB 内存
+  ├── cgroup B（限制：4 vcore，8GB 内存）
+  │     └── Executor 2（JVM 进程）→ 最多用 4 核 CPU、8GB 内存
+  └── cgroup C（限制：2 vcore，4GB 内存）
+        └── 其他任务的 Executor
+
+三个 Executor 互不影响：
+  - Executor 1 OOM 不会影响 Executor 2（内存隔离）
+  - Executor 1 跑满 CPU 不会拖慢 Executor 2（CPU 隔离）
+  - 这是通过内核级 cgroup 强制执行的，不是应用层协议
+```
 
 **slot 是 Spark 的概念吗？** 严格来说 slot 是 YARN/Mesos 的概念。Spark 自己的概念是 `spark.executor.cores`，表示一个 Executor 能同时运行多少个 Task。在 YARN 部署模式下，YARN 给 Container 分配的 vcore 数对应 Spark 的 executor.cores，两个概念在实际使用中经常混用：
 
