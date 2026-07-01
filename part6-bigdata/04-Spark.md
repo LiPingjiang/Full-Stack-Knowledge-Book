@@ -233,11 +233,103 @@ Task：    一个 Stage 内，RDD 的每个数据分区对应一个 Task
 
 > **分区是谁的？** 这里的"分区"是 **RDD / DataFrame 的数据分区**，不是 Stage 自己拥有的分区。Stage 是执行计划的概念，分区是数据的概念——数据被切成 N 份（N 个分区），Stage 就生成 N 个 Task，每个 Task 处理其中 1 份。分区数量由 `numPartitions` 参数、Shuffle 后的分区数、或 `repartition()` 决定，跟 Stage 本身无关。
 
+#### 一个 Stage 内有多个 RDD，Task 怎么划分
+
+一个 Stage 内的多个 RDD 通过窄依赖串联（map、filter 等），形成一条流水线。窄依赖保证父子 RDD 分区一一对应，所以 Spark 只看**最后一个 RDD（最终 RDD）的分区数**来决定 Task 数——中间 RDD 的分区数不影响：
+
+```
+Stage 0 内的流水线（窄依赖，不产生 Shuffle）：
+  RDD_A (3 分区) → map → RDD_B (3 分区) → filter → RDD_C (3 分区)
+
+  窄依赖：父分区 1 → 子分区 1，一一对应，不改变分区数
+  所以 RDD_A、RDD_B、RDD_C 都是 3 个分区
+
+  → 生成 3 个 Task：
+    Task 1: 读 RDD_A 分区 0 → map → RDD_B 分区 0 → filter → RDD_C 分区 0
+    Task 2: 读 RDD_A 分区 1 → map → RDD_B 分区 1 → filter → RDD_C 分区 1
+    Task 3: 读 RDD_A 分区 2 → map → RDD_B 分区 2 → filter → RDD_C 分区 2
+
+  每个 Task 内部是一条流水线，数据在内存中依次流过 map → filter，不落盘
+  Task 不需要知道上游 RDD 有几个分区——它只拿自己对应的那一份
+```
+
+> **类比**：Stage 内的多个 RDD 就像工厂流水线上的多道工序——原材料进来，经过切割（map）、质检（filter）、包装（map），全程在同一条传送带上，不需要中途换车间。Task 就是这条传送线上的一名工人，只负责自己那段材料。
+
+#### 分区 → Task → Executor 的对应关系
+
+```
+分区 → Task：    一对一（一个 Task 处理一个分区）
+Task → Executor：多对一（一个 Executor 同时运行多个 Task，受核数限制）
+Executor → 分区：多对多（一个 Executor 可以持有多个分区的数据）
+
+具体例子：
+  集群有 5 个 Executor，每个 Executor 4 个核
+  RDD 有 200 个分区
+  → 生成 200 个 Task
+  → 同时运行 5 × 4 = 20 个 Task（并行度 = 20）
+  → 剩余 180 个 Task 排队，前面的完成一批就调度下一批
+  → 每个 Executor 同时跑 4 个 Task（每个核跑一个 Task）
+  → 一个 Executor 可能持有多个分区的数据（缓存 + 正在处理）
+```
+
+> **关键**：分区数决定了 Task 数（并行度的上限），Executor 核数决定了同时能跑多少个 Task（实际并行度）。如果分区数远大于总核数，Task 会分批调度；如果分区数小于总核数，有些核会空闲——所以分区数通常建议设为总核数的 2-3 倍。
+
 ---
 
 ## 四、Spark SQL——最常用的模块
 
 Spark SQL 是在 RDD 之上封装的结构化数据处理接口，提供 DataFrame / Dataset API 和标准 SQL 语法。
+
+### 4.1 RDD vs DataFrame vs Dataset——三层 API 的区别与选型
+
+Spark 有三层 API，从底到高分别是 RDD、DataFrame、Dataset。理解它们的区别是选型的基础：
+
+```
+三层 API 的演进：
+
+RDD（Spark 1.0）          → 最底层，面向对象，无 Schema
+  ↓ 加上 Schema + 优化器
+DataFrame（Spark 1.3）     → 结构化数据，有 Schema，有 Catalyst 优化
+  ↓ 加上强类型
+Dataset（Spark 1.6）       = DataFrame + 强类型（Scala/Java 专属）
+```
+
+| 维度 | RDD | DataFrame | Dataset |
+|------|-----|-----------|---------|
+| **数据类型** | Java/Python 对象，无 Schema | Row 对象，有 Schema（列名+类型） | 强类型对象（Case Class），有 Schema |
+| **类型安全** | 编译时检查 | 运行时检查（列名写错到运行才报错） | 编译时检查（Scala/Java） |
+| **优化器** | 无，开发者自己负责 | **Catalyst 优化器**（自动谓词下推、列裁剪等） | Catalyst 优化器 |
+| **序列化** | Java/Kryo 序列化整个对象 | **Tungsten 二进制格式**（堆外内存，极高效） | Tungsten 二进制格式 |
+| **语言支持** | Scala/Java/Python/R | Scala/Java/Python/R | **仅 Scala/Java**（Python 不支持） |
+| **API 风格** | 函数式（map/filter/reduce） | SQL 风格（select/where/agg） | 两者混合 |
+| **性能** | 最低（无优化） | **最高**（Catalyst + Tungsten） | 高（和 DataFrame 接近） |
+
+> **DataFrame 和 Dataset 的关系**：在 Scala/Java 中，`DataFrame` 就是 `Dataset[Row]` 的类型别名——Dataset 是通用版本，DataFrame 是 Dataset 的一个特例（每行是弱类型的 Row）。Python 只有 DataFrame，没有 Dataset。
+
+**什么场景选什么：**
+
+```
+选 RDD：
+  ① 处理非结构化数据（纯文本、二进制流、自定义解析逻辑）
+  ② 需要精确控制底层分区和 Shuffle（如自定义 Partitioner）
+  ③ 需要复用旧的 RDD 代码，不想迁移
+  → 本质：RDD 是"手动挡"，你什么都要自己管，但什么都能控制
+
+选 DataFrame：
+  ① 结构化数据分析（有明确列和类型的数据）——这是 90% 的场景
+  ② 写 SQL 或类 SQL 的链式 API
+  ③ 用 Python / R 开发（这两个语言只有 DataFrame，没有 Dataset）
+  ④ 追求最佳性能（Catalyst + Tungsten 自动优化）
+  → 本质：DataFrame 是"自动挡"，Catalyst 帮你优化，你专注业务逻辑
+
+选 Dataset（仅 Scala/Java）：
+  ① 需要编译时类型安全（列名拼错在编译阶段就报错，不用等到运行）
+  ② 数据处理逻辑复杂，用对象操作比用 Row 取列更清晰
+  ③ 对性能有要求但又不放弃类型安全
+  → 本质：Dataset 是"手自一体"，既有 DataFrame 的优化，又有 RDD 的类型安全
+```
+
+> **实际项目中的建议**：绝大多数场景用 DataFrame（或直接写 SQL）。只有遇到非结构化数据或需要精细控制分区时才退回 RDD。Dataset 在 Scala 项目中可以替代 DataFrame 获得类型安全，但 Python 项目没得选。
 
 ```python
 # DataFrame API（Python）
