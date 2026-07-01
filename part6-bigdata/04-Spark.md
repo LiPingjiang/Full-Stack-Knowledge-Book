@@ -218,10 +218,20 @@ graph TD
 ### 3.1 Job → Stage → Task 的划分
 
 ```
-Job：    一个 Action 触发一个 Job
-Stage：  以 Shuffle 为边界划分（宽依赖切分 Stage）
-Task：   一个 Stage 内，每个分区对应一个 Task
+包含关系：1 Job ⊃ 若干 Stage ⊃ 若干 Task
+
+Job：     一个 Action 触发一个 Job
+            例：collect()、count()、saveAsTextFile() 各触发一个 Job
+Stage：   以 Shuffle 为边界划分（宽依赖切分 Stage）
+            例：map → filter → reduceByKey → filter → collect()
+                Stage 0: map → filter → reduceByKey（Shuffle 前）
+                Stage 1: filter → collect（Shuffle 后）
+Task：    一个 Stage 内，RDD 的每个数据分区对应一个 Task
+            例：RDD 有 200 个分区 → 这个 Stage 生成 200 个 Task
+                Task 1 处理分区 0 的数据，Task 2 处理分区 1 的数据 ...
 ```
+
+> **分区是谁的？** 这里的"分区"是 **RDD / DataFrame 的数据分区**，不是 Stage 自己拥有的分区。Stage 是执行计划的概念，分区是数据的概念——数据被切成 N 份（N 个分区），Stage 就生成 N 个 Task，每个 Task 处理其中 1 份。分区数量由 `numPartitions` 参数、Shuffle 后的分区数、或 `repartition()` 决定，跟 Stage 本身无关。
 
 ---
 
