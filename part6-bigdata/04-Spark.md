@@ -1150,14 +1150,84 @@ FROM daily_gmv;
   n FOLLOWING          = 当前行往后 n 行
   UNBOUNDED FOLLOWING  = 分区的最后一行（到最末尾）
 
-常见组合：
-  ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW      → 从头累计到当前行
-  ROWS BETWEEN 6 PRECEDING AND CURRENT ROW              → 最近 7 行（含当前行）
-  ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING              → 前一行 + 当前行 + 后一行
-  ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING → 整个分区（全量）
+常见组合（每种搭配一个实际应用场景）：
+
+① ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW → 从头累计到当前行
+   场景：用户累计消费金额
+   SELECT user_id, order_date, amount,
+          SUM(amount) OVER (PARTITION BY user_id ORDER BY order_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) as cumulative_spent
+   FROM orders;
+   -- 每个用户按下单时间排序，逐笔累加消费金额
+   -- user_id=1 的结果：100 → 100+200=300 → 300+50=350 → ...
+
+② ROWS BETWEEN 6 PRECEDING AND CURRENT ROW → 最近 7 行（含当前行）
+   场景：7 日移动平均（股票、DAU、GMV）
+   SELECT dt, dau,
+          AVG(dau) OVER (ORDER BY dt
+            ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) as avg_dau_7d
+   FROM daily_active_users;
+   -- 每天的 DAU 和它前面 6 天的 DAU 取平均，平滑波动看趋势
+   -- dt=01-07 的结果：(dau_01+dau_02+...+dau_07) / 7
+
+③ ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING → 前一行 + 当前行 + 后一行
+   场景：3 天滑动窗口检测异常波动
+   SELECT dt, gmv,
+          gmv - AVG(gmv) OVER (ORDER BY dt
+            ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) as deviation
+   FROM daily_gmv;
+   -- 当天 GMV 与前后各 1 天的平均 GMV 的差值，差值过大则可能是异常
+   -- 如果当天 GMV 突然暴跌/暴涨，deviation 会明显偏离 0
+
+④ ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING → 整个分区（全量）
+   场景：每个员工薪资占部门总薪资的比例
+   SELECT name, dept_id, salary,
+          salary / SUM(salary) OVER (PARTITION BY dept_id
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as pct_of_dept
+   FROM employees;
+   -- 分母是整个部门的总薪资，分子是当前员工薪资
+   -- 张三 3000 / 10000 = 30%，李四 5000 / 10000 = 50%
+   -- 注意：这里如果不写 ROWS BETWEEN，且没有 ORDER BY，默认就是这个全量框架
 ```
 
-**ROWS vs RANGE 的区别**：`ROWS` 按物理行数计算边界（第几行到第几行），`RANGE` 按值的范围计算边界（ORDER BY 字段值的差值）。实际开发中 **ROWS 用得更多**，因为行为更可预测。
+**ROWS vs RANGE 的区别——Frame 的两种模式**
+
+窗口框架（Frame）确实有两种模式：`ROWS BETWEEN` 和 `RANGE BETWEEN`。两者都是定义"当前行的窗口包含哪些行"，但计算边界的方式不同：
+
+```
+ROWS：按物理行数计算边界（第几行到第几行），与值无关
+RANGE：按 ORDER BY 字段的值范围计算边界，与行数无关
+
+具体例子（按 salary 排序的数据）：
+name   salary
+王五   2000
+张三   3000
+李四   3000     ← 与张三 salary 相同
+赵六   5000
+
+当前行 = 张三(salary=3000) 时：
+
+ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING
+  → 看物理位置：王五(1行前) + 张三(当前) + 李四(1行后) = 3 行
+  → 参与计算的行：王五, 张三, 李四
+
+RANGE BETWEEN 1000 PRECEDING AND 1000 FOLLOWING
+  → 看 salary 值范围：salary 在 [3000-1000, 3000+1000] = [2000, 4000] 之间
+  → 参与计算的行：王五(2000)✓ 张三(3000)✓ 李四(3000)✓ 赵六(5000)✗
+  → 注意李四也包含进来了，因为它的 salary=3000 在 [2000,4000] 范围内
+  → 这里李四不是按"第几行"选的，而是按"值在不在范围内"选的
+```
+
+| 维度 | ROWS | RANGE |
+|------|------|-------|
+| **边界依据** | 物理行数（第几行） | ORDER BY 字段的值范围 |
+| **窗口行数** | 固定（就是 n 行） | 不固定（取决于有多少行的值落在范围内） |
+| **是否依赖 ORDER BY** | 不依赖（按位置即可） | **必须依赖**（需要 ORDER BY 字段的值来计算范围） |
+| **行为可预测性** | 高（行数确定） | 低（行数随数据分布变化） |
+| **典型用途** | 移动平均、累计求和、Top-N | 按值范围聚合（如价格 ±10% 内的订单） |
+| **实际开发频率** | 常用（90% 场景） | 少用（特殊场景） |
+
+> **实际开发中 ROWS 用得更多**，因为行为可预测——你写 `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` 就一定是 7 行参与计算。RANGE 的行数不确定，容易出性能问题（如果某个值有大量重复行，窗口会暴增）。另外，前面说的"有 ORDER BY 时默认框架是 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`"——这也是为什么默认行为对相同值会"一起算"而非"逐行算"，如果你的排序字段有重复值，ROWS 和 RANGE 的默认结果会不同。如果不确定，**显式写 ROWS BETWEEN 最安全**。
 
 **默认框架规则**（不写 ROWS BETWEEN 时 Spark 自动使用的框架）：
 
