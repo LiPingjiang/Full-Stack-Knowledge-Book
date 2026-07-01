@@ -897,6 +897,24 @@ ShuffleHashJoin 的执行过程：
 → 这就是为什么 ShuffleHashJoin 要求"小表的每个分区能放进内存"
 ```
 
+**HashMap 是一口气全放进去吗？内存不够怎么办？**
+
+注意——HashMap 里放的是**每个分区的数据**，不是整张表。Shuffle 之后数据被分散到 N 个分区，每个分区只持有较小侧的一部分：
+
+```
+小表 10GB，Shuffle 后 200 个分区
+→ 每个分区的较小侧数据 ≈ 10GB / 200 = 50MB
+→ 50MB 构建 HashMap 完全没问题
+
+但如果数据倾斜：
+→ 某个分区分到 80% 的数据 = 8GB
+→ 这个分区的 HashMap 构建可能 OOM
+```
+
+内存不够时 Spark 会 Spill 到磁盘（Grace Hash Join）——把 HashMap 拆成多块，先处理一部分，再处理下一部分。但这会让性能急剧下降——HashMap 的 O(1) 查找优势大打折扣，变成多次磁盘 I/O。所以 ShuffleHashJoin 的适用条件是：**每个分区的较小侧数据必须能舒适地放进内存**。
+
+> **为什么 Spark 默认优先选 SortMergeJoin 而不是 ShuffleHashJoin？** SortMergeJoin 更"安全"——它只用两个指针做归并扫描，内存 O(1)，多大的表都能跑，排序内存不够时 Spill 到磁盘也只是降速不会 OOM。ShuffleHashJoin 虽然省了排序开销，但有 OOM 风险。Spark 宁可慢一点也不要 OOM，所以默认选 SortMergeJoin。只有你明确知道小侧能放进内存时，才用 `/*+ SHUFFLE_HASH(t) */` 手动指定。
+
 **不只是"排不排序"——完整的差异对比**
 
 | 维度 | SortMergeJoin | ShuffleHashJoin |
@@ -924,13 +942,54 @@ SELECT /*+ SHUFFLE_HASH(b) */
 FROM big_table a JOIN medium_table b ON a.id = b.id;
 ```
 
-**CartesianJoin** 和 **BroadcastNestedLoopJoin** 是两种非等值 JOIN 策略。CartesianJoin 做笛卡尔积（M×N 行输出），除非数据量极小否则不应使用。BroadcastNestedLoopJoin 广播小表后对每行大表遍历小表匹配，适合非等值条件（如范围 JOIN `a.start <= b.ts AND b.ts < a.end`）且小表可广播的场景。
+**为什么 Hint 需要手动指定 small_side？Shuffle 完不就知道谁大谁小了？**
+
+因为执行计划是在 Shuffle **之前**确定的，不是之后。Spark 的执行流程是先解析 SQL → Catalyst 优化（选 JOIN 策略）→ 生成物理计划 → 执行（Shuffle + JOIN）。到了 Shuffle 的时候，JOIN 策略早就定好了，来不及改：
+
+```
+时间线：
+SQL 解析 → Catalyst 优化器选 JOIN 策略 → 生成物理计划 → 开始执行
+                    ↑                                    ↑
+              这里就要决定用哪种 JOIN          到这里才知道实际数据量
+              但此时只有表统计信息（可能不准）    但策略已经定了，改不了
+
+Catalyst 的决策依据：
+  表的统计信息（ANALYZE 命令收集的行数、大小）
+  如果统计信息不准（没 ANALYZE、或过滤后数据量变化大）
+  → Catalyst 可能误判哪侧小，选错策略
+  → 你用 hint 强制指定，覆盖 Catalyst 的判断
+```
+
+Spark 3.x 的 AQE 部分解决了这个问题——可以在 Shuffle 后根据真实数据量动态切换 JOIN 策略（比如从 SortMergeJoin 切到 BroadcastHashJoin）。但 ShuffleHashJoin 的选择仍然依赖编译期判断，AQE 不会自动切到 ShuffleHashJoin，所以需要你手动指定 Hint。
+
+**CartesianJoin 怎么实现？为什么危险？**
+
+CartesianJoin 就是嵌套循环——左侧的每一行和右侧的每一行配对，产生 M × N 行结果，没有任何优化空间：
+
+```
+表 A：3 行          表 B：4 行
+  a1                 b1
+  a2                 b2
+  a3                 b3
+                     b4
+
+CartesianJoin 结果：3 × 4 = 12 行
+  (a1,b1) (a1,b2) (a1,b3) (a1,b4)
+  (a2,b1) (a2,b2) (a2,b3) (a2,b4)
+  (a3,b1) (a3,b2) (a3,b3) (a3,b4)
+
+两张各 100 万行的表 → 1 万亿行结果 → 几乎必然 OOM 或跑数小时
+```
+
+危险在于结果集是乘法关系。它只在 `CROSS JOIN`（笛卡尔积）或 `INNER JOIN` 没有 `ON` 条件时触发——正常业务几乎不应出现，通常是 SQL 写漏了 JOIN 条件的 bug。
+
+**BroadcastNestedLoopJoin** 广播小表后对每行大表遍历小表匹配，适合非等值条件（如范围 JOIN `a.start <= b.ts AND b.ts < a.end`）且小表可广播的场景。
 
 > **经验法则**：90% 的 ETL 场景只需关注两种策略——小表走 BroadcastHashJoin，大表走 SortMergeJoin。如果发现 SortMergeJoin 的排序阶段成为瓶颈（Spark UI 中 Stage 的排序耗时占比高），且其中一侧表不算太大，可以尝试切换为 ShuffleHashJoin。非等值 JOIN 尽量控制其中一侧为小表，走 BroadcastNestedLoopJoin 避免笛卡尔积。
 
 #### CTE / WITH 子查询的陷阱——不会被复用
 
-后端开发者的直觉是 WITH 子查询（CTE）像变量一样"算一次，到处引用"，但在 Spark 中 **CTE 每次引用都会重新计算**。如果同一个 CTE 被引用 3 次，底层数据会被扫描 3 次。
+CTE（Common Table Expression，通用表表达式）就是 SQL 中的 `WITH name AS (SELECT ...)` 语法。后端开发者的直觉是 CTE 像变量一样"算一次，到处引用"，但在 Spark 中 **CTE 每次引用都会重新计算**。如果同一个 CTE 被引用 3 次，底层数据会被扫描 3 次。
 
 ```sql
 -- 问题：cte_result 被引用 2 次 = 底层表扫描 2 次
@@ -988,6 +1047,19 @@ SELECT * FROM (
            ROW_NUMBER() OVER (PARTITION BY dept_id ORDER BY salary DESC) as rn
     FROM employees
 ) t WHERE rn <= 3;
+-- PARTITION BY dept_id → 按 dept_id 分组（每个部门一个独立窗口）
+-- ORDER BY salary DESC → 在每个组内按薪资降序排列
+-- ROW_NUMBER() → 在每个组内从 1 开始编号，编号不跨组
+-- 外层 WHERE rn <= 3 → 选出每个部门薪资前 3 名
+--
+-- 结果示例：
+-- name     dept_id  salary  rn
+-- 张三     1        15000   1     ← 部门 1 薪资最高
+-- 李四     1        12000   2
+-- 王五     1        10000   3
+-- 赵六     1         8000   4     ← rn=4，被 WHERE 过滤掉
+-- 孙七     2        20000   1     ← 部门 2 重新从 1 开始编号
+-- 周八     2        18000   2
 
 -- 面试高频场景 2：同比/环比——取上一期的值做对比
 SELECT dt, gmv,
