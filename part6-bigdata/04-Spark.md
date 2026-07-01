@@ -415,6 +415,159 @@ Dataset（Spark 1.6）       = DataFrame + 强类型（Scala/Java 专属）
 
 > **实际项目中的建议**：绝大多数场景用 DataFrame（或直接写 SQL）。只有遇到非结构化数据或需要精细控制分区时才退回 RDD。Dataset 在 Scala 项目中可以替代 DataFrame 获得类型安全，但 Python 项目没得选。
 
+#### 为什么 Dataset 性能比 DataFrame 低——lambda 反序列化陷阱
+
+对比表里写的是 DataFrame "最高"、Dataset "高（接近）"，这个"接近"而非"等于"的差距来自一个核心问题：**Dataset 的强类型操作会打破 Tungsten 的优化闭环**。
+
+```
+DataFrame 全流程（Tungsten 优化闭环）：
+  二进制格式 → filter（生成的代码直接操作二进制）→ select → 输出
+  数据全程以 Tungsten 二进制格式在内存中传递，不反序列化成 Java 对象
+
+Dataset 使用 SQL 风格 API（和 DataFrame 一样快）：
+  dataset.filter($"age" > 18).select($"name")   ← 等价于 DataFrame，无开销
+
+Dataset 使用 lambda 风格 API（性能下降）：
+  dataset.filter(p => p.age > 18).map(p => p.name)
+                    ↑              ↑
+                    这两个 lambda 对 Catalyst 是黑盒！
+
+  执行过程：
+  二进制格式 → 反序列化成 Person 对象 → 执行 lambda → 序列化回二进制格式
+               ↑ overhead              ↑ 黑盒        ↑ overhead
+```
+
+| API 风格 | Catalyst 能否优化 | 反序列化开销 | 性能 |
+|---------|-----------------|------------|------|
+| DataFrame / Dataset SQL 风格（`$"age" > 18`） | 能 | 无 | 最高 |
+| Dataset lambda 风格（`p => p.age > 18`） | **不能**（lambda 是黑盒） | 每条记录都要 | 下降 |
+| RDD（`map` / `filter`） | 不能 | 全程都是对象 | 最低 |
+
+> **本质**：DataFrame 的 `filter($"age" > 18)` 是声明式的——你告诉 Catalyst "我要 age > 18"，它来决定怎么执行。Dataset 的 `filter(p => p.age > 18)` 是命令式的——你告诉 Catalyst "执行这段代码"，它不知道代码里在做什么，无法优化，只能老老实实反序列化出对象、执行你的 lambda、再序列化回去。
+
+#### Tungsten 是什么——Spark 的性能引擎
+
+Tungsten 是 Spark 1.5（2015 年）启动的性能优化项目（Project Tungsten），名字来自钨（Tungsten）——最硬的金属，寓意"极致性能"。它的核心思想是：**把 Spark 的内存管理从 JVM 手中接管过来，绕过 GC 和 Java 对象的开销**。
+
+```
+Tungsten 的三大支柱：
+
+① 堆外内存管理（Off-Heap Memory）
+   不在 JVM 堆里分配内存，而是直接用 Unsafe API 向操作系统申请
+   → 不受 GC 管理，没有 GC 停顿
+   → 没有 Java 对象头开销（每个 Java 对象有 12-16 字节头）
+   → 内存可以精确控制释放，不依赖 GC 回收
+
+② 二进制行格式（Unsafe Row）
+   把一整行数据序列化为紧凑的字节数组
+   → 一个 Person{name:String, age:Int} 在 Java 对象里占 ~40 字节
+     （对象头 + 引用 + String 对象头 + char[] + int + 对齐填充）
+   → 在 Tungsten 格式里只占 ~12 字节（4 字节长度 + 4 字节 String 偏移 + 4 字节 int）
+   → 缓存友好：连续内存，CPU 缓存命中率高
+
+③ 全阶段代码生成（Whole-Stage Code Generation，Spark 2.0）
+   把多个算子（filter → map → agg）融合成一个编译好的 Java 函数
+   → 消除虚方法调用（RDD 每条记录都要多态分发）
+   → 消除中间数据结构（不需要在算子之间传递 Row 对象）
+   → 类似于把解释执行变成编译执行
+```
+
+```
+没有 Tungsten（RDD 模式）：
+  每条记录：反序列化 → 调 filter.isMatch() → 调 map.call() → 调 agg.update()
+  每一步都是虚方法调用 + 对象创建，CPU 分支预测失败率高
+
+有 Tungsten（DataFrame 模式）：
+  全阶段代码生成后：
+  for (int i = 0; i < numRows; i++) {
+      if (row.getInt(age_offset) > 18) {        // filter 被内联
+          result.setString(row.getString(name_offset));  // map 被内联
+          aggBuffer.add(row.getInt(age_offset));         // agg 被内联
+      }
+  }
+  一个紧凑循环，没有虚方法调用，没有中间对象
+```
+
+> **版本时间线**：Tungsten 在 Spark 1.5 引入（堆外内存 + 二进制格式），Spark 2.0 引入全阶段代码生成（Whole-Stage CodeGen），Spark 3.0 进一步增强（AQE 运行时优化配合 Tungsten）。现在 Tungsten 是 Spark SQL 的默认执行引擎，无需手动开启。
+
+#### Dataset 的编译时类型安全是怎么实现的
+
+Dataset 通过 Scala 的 **Case Class + Encoder** 机制实现编译时类型安全：
+
+```
+① 定义 Case Class（编译时）
+   case class Person(name: String, age: Int)
+
+② 创建 Dataset（编译时，隐式 Encoder 被注入）
+   val ds: Dataset[Person] = spark.read.json("people.json").as[Person]
+                                                    ↑
+                                          这里需要一个隐式 Encoder[Person]
+
+③ Encoder 是什么（编译时通过宏生成）
+   Encoder[Person] 在编译时通过 Scala 宏自动生成
+   它告诉 Spark：Person 有两个字段，name 是 String（偏移 0），age 是 Int（偏移 4）
+   → 本质是一个 Schema 描述器，但类型信息在编译时就确定了
+
+④ 编译时类型检查
+   ds.map(p => p.nme)   // ✗ 编译报错：Person 没有 nme 字段
+   ds.map(p => p.name)  // ✓ 编译通过
+   df.select("nme")     // 编译通过，运行时报错 AnalysisException
+
+⑤ 运行时
+   Encoder 知道如何在 Tungsten 二进制格式和 Person 对象之间转换
+   → 这就是为什么 Dataset lambda 需要反序列化：Encoder 把二进制转成 Person 对象
+```
+
+对比 DataFrame 的类型安全：
+
+| 维度 | DataFrame（`Dataset[Row]`） | Dataset（`Dataset[Person]`） |
+|------|---------------------------|------------------------------|
+| **字段访问** | `row.getAs[String]("name")` | `person.name` |
+| **字段名拼错** | 编译通过，**运行时报错** | **编译报错** |
+| **类型不匹配** | 编译通过，**运行时 ClassCastException** | **编译报错** |
+| **底层原理** | 运行时反射 + Schema 查找 | 编译时宏生成 Encoder |
+
+#### Row 取列 vs 对象操作——具体代码对比
+
+选型建议里说"数据处理逻辑复杂，用对象操作比用 Row 取列更清晰"，下面是具体例子：
+
+```scala
+// 场景：从订单数据中，筛选有 VIP 优惠的商品，计算折后价（原价 × 折扣 - 优惠券）
+
+// Case Class 定义
+case class Order(orderId: String, items: Seq[Item], coupon: Double, isVip: Boolean)
+case class Item(productId: String, name: String, price: Double, category: String)
+
+// ===== DataFrame 写法（Row 操作，逻辑复杂时很痛苦）=====
+val result = df
+  .filter($"isVip" === true && $"coupon" > 0)
+  .withColumn("discountedItems", explode(
+    expr("filter(items, x -> x.price > 100 AND x.category != 'books')")
+  ))
+  .withColumn("finalPrice",
+    $"discountedItems.price" * lit(0.8) - $"coupon" / size($"discountedItems")
+  )
+  .select($"orderId", $"discountedItems.name", $"finalPrice")
+// 问题：字段名是字符串，IDE 不能自动补全，拼错只有运行时才发现
+// 问题：嵌套结构操作需要用 expr / filter 函数，可读性差
+
+// ===== Dataset 写法（对象操作，逻辑清晰）=====
+val result = ds
+  .filter(o => o.isVip && o.coupon > 0)           // 直接访问字段，编译时检查
+  .flatMap { order =>
+    val shareCoupon = order.coupon / order.items.size  // 提前算好每件分摊的优惠券
+    order.items
+      .filter(i => i.price > 100 && i.category != "books")  // 普通 Scala 集合操作
+      .map(item => (order.orderId, item.name, item.price * 0.8 - shareCoupon))
+  }
+  .toDF("orderId", "productName", "finalPrice")
+// 优势：字段名自动补全，拼错编译报错
+// 优势：嵌套结构用普通 Scala 代码操作，逻辑一目了然
+// 代价：filter 和 map 是 lambda，触发反序列化，性能比 DataFrame 写法低
+```
+
+> **选择建议**：如果数据处理逻辑简单（select / where / agg），用 DataFrame，性能最好。如果逻辑复杂（多层嵌套、条件判断、集合操作），用 Dataset 的 lambda 写法可读性好很多，性能损失在可接受范围内——特别是当你的瓶颈在 I/O（读 HDFS）而不是 CPU 时，lambda 的反序列化开销可能根本不是瓶颈。
+
 ```python
 # DataFrame API（Python）
 df = spark.read.parquet("/data/orders")
