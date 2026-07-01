@@ -1035,8 +1035,8 @@ SELECT user_id, SUM(amount) as total FROM orders WHERE dt = '2024-06-29' GROUP B
 | | `DENSE_RANK()` | 排名（并列不跳号），1,1,2,3 | 必须 |
 | | `NTILE(n)` | 分区内分成 n 等份，返回桶号 | 必须 |
 | **聚合函数** | `SUM()` / `COUNT()` / `AVG()` / `MAX()` / `MIN()` | 在窗口内做聚合 | 可选（有无 ORDER BY 语义不同） |
-| **偏移函数** | `LAG(col, n, default)` | 取前 n 行的值（上一条记录） | 必须 |
-| | `LEAD(col, n, default)` | 取后 n 行的值（下一条记录） | 必须 |
+| **偏移函数** | `LAG(col, n, default)` | 往前数第 n 行的值（LAG = 滞后，看过去） | 必须 |
+| | `LEAD(col, n, default)` | 往后数第 n 行的值（LEAD = 领先，看未来） | 必须 |
 | | `FIRST_VALUE(col)` | 窗口内第一行的值 | 通常需要 |
 | | `LAST_VALUE(col)` | 窗口内最后一行的值 | 通常需要 |
 
@@ -1108,6 +1108,20 @@ SELECT * FROM (
 -- 框架范围为 ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
 
 -- 面试高频场景 2：同比/环比——取上一期的值做对比
+-- LAG 和 LEAD 都是纯英文单词，不是缩写：
+--   LAG  = "滞后"（lag behind），看过去，取前面的行
+--   LEAD = "领先"（lead the way），看未来，取后面的行
+--   时间线：  ← LAG（往后看）    当前行    LEAD（往前看） →
+--
+-- LAG(col, n, default) 三个参数：
+--   col     → 要取的列
+--   n       → 偏移量（LAG(gmv, 1) = 上一条，LAG(gmv, 7) = 上上上...上 7 条）
+--   default → 超出窗口边界时的默认返回值，只能填常量字面量，不能填列引用
+--             LAG(salary, 1, 0)     → 第一行没有上一行，返回 0
+--             LAG(name, 1, '无')     → 第一行返回字符串 '无'
+--             LAG(salary, 1, NULL)   → 第一行返回 NULL
+--             LAG(salary, 1)         → 不填 default，默认就是 NULL
+
 SELECT dt, gmv,
        LAG(gmv, 1) OVER (ORDER BY dt) as prev_day_gmv,           -- 昨天的 GMV
        LAG(gmv, 7) OVER (ORDER BY dt) as prev_week_gmv,          -- 上周同一天的 GMV
