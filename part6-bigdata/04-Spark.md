@@ -1801,6 +1801,94 @@ Spark Executor 的 JVM 内存分为三个区域：
 
 **真实案例**：某推荐团队的 LTV 指标计算任务，executor.memory = 8g 但 memory.fraction = 0.3，导致执行内存仅 2.4G。核心 Stage 处理 3.4TB 数据时 Memory Spill 高达 1751GB、Disk Spill 78GB，单个 Stage 耗时 25 分钟。将 memory.fraction 从 0.3 调到 0.6 后（执行内存从 2.4G 变为 4.8G），Stage 耗时从 25 分钟降至约 12 分钟，**零风险、不增加资源申请量**——这是性价比最高的优化手段。
 
+#### 为什么执行内存不放在堆外？
+
+上面内存模型图中，Shuffle/JOIN/聚合这些最吃内存的操作放在堆内执行，堆外只放 JNI、网络缓冲区等。一个自然的疑问是：**为什么不把执行内存放到容量更大的堆外？或者堆内放不下时先溢到堆外，再溢到磁盘？**
+
+答案分三层。
+
+**第一层：堆内和堆外是两套不同的内存管理范式，不能简单 fallback**
+
+```
+堆内（On-Heap）：
+  数据是 Java 对象 → 有对象头（12-16字节）、引用、GC 管理
+  分配：bump pointer（指针碰撞，极快，约 10 纳秒）
+  回收：GC 自动扫描回收，不需要手动 free
+  适合频繁创建、短生命周期的对象
+
+堆外（Off-Heap）：
+  数据是二进制 byte buffer → 无对象头，手动管理
+  分配：Unsafe.allocateMemory()（本质是 malloc，约 100 纳秒，慢 10 倍）
+  回收：必须手动调用 free，GC 不管
+  适合大块、长生命周期的数据
+
+如果"堆满了搬到堆外"：
+  需要把 Java 对象序列化成二进制 → 等于做了一次 Spill 的序列化
+  搬回来又要反序列化 → 又一次开销
+  → 这跟 Spill 到磁盘本质上是一回事，只是目的地从磁盘换成了内存
+  → 而磁盘虽然慢，但容量无限，且 Spill 时顺便做了序列化+压缩
+```
+
+所以 Spark 的设计不是"堆 → 堆外 → 磁盘"三级溢出，而是**"堆内计算，放不下就 Spill 到磁盘"**。
+
+**第二层：Tungsten 已经在堆内做了"伪堆外"优化**
+
+Tungsten 的核心思路不是把数据搬到堆外，而是**在堆内用 byte 数组模拟堆外的二进制格式**：
+
+```
+Tungsten 的 UnsafeRow（堆内模式）：
+  数据存在 byte[] 中（在堆内，GC 能看到）
+  但通过 Unsafe 类直接按 offset 读写，绕过 Java 对象模型
+  → 没有对象头开销（省 12-16 字节/对象）
+  → GC 只看到一个 byte 数组，不需要扫描内部字段
+  → 排序时只交换 8 字节指针（row pointer），不移动数据
+
+  相当于"在堆内享受了堆外的数据布局优势"
+  同时保留了 GC 管理内存的生命周期安全性
+```
+
+对于大多数场景，Tungsten 堆内模式已经够好——既避免了 Java 对象模型的开销，又不用手动管理内存。
+
+**第三层：堆外模式什么时候才值得开**
+
+```
+spark.memory.offHeap.enabled=true
+spark.memory.offHeap.size=1g
+
+开启后的效果：
+  执行内存和存储内存各拆成 on-heap + off-heap 两部分
+  Tungsten 的内存分配优先从 off-heap 池申请
+  → 堆内对象更少 → GC 扫描更快 → Full GC 频率降低
+
+适合的场景：
+  ① Executor 堆很大（>32G），GC 扫描耗时明显
+  ② 任务有大量 Shuffle/JOIN 中间数据，GC 压力大
+  ③ 数据量稳定，能准确预估 off-heap size
+
+不适合的场景：
+  ① Executor 堆较小（<8G），GC 本身不是瓶颈
+  ② off-heap size 设得太大 → 堆内可用内存减少 → 反而 OOM
+  ③ off-heap size 设得太小 → 频繁 Spill，不如不开
+```
+
+**总结：Spark 的内存设计哲学**
+
+```
+Spark 选择的架构：堆内（Tungsten 二进制格式）→ Spill 到磁盘
+                    ↑                          ↑
+                 快速计算                   无限容量
+                 GC 安全                   序列化+压缩
+
+而不是：          堆内 → 堆外 → 磁盘
+                      ↑        ↑
+                   序列化    再序列化
+                   手动管理   两套代码路径
+
+堆外是"可选的 GC 减压阀"，不是"堆内的溢出缓冲区"。
+Tungsten 在堆内已经用二进制格式解决了对象开销问题，
+堆外的增量收益（绕过 GC）只在堆很大时才显著。
+```
+
 #### Memory Spill 和 Disk Spill 是什么关系？
 
 Spark UI 上同时显示 Memory Spill 和 Disk Spill 两个指标，很多人以为 Spark 会"选择"用 memory 还是 disk 来溢写——其实不是。**它们是同一次溢写动作的两个统计视角**：
