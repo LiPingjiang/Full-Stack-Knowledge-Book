@@ -209,13 +209,28 @@ graph TD
 
 ### 4.1 Checkpoint（检查点）
 
-Flink 的容错核心是 **Chandy-Lamport 分布式快照算法**。JobManager 定期向数据流注入 **Barrier（屏障）**，Barrier 随数据流向下游传播。当一个算子收到所有输入流的 Barrier 后，它把自己的 State 快照保存到持久化存储（HDFS/S3）。
+#### Chandy-Lamport 分布式快照算法
+
+Flink 的容错核心是 **Chandy-Lamport 分布式快照算法**。这个算法解决的问题是：在一个持续流动的分布式数据流中，如何在不暂停计算的情况下，给整个系统拍一个一致的"全局快照"。
+
+核心思路是引入 **Marker（标记消息）**——在 Chandy-Lamport 原始论文中叫 marker，Flink 里叫 **Barrier（屏障）**。它是一种特殊的控制消息，混在数据流里跟普通数据一起传输，思路跟 Watermark 类似。
+
+算法流程：
+
+1. **发起**：协调器（Flink 中是 JobManager）决定做快照，向所有 Source 注入一条 Barrier N。
+2. **Source 快照**：Source 收到 Barrier N 后，记录自己的状态（如 Kafka 的 offset），然后把 Barrier N 往下游发。
+3. **中游对齐**：当一个算子有多个输入时，收到第一个输入的 Barrier N 后，**暂停**该输入的数据处理（先缓冲起来），等所有输入都收到 Barrier N——这叫 **Barrier 对齐**。对齐后，算子保存自己的 State，然后把 Barrier N 往下游发。
+4. **完成**：所有算子都保存完 State 后，JobManager 确认这次快照成功。
 
 ```
-Source → [Barrier] → Map → [Barrier] → Aggregate → [Barrier] → Sink
-                         ↓ 对齐 Barrier 时保存快照
-                    State Snapshot → HDFS
+Source → [Barrier N] → Map → [Barrier N] → Aggregate → [Barrier N] → Sink
+                           ↓ 对齐 Barrier 时保存快照
+                      State Snapshot → HDFS
 ```
+
+关键点在于 Barrier 把数据流切成了"快照前"和"快照后"两部分。一个算子在 Barrier N 之前处理的数据都属于快照 N 的状态，之后的数据属于下一个快照。因为所有算子都按同一个 Barrier 做切分，所以全局状态是一致的。
+
+**Barrier 对齐的代价**：多输入算子需要对齐 Barrier，对齐期间会暂停处理较快输入的数据（缓冲起来），这会引入短暂延迟。Flink 还提供了 **非对齐 Checkpoint（Unaligned Checkpoint）** 选项：不做对齐，直接把缓冲区里的数据也存进快照。这样快更快，但快照更大。适合反压严重、对齐时间过长的场景。
 
 任务失败时，从最近一次成功的 Checkpoint 恢复 State，数据源（如 Kafka）从对应 offset 重放，实现 **Exactly-Once** 语义。
 
