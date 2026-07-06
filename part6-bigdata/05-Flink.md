@@ -45,6 +45,119 @@ Watermark 策略：允许 2 秒乱序
 
 如果 10:03 之后还来了一个 10:02 的事件——这就是**迟到数据**。Flink 可以配置丢弃、放入侧输出流（Side Output）、或允许窗口更新。
 
+#### Watermark 不是数据字段，是流里的特殊记录
+
+Watermark 不是加在每条数据上的新字段，而是数据流里穿插的一种**特殊记录**。可以把它想象成一条管道，里面流着两种类型的元素：
+
+```
+[数据] [数据] [数据] [Watermark: 10:03] [数据] [数据] [Watermark: 10:05] [数据] ...
+```
+
+它们共享同一条通道，混在一起往下游传。算子处理时会判断元素类型：普通数据走业务逻辑，Watermark 走时间推进逻辑（更新时钟、触发 Timer、关闭窗口等）。
+
+这一点解释了几个关键问题：
+
+Watermark 能跨算子传播——因为它是流里的元素，上游生成后自然跟着数据往下游流，下游收到就能用，不需要每条数据额外携带。
+
+Watermark 不影响数据序列化结构——你的 POJO、Row、JSON 里都没有 Watermark 字段，它是 Flink 运行时层面的东西，对用户数据模型完全透明。
+
+SQL 里 `WATERMARK FOR click_time AS click_time - INTERVAL '5' SECOND` 也不是给表加了列，而是告诉 Flink："请根据 click_time 的值，定期往流里插入 Watermark 记录。"
+
+#### 每个 Task 维护一个事件时间时钟
+
+事件时间时钟不是 per executor 的，而是 **per Task（并行子任务）**。比如并行度为 4，一个算子有 4 个 Task，每个 Task 各自维护独立的事件时间时钟，互不影响。
+
+时钟由收到的 **Watermark 记录**驱动前进（不是直接根据数据时间戳），规则如下：
+
+单输入：收到更大的 Watermark 就推进，取最新值。Watermark 不能倒退。
+
+多输入（如 KeyedCoProcessFunction 有两个输入流）：每个输入流各自维护收到的最新 Watermark，Task 的时钟取**两者中的最小值**。任何一个输入流的 Watermark 没推进，整体时钟就不动。这就是多流"等待"机制的实现方式。
+
+为什么取 min 而不是 max？因为水位线的语义是"这个时间之前的数据都到了"。多个输入流各自有各自的进度，只有当**所有**输入都认为自己推进到了某个时间，才能说"这个时间之前所有流的数据都齐了"。取 max 意味着 A 说到 10:08 了但 B 才到 10:06，10:06 到 10:08 之间 B 的数据可能还没到，提前推进就会漏数据。取 min 就是取"最保守"的时间——被最慢的那个输入拖住，宁可等也不能漏。
+
+```
+当前 inputA=10:08, inputB=10:06
+
+取 max → 时钟 = 10:08  ← 激进：B 在 10:06~10:08 的数据可能还没到，会漏
+取 min → 时钟 = 10:06  ← 保守：两个流都保证到 10:06，安全
+```
+
+Watermark 记录本身不携带"来源流 ID"之类的字段——它只包含一个时间戳。下游 Task 能区分 Watermark 来自哪个输入，靠的是物理通道：每个输入是一条独立的物理通道，Task 内部为每个输入分别维护一个 watermark 值。Watermark 从哪条通道进来，就更新那个输入对应的值。
+
+```
+Watermark 记录结构：{ timestamp: 10:06 }，没有别的字段
+
+Task 内部维护：
+  input A 的最新 watermark: 10:08   ← 从通道 A 收到的
+  input B 的最新 watermark: 10:06   ← 从通道 B 收到的
+  当前时钟 = min(10:08, 10:06) = 10:06
+```
+
+#### Watermark 实时处理，单调递增不回退
+
+Watermark 的处理是实时的——每收到一条 Watermark，立刻更新该输入通道的值并重新算 min，没有攒批、没有窗口。而且**单个输入通道的 watermark 只增不减**：收到更大的才更新，比当前值小的直接丢弃。因此整体时钟（min）也一定是单调递增的，永远不会回退。
+
+```
+时刻1: A 发来 WM=10:03, B 还没发 → inputA=10:03, inputB=-∞, 时钟=min=−∞
+时刻2: B 发来 WM=10:04            → inputA=10:03, inputB=10:04, 时钟=min=10:03
+时刻3: A 发来 WM=10:05            → inputA=10:05, inputB=10:04, 时钟=min=10:04
+时刻4: B 发来 WM=10:06            → inputA=10:05, inputB=10:06, 时钟=min=10:05
+时刻5: A 异常发来 WM=10:01        → 10:01 < 10:05, 丢弃, inputA 保持 10:05
+```
+
+每个输入只增不减，min 也只增不减，但增长速度被最慢的那个输入拖住。
+
+#### Watermark 不仅驱动窗口
+
+窗口是 Watermark 最常见的消费者，但不是唯一的。Watermark 是整个事件时间体系的"全局时钟指针"，以下机制都订阅这个时钟：
+
+窗口：Watermark 推进到窗口结束时间时，触发计算并关闭窗口。
+
+Event Time Timer：用 `ProcessFunction` 注册的事件时间定时器（如"在事件时间 10:10 时执行某段逻辑"），靠 Watermark 推进来触发，与窗口无关。
+
+Interval Join / 时间维表关联：两个流做时间窗口 join 时，Watermark 决定何时可以认为某时间段数据"齐了"，可以开始 join 并清理过期状态。这里没有传统意义上的窗口，但依然依赖 Watermark。
+
+State 清理：某些算子基于事件时间清理过期状态（如"保留最近 1 小时的状态"），这个"1 小时"按 Watermark 推进来算。
+
+#### Watermark 的代码示例
+
+DataStream API 中手动生成 Watermark：
+
+```java
+DataStream<Event> stream = env
+    .addSource(new MySource())
+    // 为流分配 Watermark 策略：最大乱序 2 秒
+    .assignTimestampsAndWatermarks(
+        WatermarkStrategy
+            .<Event>forBoundedOutOfOrderness(Duration.ofSeconds(2))
+            .withTimestampAssigner((event, ts) -> event.getTimestamp())
+    );
+```
+
+`forBoundedOutOfOrderness` 的内部逻辑就是：记录已见过的最大时间戳 `maxTimestamp`，定期发出 `Watermark(maxTimestamp - 2s)`。这个 Watermark 作为特殊记录混在数据流里往下游传。
+
+多输入场景下（如 Interval Join），每个流各自走自己的 Watermark 策略，各自发送自己的 Watermark，下游算子取最小值推进：
+
+```java
+// 两个流各自分配 Watermark 策略
+DataStream<Order> orders = env.addSource(...)
+    .assignTimestampsAndWatermarks(
+        WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofSeconds(3))
+            .withTimestampAssigner((o, ts) -> o.getOrderTime()));
+
+DataStream<Payment> payments = env.addSource(...)
+    .assignTimestampsAndWatermarks(
+        WatermarkStrategy.<Payment>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+            .withTimestampAssigner((p, ts) -> p.getPayTime()));
+
+// Interval Join：下游算子取两个流 Watermark 的最小值作为事件时间时钟
+orders
+    .keyBy(Order::getOrderId)
+    .intervalJoin(payments.keyBy(Payment::getOrderId))
+    .between(Time.seconds(-10), Time.seconds(10))
+    .process(new OrderPaymentJoinFunc());
+```
+
 ### 2.3 窗口（Window）
 
 窗口把无限流切成有限的数据集来做聚合。Flink 支持四种窗口：
