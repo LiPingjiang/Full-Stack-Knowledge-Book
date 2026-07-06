@@ -256,7 +256,153 @@ Exactly-Once 不是 Flink 单方面保证的，还需要：数据源支持重放
 
 ---
 
-## 五、Flink SQL
+## 五、状态管理
+
+### 5.1 State 分类
+
+一个 Flink Job 通常由 Source → Transformation → Sink 组成，每个算子在一个或多个 Task 中并行运行。State 就是流处理过程中需要"记住"的数据快照，既包括业务数据（如累加计数），也包括元数据（如 Kafka Consumer 的 offset）。
+
+| 类型 | 作用域 | 典型场景 | 缩放行为 |
+|------|--------|---------|---------|
+| **Keyed State** | 每个 key 一份，仅在 KeyedStream 上可用 | 按 key 聚合的计数、求和、窗口状态 | 按 Key Group 重新分配 |
+| **Operator State** | 每个 Sub-Task（并行实例）一份 | Kafka Source 的 offset 列表、Broadcast State | 按 List 重新分配 |
+
+Keyed State 可以理解为"分布式 Map"——从每条记录中提取 key，状态按 key 隔离存储。常见的 Keyed State 类型：ValueState（单值）、ListState（列表）、MapState（映射）、ReducingState（聚合）、AggregatingState（聚合输出不同类型）。
+
+Operator State 常见类型：ListState（如 Kafka Source 每个 Sub-Task 维护自己消费的 partition offset 列表）、BroadcastState（广播状态，所有 Sub-Task 持有完整副本）。
+
+### 5.2 为算子设置 UID——Savepoint 恢复的关键
+
+Flink 在恢复 State 时，通过 **UID** 将 Savepoint 中的状态映射到对应的算子。UID 和状态唯一绑定。
+
+默认情况下，Flink 通过遍历 JobGraph 并 hash 算子属性自动生成 UID。这很方便但**非常脆弱**——任何对 JobGraph 的改动（加算子、改顺序、调并行度）都可能导致 UID 变化，进而导致状态无法恢复。
+
+```java
+// 强烈建议：给所有有状态的算子手动指定 UID（包括 Source 和 Sink）
+env.addSource(new MySource()).uid("my-source")
+    .keyBy(anInt -> 0)
+    .map(new MyStatefulFunction()).uid("my-map")
+    .addSink(new DiscardingSink<>()).uid("my-sink");
+```
+
+**实践原则**：有状态的算子必须设 UID，无状态的算子设了也没坏处。如果通过 SQL 层或解析器间接生成 Flink Job，要确保解析器能生成稳定的 UID，否则修改 SQL 后 Savepoint 恢复会大面积丢失状态。
+
+### 5.3 State 存储后端
+
+以最常用的 **RocksDBStateBackend** 为例，状态数据的流动分为三层：
+
+```
+用户代码 → 本地 RocksDB 文件（实时读写） → HDFS/S3（Checkpoint 异步同步）
+```
+
+- 用户代码产生的 State 实时存储在 TaskManager 本地的 RocksDB 文件中，100% 本地性，不需要网络传输。
+- Checkpoint 触发时，RocksDB 的增量快照异步同步到远端分布式文件系统（HDFS/S3）。
+- 各 Sub-Task 只负责自己所属的那部分状态，不需要互相传输，也不频繁读写 HDFS。
+- 作业重启时，从 HDFS 取回 State 数据到本地 RocksDB，恢复现场。
+
+| State Backend | 存储位置 | 适用场景 | 特点 |
+|---------------|---------|---------|------|
+| **MemoryStateBackend** | 纯内存（Java 堆） | 验证、测试 | 不推荐生产，State 大小受 JVM 堆限制 |
+| **FsStateBackend** | 内存 + 文件（HDFS/S3） | 中小规模 State | State 在内存中，Checkpoint 时写文件 |
+| **RocksDBStateBackend** | 本地 RocksDB 文件 + HDFS/S3 | 大规模 State（生产首选） | 支持增量 Checkpoint，State 大小不受 JVM 堆限制 |
+
+### 5.4 State 重分布——改变并行度时的状态分配
+
+Flink 不支持运行时动态改变并行度，必须先停止作业，修改并行度后从 Savepoint 恢复。改变并行度后，State 怎么分配给新的 Sub-Task？
+
+**Operator State 的重分布**：
+
+- **ListState**：将所有 Sub-Task 的 List 取出合并，然后按元素个数均匀分配给新的 Sub-Task。
+- **UnionListState**：将所有 List 拼接起来，不做划分，直接完整分发给每个新的 Sub-Task（由用户自行处理）。
+- **BroadcastState**：直接复制到所有新的 Sub-Task（每个 Sub-Task 持有完整副本）。
+
+**Keyed State 的重分布——Key Group 机制**：
+
+如果没有状态，改变并行度只需要重新分配数据流即可。但 Keyed State 的状态数据存在 HDFS 里，并行度变化后需要决定哪些状态分给哪个 Sub-Task。
+
+最朴素的想法是按 `hash(key) % newParallelism` 重新分配。但问题在于：Checkpoint 时状态是顺序写入文件的，恢复时需要随机读（HDFS 不带按 key 的索引），效率极低；而且重新分配后各 Sub-Task 处理的 key 可能和之前完全不同，本地性很差。
+
+为解决这个问题，Flink 引入了 **Key Group（键组）**：
+
+- Key Group 是 Keyed State 分配的**原子单位**，不能再细分。
+- Key Group 的数量 = **最大并行度（maxParallelism）**，索引范围为 `[0, maxParallelism - 1]`。
+- 每个 Sub-Task 处理一个或多个 Key Group。
+
+**key 如何分配到 Key Group？** 对 key 做两重哈希（一次取 hashCode，一次做 MurmurHash）后对最大并行度取余：
+
+```
+keyGroupIndex = MathUtils.murmurHash(key.hashCode()) % maxParallelism
+```
+
+**Key Group 如何分配到 Sub-Task？** 由并行度、最大并行度和 Sub-Task 索引共同决定：
+
+```
+// 简化逻辑
+int keyGroupsPerTask = maxParallelism / parallelism  // 均匀分配
+startGroup = subTaskIndex * keyGroupsPerTask
+endGroup = startGroup + keyGroupsPerTask - 1
+```
+
+例如，最大并行度 = 10，当前并行度从 3 改为 4：
+
+```
+并行度 = 3 时：
+  Sub-Task 0 → Key Group [0, 1, 2, 3]    (4 个)
+  Sub-Task 1 → Key Group [4, 5, 6]        (3 个)
+  Sub-Task 2 → Key Group [7, 8, 9]        (3 个)
+
+并行度 = 4 时（从 Savepoint 恢复）：
+  Sub-Task 0 → Key Group [0, 1]           (2 个)
+  Sub-Task 1 → Key Group [2, 3, 4]        (3 个)
+  Sub-Task 2 → Key Group [5, 6, 7]        (3 个)
+  Sub-Task 3 → Key Group [8, 9]           (2 个)
+```
+
+每个 Sub-Task 只需要从 Checkpoint 中读取自己负责的 Key Group 的数据，不需要读取整个文件，解决了随机读和本地性问题。
+
+### 5.5 最大并行度（Max Parallelism）
+
+Key Group 的数量 = 最大并行度，这意味着**当前并行度不能超过最大并行度**，否则有 Sub-Task 分不到 Key Group 变成空转，Flink 会直接报错：
+
+```
+Caused by: org.apache.flink.runtime.JobException: 
+  Vertex Map's parallelism (4) is higher than the max parallelism (2).
+  Please lower the parallelism or increase the max parallelism.
+```
+
+**最大并行度一旦设置就不可轻易修改**——因为 Key Group 数量变了，Checkpoint 中的状态快照无法映射到新的 Key Group，所有状态快照会失效。
+
+**默认值规则**（未手动设置时）：
+
+- 当并行度 < 128 时，最大并行度默认 = 128
+- 当并行度 ≥ 128 时，最大并行度 = `parallelism + parallelism / 2`，上限为 32768（2^15）
+
+**设置方式**：
+
+```java
+final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+env.getConfig().setMaxParallelism(4);
+```
+
+**实践建议**：最大并行度应根据未来数据增量预估设置——当前并行度 ≤ 最大并行度，留出扩容空间。但不要设得过大，因为 Key Group 数量越多，状态元数据越大，Checkpoint 快照也随之增大，会降低性能。在满足业务需求的前提下设置尽可能小的最大并行度。
+
+### 5.6 Savepoint 恢复规则
+
+从 Savepoint 恢复时，Flink 按 UID 匹配算子状态。以下是各种代码变更的恢复情况：
+
+| 变更类型 | 能否恢复 | 说明 |
+|---------|---------|------|
+| 算子顺序改变，UID 不变 | 可以 | 按 UID 匹配，与位置无关 |
+| 新增无状态算子 | 可以 | 无状态不涉及恢复 |
+| 新增有状态算子 | 可以（新算子无初始状态） | 不影响已有算子恢复 |
+| 删除有状态算子 | 默认报错 | 需加 `-allowNonRestoredState`（`-n`）跳过 |
+| UID 变了 | 恢复失败 | 找不到对应状态，最常见的事故 |
+| 调整并行度 | 可以（≤ maxParallelism） | 按 Key Group 重新分配 |
+| 修改最大并行度 | 状态失效 | Key Group 数量变化，无法映射 |
+
+---
+
+## 六、Flink SQL
 
 Flink 也支持 SQL 接口，语法和 Hive SQL / 标准 SQL 类似，但增加了流处理专用语法：
 
@@ -285,7 +431,7 @@ GROUP BY user_id, TUMBLE(click_time, INTERVAL '10' MINUTE);
 
 ---
 
-## 六、面试深度剖析
+## 七、面试深度剖析
 
 ### 考点 1：Flink vs Spark Streaming
 
@@ -310,6 +456,24 @@ Watermark 的延迟容忍时间需要在"结果准确性"和"延迟"之间权衡
 > **面试官**：「Flink 处理不过来怎么办？」
 
 Flink 有天然的反压机制：下游算子处理不过来时，它的输入缓冲区满了，上游算子的输出缓冲区也随之满了，一层层传导到 Source，Source 自动降低读取速率。不需要额外配置。反压持续过久说明需要加资源（增加并行度）或优化算子逻辑。
+
+### 考点 5：Key Group 和最大并行度
+
+> **面试官**：「Flink 改并行度时状态怎么恢复？Key Group 是什么？」
+
+Flink 用 Key Group 作为 Keyed State 重分配的原子单位。Key Group 数量 = 最大并行度，key 通过 `murmurHash(key.hashCode()) % maxParallelism` 分配到某个 Key Group，每个 Sub-Task 负责一段连续的 Key Group 范围。改变并行度时，Key Group 的归属重新划分，但 Key Group 到 key 的映射不变，所以状态能正确恢复。最大并行度一旦设定不能随意改，否则 Key Group 数量变化导致状态失效。默认值：并行度 < 128 时取 128，否则取 `parallelism + parallelism / 2`。
+
+### 考点 6：Savepoint 恢复的坑
+
+> **面试官**：「修改 Flink 作业代码后从 Savepoint 恢复，有哪些注意事项？」
+
+最关键的是 UID——不手动指定 UID 时，Flink 自动 hash 生成，代码任何改动都可能导致 UID 变化，状态恢复失败。所以有状态的算子必须手动 `.uid()`。其他规则：新增无状态算子不影响恢复；删除有状态算子需加 `-n` 跳过；调整并行度可以恢复（≤ maxParallelism）；修改最大并行度会导致状态失效。
+
+### 考点 7：Watermark 与 Barrier 的区别
+
+> **面试官**：「Watermark 和 Barrier 有什么区别？」
+
+两者都是混在数据流里的特殊记录，但本质不同。Watermark 是 Source 根据数据时间戳自主生成的，驱动事件时间推进，决定窗口何时触发、Timer 何时执行。Barrier 是 JobManager 通过 RPC 定时注入的，标志快照边界，协调全局状态一致性。Watermark 在多输入时取 min，Barrier 在多输入时对齐。一句话：Watermark 管"时间到了没"，Barrier 管"快照切在哪"。
 
 ---
 
