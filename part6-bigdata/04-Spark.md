@@ -860,6 +860,61 @@ Task 内存调度规则（n = 当前活跃 Task 数）：
 
 启用 `spark.memory.offHeap.enabled=true` 后，堆外也参与统一内存管理，同样划分为 Storage（50%）和 Execution（50%），与堆内互不影响。堆外内存不受 GC 影响，不会被 GC 停顿打断，作为"共享缓冲区"降低 Task 因内存不足被挂起/失败的概率，适合大 Shuffle 场景。
 
+<details>
+<summary><b>展开：memoryOverhead 和 offHeap.size 的区别——两种"堆外内存"不要搞混</b></summary>
+
+Spark 的"堆外内存"有两种，名字容易混淆，但用途完全不同：
+
+**spark.executor.memoryOverhead**（YARN 层面的堆外）——给 JVM 自身开销用的，包括 JNI 调用、网络缓冲区（Netty I/O）、Python UDF 子进程（PySpark 的 Python worker）、线程栈等。这块内存**不归 Spark 内存管理器（MemoryManager）管**，你的 Shuffle/JOIN 中间数据不会放到这里。它的作用是防止 Container 物理内存（堆 + 堆外所有开销）超出 YARN 申请量，被 YARN kill（exitCode 143 + "exceeding physical memory limits"）。
+
+**spark.memory.offHeap.size**（Spark 层面的堆外统一内存）——需要 `spark.memory.offHeap.enabled=true` 才生效。这块内存**归 Spark 内存管理器管**，和堆内一样划分为 Storage + Execution，支持动态借用。Shuffle 排序、JOIN 的中间数据可以放到这里。它与堆内的 Unified Memory 互不影响，相当于额外开了一个内存池。
+
+```
+两种"堆外"的关系（以 8GB executor.memory + 2GB memoryOverhead + 3GB offHeap 为例）：
+
+┌─ YARN Container 申请量 = executor.memory + memoryOverhead + offHeap.size ──┐
+│                                                                              │
+│  ┌─ JVM Heap（8GB）─────────────────────┐                                   │
+│  │  Reserved (300MB)                     │                                   │
+│  │  User Memory                          │                                   │
+│  │  Unified Memory (Storage + Execution) │  ← MemoryManager 管理            │
+│  └───────────────────────────────────────┘                                   │
+│  ┌─ memoryOverhead（2GB）───────────────┐                                   │
+│  │  JNI / Netty / Python worker / 线程栈 │  ← MemoryManager 管不到           │
+│  └───────────────────────────────────────┘                                   │
+│  ┌─ offHeap.size（3GB）─────────────────┐                                   │
+│  │  Off-heap Storage + Execution         │  ← MemoryManager 管理            │
+│  └───────────────────────────────────────┘                                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+
+所以：
+  memoryOverhead = JVM 自身的"生活费"，不能用来跑 Shuffle/JOIN
+  offHeap.size   = 额外的"工作空间"，可以跑 Shuffle/JOIN，且不受 GC 影响
+```
+
+一个常见误解是"Unified Memory 不够用了，调大 memoryOverhead 就行"——这是错的。memoryOverhead 里的内存 Spark 用不了。你需要调的是 `executor.memory`（增大堆内 Unified Memory）或 `offHeap.size`（增大堆外 Unified Memory）。
+
+</details>
+
+<details>
+<summary><b>展开：面试常问——大表 JOIN 场景该调 storageFraction 还是 memory.fraction？</b></summary>
+
+**场景**：两个大表做 SortMergeJoin，没有广播、没有缓存 RDD，Executor OOM 了。应该调 `storageFraction` 来给 Execution 更多空间吗？
+
+**答**：不需要。在"无缓存"场景下，调 `storageFraction` 几乎没有实际效果。
+
+原因是动态借用机制已经自动处理了——Storage Memory 里没有缓存数据（空的），Execution Memory 需要空间时会自动借用 Storage 的空闲部分。极端情况下 Execution 可以占满整个 Unified Memory（接近 100%），因为 Storage 没有数据需要保护，不存在"驱逐缓存"的问题。`storageFraction` 只是控制 Storage 的**初始保留量**，当 Storage 本身是空的，初始保留多少都一样会被 Execution 借走。
+
+这种场景下 OOM 的真正原因是 **Unified Memory 总量不够**——即使 Execution 借满了整个 Unified Memory，Shuffle 中间数据仍然放不下。Spark 会先尝试 Spill 到磁盘，如果 Spill 能缓解内存压力，任务能完成（只是变慢）。只有当单 Task 数据量实在太大（或 Task 并发太多导致每个 Task 分到的 1/2n 都不够），Spill 也救不了，才会真正 OOM。
+
+正确的调优顺序（成本递增）：
+
+①  增大 `spark.sql.shuffle.partitions`（从 200 调到 1000-2000）——让每个 Task 处理的数据量减小，零成本。②  减小 `executor.cores`（从 4 减到 2）——Task 并行数减少，每 Task 可用内存翻倍，不增加资源申请。③ 调大 `memory.fraction`（从 0.6 调到 0.7）——Unified Memory 总量增大，但 User Memory 减小。④  调大 `executor.memory`——整个蛋糕变大，但受 YARN Container 上限约束。⑤  开启 `offHeap`（`spark.memory.offHeap.enabled=true` + `offHeap.size=2G`）——额外增加一个不受 GC 影响的 Execution 内存池。⑥  降低 `storageFraction`（从 0.5 到 0.2）——**在"无缓存"场景下几乎没用**，动态借用已自动处理。
+
+**什么场景才需要调 storageFraction？** 当你**既有大量 cache 又有大量 Shuffle** 时——比如迭代式机器学习（每轮 cache 中间结果 + 做 JOIN 聚合），Storage 和 Execution 真的在抢内存。这时降低 storageFraction 可以减少 Execution 需要驱逐 Storage 缓存的频率。
+
+</details>
+
 > 更多内存模型的调优实战（包括 YARN Container 约束、memory.fraction 调优案例、堆外 vs 堆内执行的取舍等）请查看 → [Spark 性能优化专题 · 内存模型调优](./04-Spark-性能优化.md#内存模型与-memoryfraction)
 
 ---
