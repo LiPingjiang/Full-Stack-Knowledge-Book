@@ -1012,6 +1012,8 @@ spark-submit \
 
 #### 内存模型与 memory.fraction
 
+> **前置知识**：Executor 内存模型的完整概念介绍（四层结构、两代演进、动态借用规则、Task 内存调度）已在主文档中详细讲解，请先阅读 → [Spark 主文档 · 3.5 Executor 内存模型](./04-Spark.md#35-executor-内存模型spark-最核心的资源管理机制)。本节侧重**调优实战**——参数如何映射到模型、如何诊断和调整。
+
 Spark Executor 的 JVM 堆内存管理经历了两代演进：
 
 **第一代：静态内存管理（StaticMemoryManager，Spark 1.5 及以前）**

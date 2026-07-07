@@ -687,6 +687,181 @@ graph TD
 
 > **关键理解**：Container 不是进程，而是 YARN 的资源隔离单位（通过 cgroup 限制 CPU/内存）。YARN 在 Container 内启动 JVM 进程（Executor 或 AM），Container 提供资源边界，JVM 在边界内运行。一个物理机上可以同时运行多个 Container（多个 Executor），它们通过 cgroup 互相隔离。
 
+### 3.5 Executor 内存模型——Spark 最核心的资源管理机制
+
+理解 Executor 的内存模型是排查 OOM、调优参数、分析 Spill 的基础。很多性能问题的根源就是"不知道自己的 Shuffle/Cache 数据在内存模型里占了哪一层"。
+
+#### 两代内存管理
+
+Spark Executor 的 JVM 堆内存管理经历了两代演进：
+
+**第一代：静态内存管理（StaticMemoryManager，Spark 1.5 及以前）**
+
+静态管理将堆内存按固定比例分配给 Storage 和 Execution，两者**互不借用**：
+
+```
+静态内存管理（已废弃）：
+
+  Heap × 20%    → Other/Reserved（系统预留）
+  Heap × 60%    → Storage Memory（缓存 RDD）   ← spark.storage.memoryFraction = 0.6
+  Heap × 20%    → Execution Memory（Shuffle/JOIN） ← spark.shuffle.memoryFraction = 0.2
+
+  问题：Storage 和 Execution 之间有硬边界，不能跨界借用
+  → 某些任务 Shuffle 重但不用缓存 → Execution 不够用，Storage 空着浪费
+  → 某些任务疯狂 cache 但不 Shuffle → Storage 不够用，Execution 空着浪费
+```
+
+![静态内存管理模型（已废弃）——Storage/Execution 硬隔离，不可借用](assets/spark-memory-static.png)
+
+**第二代：统一内存管理（UnifiedMemoryManager，Spark 1.6+，默认）**
+
+统一管理把 Storage 和 Execution 放进同一个池子，可以动态借用。Spark 1.6+ 默认使用统一管理，静态管理的代码在 Spark 3.0 已被移除。
+
+> **为什么统一管理更好？** 因为实际任务中 Storage 和 Execution 的需求是动态变化的——ETL 任务几乎不用缓存（Storage 空闲），而迭代式机器学习任务疯狂缓存（Execution 空闲）。统一管理让两者共享空间，谁需要谁用，避免"一半撑死一半饿死"。代价是 Storage 的缓存可能被 Execution 驱逐（但缓存可以从磁盘重建，而计算中间数据不能丢，所以这个优先级设计是合理的）。
+
+#### 四层内存模型
+
+Spark Executor 的 JVM 堆内存从下到上分为四个层次（Unified Memory Management，Spark 1.6+）：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                  Executor JVM Heap                      │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Unified Memory（统一内存）                        │   │
+│  │  = (Heap - 300MB) × spark.memory.fraction        │   │
+│  │  ┌────────────────────┐  ┌────────────────────┐  │   │
+│  │  │  Storage Memory    │  │  Execution Memory  │  │   │
+│  │  │  用于缓存 RDD      │  │  用于 Shuffle/     │  │   │
+│  │  │  /广播变量/数据    │  │  JOIN/聚合中间数据 │  │   │
+│  │  │  = Unified × 50% │  │  = Unified × 50%   │  │   │
+│  │  │  默认 storageFraction=0.5                    │  │   │
+│  │  │                    │  │                    │  │   │
+│  │  │  ┌────────────┐    │  │    ┌────────────┐  │  │   │
+│  │  │  │ 动态借用   │◄───┼──┼───►│ 动态借用   │  │  │   │
+│  │  │  └────────────┘    │  │    └────────────┘  │  │   │
+│  │  └────────────────────┘  └────────────────────┘  │   │
+│  └──────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  User Memory（用户内存）                           │   │
+│  │  = (Heap - 300MB) × (1 - memory.fraction)        │   │
+│  │  用于用户代码、UDF、数据结构、RDD 依赖关系等       │   │
+│  └──────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Reserved Memory（系统预留）                       │   │
+│  │  默认 300MB，用于存储 Spark 内部对象（不可配置）    │   │
+│  └──────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────┤
+│  堆外内存（spark.executor.memoryOverhead）              │
+│  （JNI、网络缓冲区、Python UDF 等）                      │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### 参数与内存模型的逐层对应关系
+
+```
+模型结构（从上到下）与参数的对应：
+
+┌─────────────────────────────────────────────────────────┐
+│  Executor JVM Heap（spark.executor.memory）              │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Unified Memory                                    │   │
+│  │  ┌────────────────────┐  ┌────────────────────┐  │   │
+│  │  │  Storage Memory    │  │  Execution Memory  │  │   │
+│  │  │  ← storageFraction │  │  ← 1-storageFraction│  │   │
+│  │  └────────────────────┘  └────────────────────┘  │   │
+│  │           ↑                                        │   │
+│  │    spark.memory.fraction 控制这一整块的大小         │   │
+│  └──────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  User Memory  ← 1 - spark.memory.fraction         │   │
+│  └──────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Reserved Memory（固定 300MB，不可配置）            │   │
+│  └──────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────┤
+│  堆外内存（spark.executor.memoryOverhead + offHeap.size）│
+└─────────────────────────────────────────────────────────┘
+```
+
+| 参数 | 默认值 | 对应模型哪一层 | 公式 | 调大/调小的影响 |
+|------|--------|--------------|------|----------------|
+| `spark.executor.memory` | — | 整个 JVM 堆 | 即 `-Xmx` | 调大增加总内存，但受 YARN Container 上限制约 |
+| `spark.memory.fraction` | 0.6 (Spark 2.0+) | Unified Memory 占可用堆的比例 | `(Heap - 300MB) × fraction` | 调大→ Execution/Storage 增多，User Memory 减少（UDF 可能 OOM） |
+| `spark.memory.storageFraction` | 0.5 | Unified Memory 中 Storage 的**初始**保留比例 | `Unified × storageFraction` | 调大→ Storage 初始保留更多，Execution 可借用空间减少 |
+| `spark.executor.memoryOverhead` | memory × 0.1 | 堆外内存（JNI/网络/Python UDF） | 独立于堆 | 调大避免堆外 OOM 被 YARN kill，但不参与统一管理 |
+| `spark.memory.offHeap.enabled` | false | 是否启用堆外统一内存 | — | 启用后堆外也有 Storage/Execution 分区，与堆内互不影响 |
+| `spark.memory.offHeap.size` | 0 | 堆外统一内存总量 | 需启用 offHeap | 堆外 Execution 内存不受 GC 影响，适合大 Shuffle 场景 |
+
+> **参数与模型的对应关系速记**：`executor.memory` 决定整个蛋糕大小 → 减去 300MB Reserved → 乘以 `memory.fraction` 得到 Unified Memory（Execution + Storage 共享池）→ 再乘以 `storageFraction` 得到 Storage 的初始保留量 → 剩余给 Execution。User Memory 是 `1 - memory.fraction` 那部分，Spark 不管，由用户代码自由使用。
+
+#### Storage 与 Execution 的动态借用
+
+Storage 和 Execution 共享统一内存池，但有一个**优先级差异**：
+
+```
+动态借用规则：
+
+① Storage 可以借用 Execution 的空闲内存
+   → 当缓存数据量临时增加时，Storage 可以占用 Execution 未使用的部分
+   → Execution 后续需要时可以强制回收（Storage 数据会被驱逐到磁盘）
+
+② Execution 可以借用 Storage 的空闲内存
+   → 当 Shuffle/JOIN 需要更多内存时，Execution 可以占用 Storage 未使用的部分
+   → Storage 后续需要时可以尝试回收，但 Execution 不会主动归还
+   → 如果 Storage 被占用的部分有缓存数据，Execution 需要时可以强制驱逐
+
+③ 两者都不足时 → 触发 Spill 到磁盘
+```
+
+![统一内存管理的动态借用机制——三种场景](assets/spark-memory-dynamic-borrow.png)
+
+> **关键区别**：Execution 内存有**优先权**。当 Execution 需要内存时，可以强制回收 Storage 借用的部分（驱逐缓存数据到磁盘）。反之，Storage 不能强制回收 Execution 的内存——只能等待 Execution 主动释放。这是合理的：计算中的中间数据不能丢，但缓存的数据可以从磁盘重新读取。
+
+#### 完整计算公式（以 8GB Executor 为例）
+
+```
+Heap = 8GB = 8192MB
+  Reserved = 300MB（固定）
+  Usable = 8192 - 300 = 7892MB
+    Unified Memory = 7892 × 0.6 = 4735MB
+      Storage = 4735 × 0.5 = 2367MB
+      Execution = 4735 × 0.5 = 2367MB
+    User Memory = 7892 × 0.4 = 3157MB
+  
+  堆外内存 = memoryOverhead（默认 8GB × 0.1 = 819MB，最小 384MB）
+```
+
+#### Task 内存分配与调度机制
+
+`spark.executor.cores = N` 时，每个 Task 能申请到的内存为 `1/2N ~ 1/N`。例如 N=4、Execution Memory 为 4735MB → 每个 Task 初始可申请 4735/8 ≈ 592MB，最大可扩展到 4735/4 ≈ 1184MB。
+
+Executor 中每个 Task 以线程方式运行，共享 Execution Memory。Spark 用 `memoryForTask`（HashMap）跟踪每个 Task 的内存使用量。当多个 Task 竞争内存时：
+
+```
+Task 内存调度规则（n = 当前活跃 Task 数）：
+
+① 每个 Task 的内存下限 = Execution Memory × 1/2n
+   → 当剩余内存 < 1/2n 时，新 Task 被挂起（等待内存释放）
+
+② 每个 Task 的内存上限 = Execution Memory × 1/n
+   → Task 可以在 [1/2n, 1/n] 区间内申请内存
+
+③ Task 挂起后，当其他 Task 完成释放内存，剩余内存 ≥ 1/2n 时被唤醒
+
+④ 如果 Task 申请内存失败（无空闲且无法驱逐 Storage）→ 抛出 OutOfMemoryError
+```
+
+> **为什么是 1/2n ~ 1/n 而不是均分 1/n？** 因为 Spark 允许 Task 动态扩展内存——先到的 Task 可以用到 1/n（上限），后到的 Task 保底有 1/2n（下限）。这比严格均分更灵活：短 Task 快速完成释放内存，长 Task 可以借用其份额。代价是先到的 Task 可能"占便宜"用更多内存，后到的 Task 内存偏少——这就是为什么同一个 Stage 中有时个别 Task OOM 而其他 Task 正常。
+
+#### 堆外统一内存
+
+![堆外内存的 Storage/Execution 动态借用——与堆内统一管理一致](assets/spark-memory-offheap.png)
+
+启用 `spark.memory.offHeap.enabled=true` 后，堆外也参与统一内存管理，同样划分为 Storage（50%）和 Execution（50%），与堆内互不影响。堆外内存不受 GC 影响，不会被 GC 停顿打断，作为"共享缓冲区"降低 Task 因内存不足被挂起/失败的概率，适合大 Shuffle 场景。
+
+> 更多内存模型的调优实战（包括 YARN Container 约束、memory.fraction 调优案例、堆外 vs 堆内执行的取舍等）请查看 → [Spark 性能优化专题 · 内存模型调优](./04-Spark-性能优化.md#内存模型与-memoryfraction)
+
 ---
 
 ## 四、Spark SQL——最常用的模块
