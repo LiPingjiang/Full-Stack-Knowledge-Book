@@ -184,6 +184,172 @@ orders
 | **会话窗口（Session）** | 按活跃间隔动态切分 | 用户 30 分钟无操作则关闭会话 |
 | **全局窗口（Global）** | 所有数据在一个窗口，需自定义触发器 | 特殊场景 |
 
+#### 滚动窗口（Tumbling Window）
+
+**SQL**：
+
+```sql
+-- 统计每 5 分钟每个商品的订单数
+SELECT
+  product_id,
+  TUMBLE_START(order_time, INTERVAL '5' MINUTE) AS window_start,
+  TUMBLE_END(order_time, INTERVAL '5' MINUTE) AS window_end,
+  COUNT(*) AS order_cnt
+FROM orders
+GROUP BY
+  product_id,
+  TUMBLE(order_time, INTERVAL '5' MINUTE);
+```
+
+**Java DataStream**：
+
+```java
+DataStream<Order> orders = env.addSource(new KafkaSource<>())
+    .assignTimestampsAndWatermarks(
+        WatermarkStrategy.<Order>forBoundedOutOfOrderness(Duration.ofSeconds(5))
+            .withTimestampAssigner((o, ts) -> o.getOrderTime()));
+
+orders
+    .keyBy(Order::getProductId)
+    .window(TumblingEventTimeWindows.of(Time.minutes(5)))  // 5 分钟滚动窗口
+    .aggregate(new OrderCountAggregate())  // 自定义聚合函数
+    .addSink(new KafkaSink<>());
+```
+
+#### 滑动窗口（Sliding Window）
+
+**SQL**：
+
+```sql
+-- 每 1 分钟统计一次最近 10 分钟的订单数
+SELECT
+  product_id,
+  HOP_START(order_time, INTERVAL '1' MINUTE, INTERVAL '10' MINUTE) AS window_start,
+  HOP_END(order_time, INTERVAL '1' MINUTE, INTERVAL '10' MINUTE) AS window_end,
+  COUNT(*) AS order_cnt
+FROM orders
+GROUP BY
+  product_id,
+  HOP(order_time, INTERVAL '1' MINUTE, INTERVAL '10' MINUTE);
+-- 语法：HOP(timeCol, slideSize, windowSize)
+```
+
+**Java DataStream**：
+
+```java
+orders
+    .keyBy(Order::getProductId)
+    .window(SlidingEventTimeWindows.of(
+        Time.minutes(10),   // 窗口大小
+        Time.minutes(1)   // 滑动步长
+    ))
+    .aggregate(new OrderCountAggregate())
+    .addSink(new KafkaSink<>());
+```
+
+#### 会话窗口（Session Window）
+
+**SQL**：
+
+```sql
+-- 统计用户会话，30 分钟无操作则关闭会话
+SELECT
+  user_id,
+  SESSION_START(visit_time, INTERVAL '30' MINUTE) AS session_start,
+  SESSION_END(visit_time, INTERVAL '30' MINUTE) AS session_end,
+  COUNT(*) AS pv
+FROM user_visits
+GROUP BY
+  user_id,
+  SESSION(visit_time, INTERVAL '30' MINUTE);
+```
+
+**Java DataStream**：
+
+```java
+orders
+    .keyBy(Order::getUserId)
+    .window(EventTimeSessionWindows.withDynamicGap(
+        (Order o) -> Time.minutes(30)  // 动态间隔，也可固定
+    ))
+    // 或固定间隔：.window(EventTimeSessionWindows.withGap(Time.minutes(30)))
+    .aggregate(new SessionAggregate())
+    .addSink(new KafkaSink<>());
+```
+
+#### 累积窗口（Cumulative Window）
+
+**SQL**（Flink 1.13+）：
+
+```sql
+-- 每天从 00:00 开始，每 1 小时输出一次累计结果（截至当前小时）
+SELECT
+  product_id,
+  CUMULATE_START(order_time, INTERVAL '1' DAY, INTERVAL '1' HOUR) AS window_start,
+  CUMULATE_END(order_time, INTERVAL '1' DAY, INTERVAL '1' HOUR) AS window_end,
+  COUNT(*) AS pv
+FROM orders
+GROUP BY
+  product_id,
+  CUMULATE(order_time, INTERVAL '1' DAY, INTERVAL '1' HOUR);
+-- 语法：CUMULATE(timeCol, maxStepSize, stepSize)
+-- 窗口从 00:00 开始，每个 stepSize（1小时）输出一次，直到 maxStepSize（1天）结束
+```
+
+**Java DataStream**（Flink 1.13+ 无原生 Cumulative Window API，需用 ProcessFunction + Timer 模拟）：
+
+```java
+// 用 KeyedProcessFunction 实现累积窗口
+orders
+    .keyBy(Order::getProductId)
+    .process(new KeyedProcessFunction<String, Order, Result>() {
+        private ValueState<Long> pvState;
+        private ValueState<Long> lastOutputHour;
+
+        @Override
+        public void open(Configuration parameters) {
+            pvState = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("pv", Long.class));
+            lastOutputHour = getRuntimeContext().getState(
+                new ValueStateDescriptor<>("lastHour", Long.class));
+        }
+
+        @Override
+        public void processElement(Order order, Context ctx, Collector<Result> out) throws Exception {
+            long currentPv = pvState.value() == null ? 0 : pvState.value();
+            pvState.update(currentPv + 1);
+
+            // 注册当天每小时结束的 Timer
+            long eventTime = order.getOrderTime();
+            long hourEnd = (eventTime / 3600000 + 1) * 3600000; // 下一小时的边界
+            ctx.timerService().registerEventTimeTimer(hourEnd);
+        }
+
+        @Override
+        public void onTimer(long timestamp, OnTimerContext ctx, Collector<Result> out) throws Exception {
+            long pv = pvState.value() == null ? 0 : pvState.value();
+            out.collect(new Result(ctx.getCurrentKey(), timestamp, pv));
+        }
+    });
+```
+
+#### 全局窗口（Global Window）+ 自定义触发器
+
+**SQL**：SQL 层无全局窗口概念，需用 `GROUP BY` 无窗口聚合配合 `EMIT` 策略。
+
+**Java DataStream**：
+
+```java
+// 全局窗口 + 自定义触发器：每 100 条数据或 1 分钟触发一次计算
+orders
+    .keyBy(Order::getProductId)
+    .window(GlobalWindows.create())
+    .trigger(CountTrigger.of(100))  // 每 100 条触发
+    // 或组合触发器：.trigger(CountTrigger.of(100).or(ProcessingTimeTrigger.of(Time.minutes(1))))
+    .aggregate(new OrderCountAggregate())
+    .addSink(new KafkaSink<>());
+```
+
 ---
 
 ## 三、架构
@@ -617,9 +783,105 @@ Flink 1.11+ 开始，Checkpoint 和 Savepoint 的格式已经统一（都基于 
 # 从 Savepoint 恢复，允许跳过缺失的状态
 flink run -s hdfs://path/to/savepoint -n -c com.example.MyJob my-job.jar
 ```
+
+### 5.7 大 State 处理策略
+
+生产环境中，State 可能膨胀到几十 GB 甚至几百 GB（如全量用户画像、长时间窗口聚合），直接决定作业能否稳定运行。以下是处理大 State 的核心策略：
+
+#### 1. 选择 RocksDBStateBackend（生产唯一选择）
+
+MemoryStateBackend 和 FsStateBackend 都将 State 放在 JVM 堆内存中，受 JVM 堆大小限制，且大堆会导致 GC 停顿和 OOM。RocksDBStateBackend 将 State 放在本地磁盘（RocksDB 文件），不受 JVM 堆限制，是唯一适合大 State 的生产方案。
+
+```java
+// 配置 RocksDBStateBackend，Checkpoint 保存到 HDFS
+env.setStateBackend(new EmbeddedRocksDBStateBackend());
+env.getCheckpointConfig().setCheckpointStorage("hdfs://namenode:8020/flink/checkpoints");
+```
+
+#### 2. 增量 Checkpoint + 定期全量对齐
+
+增量 Checkpoint 只上传新增 SST 文件，大幅减少上传数据量。但增量链过长会导致恢复变慢。Flink 会自动在增量链达到一定长度时做全量对齐，也可以通过 `state.backend.incremental` 配置开启/关闭。保持增量开启（默认），无需特殊处理。
+
+#### 3. State TTL——必须设置
+
+大 State 最常见的根源是"只写不删"——数据源源不断流入，但过期数据永远不清理。必须根据业务语义设置 TTL：
+
+- 用户会话统计：TTL = 会话最大超时时间 + 缓冲
+- 7 日留存窗口：TTL = 7 天 + 1 天
+- 实时去重：TTL = 业务允许的重复时间窗口（如 24 小时）
+
+```java
+StateTtlConfig ttl = StateTtlConfig.newBuilder(Time.days(7))
+    .setUpdateType(OnCreateAndWrite)
+    .setStateVisibility(NeverReturnExpired)
+    .cleanupIncrementally(10, true)  // 增量清理，每 10 条读取触发一次清理
+    .build();
+```
+
+#### 4. 状态拆分：MapState 替代 ValueState<Set> / ValueState<List>
+
+当需要存储"某个 key 关联的大量子项"时，不要用一个 ValueState 存一个大集合，而是用 MapState：
+
+```java
+// 错误：ValueState<Set<String>> 存所有用户，集合越来越大
+ValueState<Set<String>> allUsersState = getRuntimeContext().getState(
+    new ValueStateDescriptor<>("users", TypeInformation.of(new TypeHint<Set<String>>() {})));
+
+// 正确：MapState<userId, Boolean> 按需存，配合 TTL 自动清理
+MapState<String, Boolean> userMapState = getRuntimeContext().getMapState(
+    new MapStateDescriptor<>("users", String.class, Boolean.class));
+```
+
+MapState 的每个 entry 可以独立设置 TTL（RocksDB 中每个 entry 对应独立的 key），过期后 RocksDB Compaction 可以逐条清理。而 ValueState 的 TTL 只能整体过期，无法细粒度清理。
+
+#### 5. 状态压缩与序列化优化
+
+- **使用 Protobuf / Avro 代替 Java 原生序列化**：原生序列化体积大、速度慢，且对 Schema 变化敏感。Protobuf 可以将状态体积减少 50% 以上。
+- **状态类型注册器（TypeSerializer）**：自定义 POJO 时，确保 Flink 能推断出 TypeSerializer，避免 fallback 到 Kryo（Kryo 兼容性差，版本升级可能破坏序列化）。
+- **禁用泛型快照（禁用 GenericTypeInfo）**：尽量用 `TypeHint` 或 `TypeInformation` 显式声明类型，避免 Flink 使用 Kryo 作为 fallback。
+
+```java
+// 显式声明类型，避免 Kryo
+TypeInformation<MyState> stateType = TypeInformation.of(new TypeHint<MyState>() {});
+ValueStateDescriptor<MyState> descriptor = new ValueStateDescriptor<>("state", stateType);
+```
+
+#### 6. 大状态排查与监控
+
+| 监控指标 | 含义 | 告警阈值 |
+|---------|------|---------|
+| `rocksdb_memtable_flush_duration` | MemTable 刷盘耗时 | > 5s 告警，可能写放大严重 |
+| `rocksdb_compaction_times` | Compaction 次数 | 突增告警，可能 SST 文件过多 |
+| `rocksdb_num_immutable_mem_tables` | 不可变 MemTable 数量 | > 3 告警，写入压力过大 |
+| `checkpoint_duration` | Checkpoint 总耗时 | > interval 的 50% 告警 |
+| `checkpoint_state_size` | 单次 Checkpoint 状态大小 | 持续增长且无收敛趋势告警 |
+| `numRecordsInPerSecond` / `numRecordsOutPerSecond` | 输入/输出速率 | 反压时 `out` 远小于 `in` |
+
+**排查方法**：Flink Web UI → Task Metrics → 按 Sub-Task 查看 `rocksdb_estimate_live_data_size`，如果某个 Sub-Task 的 RocksDB 数据量远大于其他，说明数据倾斜或 Key 设计不合理。
+
+#### 7. 状态清理策略优化
+
+RocksDB 默认的 Compaction 策略是 Size-Tiered，大 State 下建议改为 **Level Compaction**（通过 `state.backend.rocksdb.predefined-options` 配置为 `FLASH_SSD_OPTIMIZED`），减少读放大和写放大：
+
+```java
+// 配置 RocksDB 预定义选项（优化 SSD 场景）
+env.setStateBackend(new EmbeddedRocksDBStateBackend());
+DefaultConfigurableOptionsFactory optionsFactory = new DefaultConfigurableOptionsFactory();
+optionsFactory.setRocksDBOptions("state.backend.rocksdb.predefined-options", "FLASH_SSD_OPTIMIZED");
+optionsFactory.setRocksDBOptions("state.backend.rocksdb.memory.managed", "true");
+env.setStateBackend(new EmbeddedRocksDBStateBackend(true, optionsFactory));
+```
+
+#### 8. 大状态作业的扩容与缩容
+
+- **扩容**：增加并行度（不超过 maxParallelism），Key Group 重新分配，各 Sub-Task 负载降低。但 Savepoint 恢复时，每个 Sub-Task 需要从 HDFS 拉取属于自己的 Key Group 数据，首次启动可能较慢。
+- **缩容**：减少并行度，多个 Sub-Task 的状态合并到更少的 Sub-Task。注意：缩容后每个 Sub-Task 的 State 变大，需要确保本地磁盘和内存足够。
+- **分区重设计**：如果某些 Key 的数据量远大于其他（如"匿名用户" key 占 80%），考虑重新设计 key（如加随机后缀打散，或拆分冷热 key）。
+
 ---
 
 ## 六、Flink SQL
+
 
 Flink 也支持 SQL 接口，语法和 Hive SQL / 标准 SQL 类似，但增加了流处理专用语法：
 
@@ -717,6 +979,155 @@ Checkpoint 大小直接影响三个维度：快照写入时间（越大写入 HD
 > **面试官**：「Broadcast State 改变并行度时怎么恢复？」
 
 Broadcast State 属于 Operator State，所有并行子任务持有**完全相同的副本**。Checkpoint 时每个 Sub-Task 都会保存完整副本；恢复时（无论并行度是否变化），每个 Sub-Task 都会获得完整副本。因此 Broadcast State 不涉及 Key Group 重分配，也不受并行度变化影响。典型场景是动态配置（如规则引擎），通过 Broadcast Stream 将规则广播到所有 Sub-Task，每个 Sub-Task 本地保存一份规则状态，避免每个 key 都存一份规则。
+
+### 考点 12：场景题——每天从 00:00 开始，每小时累计统计 PV/UV
+
+> **面试官**：「有一张 Kafka topic `user_visit_log`，字段有 user_id、user_type、visit_time。要求每天从 00:00 开始，每隔 1 小时输出一次截至当前小时的累计访问指标（按 user_type 分组，累计 PV 和 UV）。怎么设计 Flink SQL 或 DataStream 实现？」
+
+**核心思路**：这不是普通的滚动窗口（Tumbling Window），而是**累积窗口（Cumulative Window）**——窗口起点固定（每天 00:00），终点逐步扩展，每次输出从起点到当前时刻的累计结果。Flink SQL 1.13+ 提供了 `CUMULATE` 窗口函数直接支持：
+
+```sql
+SELECT
+  user_type,
+  CUMULATE_START(visit_time, INTERVAL '1' DAY, INTERVAL '1' HOUR) AS window_start,
+  CUMULATE_END(visit_time, INTERVAL '1' DAY, INTERVAL '1' HOUR) AS window_end,
+  COUNT(*) AS pv,
+  COUNT(DISTINCT user_id) AS uv
+FROM user_visit_log
+GROUP BY
+  user_type,
+  CUMULATE(visit_time, INTERVAL '1' DAY, INTERVAL '1' HOUR);
+```
+
+如果用 DataStream API，需要自己维护状态：用 `ProcessFunction` 或 `KeyedProcessFunction`，按 `user_type` 分组，状态中保存累计的 PV 计数和 UV 的 `MapState<user_id, Boolean>`（或 `ValueState<Set<String>>`，但大状态用 `MapState` 更好）。每来一条数据就更新状态，然后用 `Timer`（每天每小时触发）输出当前累计值。注意：状态必须设置 TTL（比如 25 小时），防止无限增长。
+
+### 考点 13：场景题——实时 TopN（每小时热门商品 Top10）
+
+> **面试官**：「实时统计每个小时销量最高的 Top10 商品，数据流中有商品 ID 和订单时间，怎么实现？」
+
+**核心思路**：`TumblingWindow` + `aggregate` 先聚合出每个商品每小时的销量，然后用 `KeyedProcessFunction` 维护一个大小为 N 的优先队列（小顶堆）做 TopN。关键在于：**先按窗口聚合，再在每个窗口内做 TopN 排序**，避免把所有数据都存到内存里。
+
+Flink SQL 实现更简洁：
+
+```sql
+SELECT *
+FROM (
+  SELECT
+    product_id,
+    window_start,
+    window_end,
+    sales_cnt,
+    ROW_NUMBER() OVER (PARTITION BY window_start, window_end ORDER BY sales_cnt DESC) AS rn
+  FROM (
+    SELECT
+      product_id,
+      TUMBLE_START(order_time, INTERVAL '1' HOUR) AS window_start,
+      TUMBLE_END(order_time, INTERVAL '1' HOUR) AS window_end,
+      COUNT(*) AS sales_cnt
+    FROM orders
+    GROUP BY product_id, TUMBLE(order_time, INTERVAL '1' HOUR)
+  )
+) WHERE rn <= 10;
+```
+
+**踩坑点**：如果商品数量极大，`COUNT(DISTINCT)` 或 `ROW_NUMBER()` 的状态可能很大。如果只需要近似 TopN，可以用 `AggState` 或 `MapState<product_id, count>` 配合 TTL，避免状态无限增长。
+
+### 考点 14：场景题——双流 Join（订单流 join 商品信息流）
+
+> **面试官**：「有两条流：订单流（实时）和商品信息流（更新较少）。怎么把订单和商品信息 Join 起来？有哪些方案？」
+
+**三种方案对比**：
+
+| 方案 | 适用场景 | 原理 | 缺点 |
+|------|---------|------|------|
+| **Window Join** | 两条流都有明确时间窗口，且在窗口内能匹配 | 划分时间窗口（Tumbling/Sliding/Session），窗口内做笛卡尔积匹配 | 窗口外的数据无法匹配，容易丢数据；大窗口状态大 |
+| **Interval Join** | 订单流在商品流前后一段时间内有匹配 | `KEY BY` 后，`between` 指定时间范围（如订单前后 5 分钟），状态保留范围内的数据 | 需要 key 相同，时间范围不能太大，否则状态爆炸 |
+| **Temporal Table Join** | 商品流是维度表（更新少），订单流是事实流 | 商品流作为 Temporal Table（类似版本表），订单流按处理时间 lookup | 只支持处理时间，不支持事件时间；商品流更新频率不能太高 |
+| **Async I/O + 外部存储** | 商品信息在外部（Redis/MySQL/HBase） | 订单流用 Async I/O 异步查询外部维度表 | 有外部依赖延迟，需要处理查询失败和超时 |
+
+**推荐策略**：如果商品信息更新频率低且全量可控，可以先用 Broadcast Stream 将商品信息广播到所有 Task 做 `Broadcast Join`；如果商品信息量大，用 `Async I/O` 查 Redis/HBase；如果两条流都是高频流，用 `Interval Join` 控制时间窗口。
+
+### 考点 15：场景题——数据倾斜怎么处理？
+
+> **面试官**：「Flink 作业中某个 Task 的并行度处理量远大于其他 Task，导致整体延迟，怎么排查和解决？」
+
+**排查方法**：
+
+- 看 Flink Web UI 的 `Backpressure` 和 `Records Received/Sent`，确认哪个 Sub-Task 接收或发送量异常。
+- 看 Checkpoint 的 `Subtask-level Checkpoint Duration`，如果某个 Sub-Task 耗时远大于其他，说明该 Sub-Task 的状态量远大于其他，大概率是数据倾斜。
+
+**解决方案**：
+
+- **两阶段聚合**：先局部预聚合（如加随机前缀 `keyBy(randomPrefix + key)`），再全局聚合。Flink SQL 会自动做 `Local-Global` 聚合优化。
+- **拆分热点 key**：如果某个 key 的数据量占 80%，可以把这个 key 的数据拆成多个子 key（比如 `key_0`、`key_1`...`key_N`），分散到多个 Sub-Task，最后再合并。
+- **自定义分区器**：实现 `Partitioner` 接口，按数据分布自定义分区逻辑，避免默认的 `hashCode % parallelism` 导致倾斜。
+- **状态层面**：如果倾斜是由 Keyed State 过大导致，考虑增加 `maxParallelism` 或重新设计 key（如从用户 ID 改为"用户 ID + 设备 ID"）。
+
+### 考点 16：场景题——反压（Backpressure）怎么排查和处理？
+
+> **面试官**：「Flink 作业出现反压，数据消费变慢，怎么排查和处理？」
+
+**排查方法**：
+
+- **Flink Web UI**：`Backpressure` 标签页会显示 `OK / LOW / HIGH` 三个等级。从 Source 往下游逐个看，第一个出现 `HIGH` 的算子就是瓶颈。
+- **Metrics 监控**：关注 `outPoolUsage`（输出缓冲区使用率）、`inPoolUsage`（输入缓冲区使用率）。如果 `outPoolUsage` 持续高，说明下游消费慢；如果 `inPoolUsage` 高，说明上游发送快。
+- **日志和 GC**：看 TaskManager 日志是否有频繁 Full GC（堆内存不足）、RocksDB 日志是否有 Compaction 堆积（磁盘 IO 瓶颈）。
+
+**处理方案**：
+
+- **资源层面**：增加瓶颈算子的并行度，或增加 TaskManager 的内存/CPU。
+- **算子优化**：检查瓶颈算子是否有大状态操作（如大窗口、大 Keyed State），考虑加 TTL、减少窗口范围、或改算子逻辑。
+- **网络层面**：如果跨网络传输的数据量太大（比如大字段、大 ListState），先做 `map` 过滤或压缩字段，减少网络传输。
+- **外部系统层面**：如果 Sink 是外部系统（如 MySQL、Elasticsearch），可能是外部系统写入瓶颈，需要加批量写入、增加连接池、或改用异步写入。
+- **Unaligned Checkpoint**：如果反压导致 Checkpoint 超时，可以启用 Unaligned Checkpoint，但会增大快照体积。
+
+### 考点 17：场景题——实时去重（用户行为去重）
+
+> **面试官**：「实时统计每个用户的首次购买行为，同一个用户多次购买只算一次，怎么实现？」
+
+**核心思路**：本质上就是**按 key 去重**。Flink 提供两种去重机制：
+
+**方案一：状态去重（First-Row）**
+
+```java
+// 使用 MapState<user_id, Boolean> 记录是否已处理
+MapState<String, Boolean> seenState = getRuntimeContext().getMapState(
+    new MapStateDescriptor<>("seen", String.class, Boolean.class));
+
+if (!seenState.contains(userId)) {
+    seenState.put(userId, true);
+    // 输出首次购买行为
+    out.collect(record);
+}
+```
+
+优点：精确，不需要外部依赖。缺点：状态无限增长（所有用户 ID 都要存）。**必须设置 TTL**，比如"只保留 7 天内的用户状态"，超期的用户可以重新算一次（业务上通常可接受）。
+
+**方案二：Bloom Filter 去重**
+
+用 Bloom Filter 近似判断用户是否已出现。优点：内存占用极小（百万级用户只需几 MB）。缺点：有误判率（可能把新用户误判为已存在，漏掉首次行为）。适合允许少量误差的场景（如广告曝光去重）。
+
+**方案三：HyperLogLog 去重**
+
+如果只需要统计 UV 数量而不需要精确知道每个用户是否首次，可以用 HyperLogLog 近似计数。Flink SQL 的 `COUNT(DISTINCT)` 底层会自动优化。
+
+### 考点 18：场景题——延迟数据怎么处理？
+
+> **面试官**：「Watermark 已经推进到 12:00 了，但突然来了一条 11:55 的数据，怎么处理？」
+
+**Flink 的延迟数据处理机制**：
+
+- **Watermark 的作用**：Watermark 标记了"小于该时间戳的数据应该都已到达"，窗口基于 Watermark 触发。如果 Watermark 已到 12:00，则 11:00~12:00 的窗口已经计算并输出，11:55 的数据属于**延迟数据**。
+- **Allowed Lateness**：窗口可以配置 `allowedLateness`，允许在窗口触发后的一段时间内继续接收延迟数据。延迟数据到达时，窗口会重新触发计算（输出更新结果）。适合窗口结果需要修正的场景。
+
+```java
+window
+    .allowedLateness(Time.minutes(5))  // 窗口触发后，允许 5 分钟内延迟数据到达
+    .sideOutputLateData(lateTag);       // 超过 allowedLateness 的延迟数据输出到侧输出流
+```
+
+- **Side Output**：超过 `allowedLateness` 的延迟数据会被输出到侧输出流（Side Output），可以单独处理（如写入日志、或进入离线补数流程）。
+- **Watermark 策略**：如果业务对延迟数据容忍度低，可以用 `WatermarkStrategy.forBoundedOutOfOrderness` 设置更长的乱序容忍时间，但会增大窗口延迟（Watermark 推进更慢）。需要在"延迟容忍度"和"结果实时性"之间权衡。
 
 ---
 
