@@ -865,7 +865,7 @@ Task 内存调度规则（n = 当前活跃 Task 数）：
 
 Spark 的"堆外内存"有两种，名字容易混淆，但用途完全不同：
 
-**spark.executor.memoryOverhead**（YARN 层面的堆外）——给 JVM 自身开销用的，包括 JNI 调用、网络缓冲区（Netty I/O）、Python UDF 子进程（PySpark 的 Python worker）、线程栈等。这块内存**不归 Spark 内存管理器（MemoryManager）管**，你的 Shuffle/JOIN 中间数据不会放到这里。它的作用是防止 Container 物理内存（堆 + 堆外所有开销）超出 YARN 申请量，被 YARN kill（exitCode 143 + "exceeding physical memory limits"）。
+**spark.executor.memoryOverhead**（YARN 层面的堆外预算）——这不是一块专门划出来的内存区域，而是一个**兜底预算**：JVM 堆之外的所有开销（Metaspace、线程栈、DirectByteBuffer、JNI/native 库、Python worker 进程等）加起来不能超过这个数。YARN 监控的是整个 Container 的物理内存总量（不区分堆/栈/DirectBuffer），如果 `executor.memory + 实际堆外开销` 超过 `executor.memory + memoryOverhead`，Container 就会被 YARN kill（exitCode 143 + "exceeding physical memory limits"）。这块预算**不归 Spark 内存管理器（MemoryManager）管**，Shuffle/JOIN 中间数据不会放到这里。
 
 **spark.memory.offHeap.size**（Spark 层面的堆外统一内存）——需要 `spark.memory.offHeap.enabled=true` 才生效。这块内存**归 Spark 内存管理器管**，和堆内一样划分为 Storage + Execution，支持动态借用。Shuffle 排序、JOIN 的中间数据可以放到这里。它与堆内的 Unified Memory 互不影响，相当于额外开了一个内存池。
 
@@ -879,8 +879,10 @@ Spark 的"堆外内存"有两种，名字容易混淆，但用途完全不同：
 │  │  User Memory                          │                                   │
 │  │  Unified Memory (Storage + Execution) │  ← MemoryManager 管理            │
 │  └───────────────────────────────────────┘                                   │
-│  ┌─ memoryOverhead（2GB）───────────────┐                                   │
-│  │  JNI / Netty / Python worker / 线程栈 │  ← MemoryManager 管不到           │
+│  ┌─ memoryOverhead（2GB 兜底预算）──────┐                                   │
+│  │  ← 不是专用区域，是以下开销的总预算：  │  ← MemoryManager 管不到           │
+│  │  Metaspace + 线程栈 + DirectBuffer  │                                   │
+│  │  + JNI/native + Python worker       │                                   │
 │  └───────────────────────────────────────┘                                   │
 │  ┌─ offHeap.size（3GB）─────────────────┐                                   │
 │  │  Off-heap Storage + Execution         │  ← MemoryManager 管理            │
@@ -888,15 +890,15 @@ Spark 的"堆外内存"有两种，名字容易混淆，但用途完全不同：
 └──────────────────────────────────────────────────────────────────────────────┘
 
 所以：
-  memoryOverhead = JVM 自身的"生活费"，不能用来跑 Shuffle/JOIN
+  memoryOverhead = JVM 堆之外所有开销的"兜底预算"，不能用来跑 Shuffle/JOIN
   offHeap.size   = 额外的"工作空间"，可以跑 Shuffle/JOIN，且不受 GC 影响
 ```
 
-一个常见误解是"Unified Memory 不够用了，调大 memoryOverhead 就行"——这是错的。memoryOverhead 里的内存 Spark 用不了。你需要调的是 `executor.memory`（增大堆内 Unified Memory）或 `offHeap.size`（增大堆外 Unified Memory）。
+一个常见误解是“Unified Memory 不够用了，调大 memoryOverhead 就行”——这是错的。memoryOverhead 只是 YARN 层面的预算额度，Spark 内存管理器用不到这块预算。你需要调的是 `executor.memory`（增大堆内 Unified Memory）或 `offHeap.size`（增大堆外 Unified Memory）。
 
 **那 memoryOverhead 什么场景会不够用？**
 
-memoryOverhead 不够的典型表现是 YARN kill + "exceeding physical memory limits" + "Consider boosting spark.yarn.executor.memoryOverhead"——注意这时 JVM 堆内**没有** OOM，是 Container 的物理内存总量（堆 + 堆外）超了 YARN 申请量。以下四种场景最容易触发：
+memoryOverhead 不够的典型表现是 YARN kill + "exceeding physical memory limits" + "Consider boosting spark.yarn.executor.memoryOverhead"——注意这时 JVM 堆内**没有** OOM，是 Container 的物理内存总量（堆 + 栈 + DirectBuffer + native + Python 等所有开销）超了 YARN 申请量。以下四种场景最容易挤占这个预算：
 
 ```
 场景 1：PySpark 任务（最常见）
@@ -919,10 +921,11 @@ memoryOverhead 不够的典型表现是 YARN kill + "exceeding physical memory l
   → 压缩/解压大数据集时 native 库的内存开销比预期大
 
 场景 4：executor.cores 过大导致线程栈累积
+  线程栈不在堆里，属于 JVM 进程的 native memory，但它占用 Container 物理内存
   每个 Task 是一个线程，每个线程栈默认 1MB（-XX:ThreadStackSize）
   → executor.cores=8 时光 Task 线程栈就 8MB
   → 加上 Spark 内部后台线程（心跳、BlockManager、Netty worker 等）
-  → 线程栈总开销可达 20-30MB，在 memoryOverhead 本身就小的时候占比不低
+  → 线程栈总开销可达 20-30MB，挤占 memoryOverhead 的预算空间
 ```
 
 > **判断口诀**：看到 "exceeding physical memory limits" → 调 memoryOverhead；看到 `OutOfMemoryError: Java heap space` → 调 executor.memory。两者不要搞反。
