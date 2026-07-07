@@ -976,28 +976,108 @@ Spark 从 2014 年的 1.0 到如今的 3.x / 4.x，核心架构保持稳定（RD
 
 AQE 是 Spark 3.0 引入的**运行时自适应优化**——在查询执行过程中，根据已经产生的真实数据统计信息（而非编译期的估算），动态调整执行计划。
 
-传统 Catalyst 优化器的问题是：它在**编译期**根据表的统计信息（行数、大小）决定执行计划，但统计信息经常不准（表没有 ANALYZE、分区被过滤后实际数据量远小于统计值）。AQE 把这个决策推迟到**运行时**——Shuffle 写完后，Spark 拿到了每个分区的真实数据量，再决定下一步怎么做。
+**CBO vs AQE：为什么需要运行时优化？**
+
+CBO（Cost-Based Optimization，基于代价的优化器）是 Catalyst 的优化器之一，它依赖预先收集的统计信息（行数、去重行数、空值率、最大最小值等）来选择最优执行计划。但 CBO 的问题在于：
+
+```
+CBO 的局限：
+
+① 统计信息过时：ANALYZE 收集的统计信息是静态快照，数据变化后不再准确
+② 过滤后估算不准：WHERE 条件过滤后实际数据量可能远小于估算值
+  例：表有 1 亿行，WHERE dt='2024-01-01' 过滤后只剩 100 万行，CBO 仍按 1 亿行估算
+③ 统计信息收集成本：对大表执行 ANALYZE 本身就是耗时操作，且需要维护成本
+
+AQE 解决思路：不在编译期决策，而是执行到某个阶段（Shuffle 后）拿到真实数据量，再优化后续计划
+  → 数据是"真"的，不是估算的
+  → 不需要提前 ANALYZE
+  → 不需要维护统计信息
+```
+
+**AQE 的核心机制：Query Stage 与执行循环**
+
+AQE 不是随时优化，而是在特定的"停顿点"——**物化点（Materialization Points）**——进行优化：
+
+```
+什么是物化点？
+
+Spark 的算子通常按流水线排列，在一个 Stage 内连续执行（不中断、不等待）。
+但 Shuffle 和 Broadcast exchange 会打断流水线：
+  → 上游 Stage 必须全部完成，产出中间结果（Shuffle 文件或广播数据）
+  → 下游 Stage 才能开始读取这些中间结果
+  → 这个"上游完成、下游未开始"的间隙，就是 AQE 的优化时机
+
+Spark 把这种被物化点分割的片段称为 Query Stage：
+
+  Query Stage 1 → 物化点（Shuffle 1） → Query Stage 2 → 物化点（Shuffle 2） → Query Stage 3
+  各 Stage 可以并行执行，但 Stage 之间有依赖关系（Stage 2 依赖 Stage 1 的 Shuffle 输出）
+  
+  AQE 在每个 Query Stage 完成后执行一次：
+    ① 标记该 Stage 在物理计划中已完成
+    ② 读取该 Stage 的真实统计数据（每个分区的行数、大小）
+    ③ 用这些数据更新逻辑计划
+    ④ 执行优化器（包括 Catalyst 的优化规则 + AQE 专属规则）
+    ⑤ 重新生成物理计划，执行下一个 Stage
+    ⑥ 重复直到所有 Stage 完成
+```
+
+> **为什么 AQE 只能在物化点优化？** 因为流水线内 Spark 是边读边写的，没有中间数据的统计数据。只有在 Shuffle 写完或 Broadcast 完成后，Spark 才知道每个分区到底有多少行、多大。所以 AQE 的优化频率取决于查询中有多少个 Shuffle/Broadcast exchange——exchange 越多，优化次数越多。
 
 AQE 包含三个核心能力：
 
 ```
 ① 自动合并小分区（Coalescing Post-Shuffle Partitions）
-   Shuffle 后如果很多分区数据量很小（比如 1MB），AQE 自动合并成更大的分区
-   → 减少 Task 数量，降低调度开销
-   SET spark.sql.adaptive.coalescePartitions.enabled=true;
+
+Shuffle 后如果很多分区数据量很小（比如 1MB），AQE 自动合并成更大的分区
+→ 减少 Task 数量，降低调度开销
+
+为什么先设大分区数再合并？
+  因为数据量在不同查询/Stage 间差异很大，很难确定最佳分区数
+  → 先设一个相对较大的初始值（如 200），保证有足够的并行度
+  → 执行后，AQE 合并相邻的小分区，让每个最终分区有合理的数据量（如 128MB）
+  → 既不浪费 Task 调度开销，也不让单个分区太大导致 OOM
+
+SET spark.sql.adaptive.coalescePartitions.enabled=true;
 
 ② 动态切换 JOIN 策略（Converting Sort-Merge Join to Broadcast Join）
-   编译期估算小表 100MB 选了 SortMergeJoin，但运行时发现过滤后只有 5MB
-   → AQE 自动切换为 BroadcastHashJoin，省掉一次 Shuffle
-   SET spark.sql.adaptive.autoBroadcastJoinThreshold=100MB;
+
+编译期估算小表 100MB 选了 SortMergeJoin，但运行时发现过滤后只有 5MB
+→ AQE 自动切换为 BroadcastHashJoin，省掉一次 Shuffle
+
+优化不仅限于切换 JOIN 类型，还包括本地 Shuffle 优化：
+  当表被广播到所有 Executor 后，JOIN 时不需要通过网络 Shuffle 数据
+  → 传统的 Shuffle Read 被优化为本地 Mapper 读取，大幅降低网络开销
+
+SET spark.sql.adaptive.autoBroadcastJoinThreshold=100MB;
 
 ③ 自动处理倾斜 JOIN（Optimizing Skew Joins）
-   Shuffle 后发现某个分区数据量远大于其他分区
-   → AQE 自动把大分区拆成多个小分区，并行处理
-   SET spark.sql.adaptive.skewJoin.enabled=true;
+
+Shuffle 后发现某个分区数据量远大于其他分区
+→ AQE 自动把大分区拆成多个子分区，并行处理
+
+拆分机制：
+  假设 Table A 和 Table B 做 JOIN，A 的 partition 0 数据量是其他分区的 10 倍
+  → AQE 将 A 的 partition 0 拆分成 2 个子分区（sub-partition）
+  → 每个子分区分别与 B 的 partition 0 做 JOIN
+  → 原来 1 个大 Task → 变成 2 个中等大小的 Task，执行时间更均衡
+  → 没有 AQE 时，整个 JOIN 的性能被那一个倾斜的 Task 拖慢
+
+SET spark.sql.adaptive.skewJoin.enabled=true;
 ```
 
 > **实际影响**：AQE 是 Spark 3.x 对 ETL 任务最大的性能提升——很多之前需要手动调 shuffle.partitions、手动加 Broadcast hint、手动处理数据倾斜的场景，开启 AQE 后 Spark 自己就能处理。Spark 3.2+ 默认开启 AQE。
+
+**AQE 的启用条件**：
+
+```
+开启方式：SET spark.sql.adaptive.enabled=true
+（Spark 3.0 默认 false，3.2+ 默认 true）
+
+需满足条件：
+  ① 非流式查询（非 Streaming 查询）
+  ② 查询包含至少一个 exchange（Shuffle、Broadcast 或子查询）
+  → 如果查询只有 filter + map + collect（无 Shuffle 无 Join），AQE 不会被触发
+```
 
 ### 5.2 Spark 3.x 其他关键改进
 
