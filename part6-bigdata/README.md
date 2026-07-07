@@ -37,7 +37,7 @@ graph LR
 
 **[6.3 Hive](./03-Hive.md)** —— 用 SQL 查大数据。Hive 的本质（SQL 翻译器 + MetaStore）、内部表 vs 外部表、分区裁剪（最重要的优化手段）、分桶、文件格式（ORC/Parquet）、SQL 差异速查、数据倾斜解决方案。*面试剖析覆盖：Hive 和数据库的区别、内外部表区别、数据倾斜排查、ORC vs Parquet 选型。*
 
-**[6.4 Spark](./04-Spark.md)** —— 内存计算引擎。RDD 核心抽象（不可变/分区/惰性/血缘容错）、Transformation vs Action、宽窄依赖与 Shuffle、Job→Stage→Task 划分、Spark SQL 与 Catalyst 优化器、性能优化要点。*面试剖析覆盖：Spark vs MapReduce、RDD 容错机制、Shuffle 原理、数据倾斜处理。*
+**[6.4 Spark](./04-Spark.md)** —— 内存计算引擎。RDD 核心抽象（不可变/分区/惰性/血缘容错）、Transformation vs Action、宽窄依赖与 Shuffle、Job→Stage→Task 划分、Spark SQL 与 Catalyst 优化器、内存模型与 YARN 资源管理。性能优化专题（数据倾斜八种修复方案、Shuffle 调优、Spark UI 分析方法）见 [Spark 性能优化](./04-Spark-性能优化.md)，作业日志体系与调试运维（日志类型、排查方法、常见故障）见 [Spark 调试运维](./04-Spark-调试运维.md)。*面试剖析覆盖：Spark vs MapReduce、RDD 容错机制、Shuffle 原理、数据倾斜处理、内存模型。*
 
 **[6.5 Flink](./05-Flink.md)** —— 实时计算引擎。流处理三大挑战（乱序/延迟/窗口）、Event Time vs Processing Time、Watermark 机制、四种窗口类型、Checkpoint + Exactly-Once 语义、Flink SQL。*面试剖析覆盖：Flink vs Spark Streaming、Checkpoint vs Savepoint、Watermark 设置、反压机制。*
 
