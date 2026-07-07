@@ -894,6 +894,39 @@ Spark 的"堆外内存"有两种，名字容易混淆，但用途完全不同：
 
 一个常见误解是"Unified Memory 不够用了，调大 memoryOverhead 就行"——这是错的。memoryOverhead 里的内存 Spark 用不了。你需要调的是 `executor.memory`（增大堆内 Unified Memory）或 `offHeap.size`（增大堆外 Unified Memory）。
 
+**那 memoryOverhead 什么场景会不够用？**
+
+memoryOverhead 不够的典型表现是 YARN kill + "exceeding physical memory limits" + "Consider boosting spark.yarn.executor.memoryOverhead"——注意这时 JVM 堆内**没有** OOM，是 Container 的物理内存总量（堆 + 堆外）超了 YARN 申请量。以下四种场景最容易触发：
+
+```
+场景 1：PySpark 任务（最常见）
+  PySpark 每个 Task 在 JVM 之外启动独立的 Python worker 进程
+  → 数据通过 Socket 在 JVM ↔ Python 之间序列化/反序列化传输
+  → Python worker 本身的内存 + 序列化缓冲区 + pandas UDF 的 Arrow 批量传输
+  → 如果 Python UDF 里用了 numpy/pandas 加载大数组，内存进一步膨胀
+  → 默认 memoryOverhead（executor.memory × 10%，最小 384MB）经常不够
+  → 生产环境 PySpark 任务建议 memoryOverhead 设 2-4G
+
+场景 2：大量 Shuffle 的任务
+  Shuffle 网络传输用 Netty，I/O 缓冲区是 DirectByteBuffer（堆外）
+  → 当 Shuffle 数据量大、并发连接多（如 1000 Reducer × 500 Mapper）
+  → Netty 的堆外缓冲区占用大量 memoryOverhead
+  → JVM 堆内没问题，但 Container 物理内存超限被 YARN kill
+
+场景 3：使用 JNI / Native 库
+  LZO/Snappy/Zstd 等 native 压缩库、TensorFlow Java binding、OpenCV 等
+  → native 代码分配的内存在 JVM 堆外，全部算在 memoryOverhead
+  → 压缩/解压大数据集时 native 库的内存开销比预期大
+
+场景 4：executor.cores 过大导致线程栈累积
+  每个 Task 是一个线程，每个线程栈默认 1MB（-XX:ThreadStackSize）
+  → executor.cores=8 时光 Task 线程栈就 8MB
+  → 加上 Spark 内部后台线程（心跳、BlockManager、Netty worker 等）
+  → 线程栈总开销可达 20-30MB，在 memoryOverhead 本身就小的时候占比不低
+```
+
+> **判断口诀**：看到 "exceeding physical memory limits" → 调 memoryOverhead；看到 `OutOfMemoryError: Java heap space` → 调 executor.memory。两者不要搞反。
+
 </details>
 
 <details>
