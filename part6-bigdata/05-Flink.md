@@ -281,15 +281,22 @@ orders
 会话窗口的隔离靠 key（如 `user_id`），切分和触发靠事件时间 + Watermark。`GROUP BY user_id, SESSION(visit_time, INTERVAL '30' MINUTE)` 的含义是：先按 `user_id` 分组（每个用户独立维护自己的会话），然后在每个用户的数据流内，按 `visit_time` 判断两条相邻数据之间的间隔是否超过 30 分钟来切分会话。
 
 ```mermaid
-flowchart LR
-    A1["10:00 访问"] --> A2["10:05 访问<br/>间隔 5min < 30min"]
-    A2 --> A3["10:20 访问<br/>间隔 15min < 30min"]
-    A3 --> A4["10:45 访问<br/>间隔 25min < 30min"]
-    A4 --> A5["11:15 会话 1 关闭<br/>10:45 后 30min 无新数据"]
-    A5 --> B["空闲 45min > 30min<br/>因此拆分新会话"]
-    B --> C1["11:30 访问<br/>会话 2 开始"]
-    C1 --> C2["11:35 访问<br/>间隔 5min < 30min"]
-    C2 --> C3["12:05 会话 2 关闭<br/>11:35 后 30min 无新数据"]
+flowchart TB
+    subgraph S1["会话 1"]
+        direction LR
+        A1["10:00 访问"] --> A2["10:05 访问<br/>间隔 5min"]
+        A2 --> A3["10:20 访问<br/>间隔 15min"]
+        A3 --> A4["10:45 访问<br/>间隔 25min"]
+    end
+    A5["11:15 会话关闭<br/>10:45 + 30min 无新数据"]
+    B["空闲 45min > 30min<br/>拆分为新会话"]
+    subgraph S2["会话 2"]
+        direction LR
+        C1["11:30 访问"] --> C2["11:35 访问<br/>间隔 5min"]
+    end
+    C3["12:05 会话关闭<br/>11:35 + 30min 无新数据"]
+
+    S1 --> A5 --> B --> S2 --> C3
 ```
 
 **触发机制**：不是固定时间触发，而是靠 Watermark 推进。当 Watermark 推进到"会话最后一条数据的时间 + gap（30 分钟）"时，Flink 认为这个会话不会再有新数据了，触发计算。
