@@ -131,6 +131,118 @@ ORC / Parquet 的内部结构自带多级过滤，效果已经覆盖了传统索
 
 > **总结**：分区裁剪是第一道过滤（目录级），列式存储的内置统计信息是第二道过滤（行组级），列裁剪是第三道过滤（列级）。三道过滤加起来，已经把传统索引能做的事情覆盖了，而且不需要额外的写入和维护成本。
 
+### 2.6 四种排序关键字——ORDER BY / SORT BY / DISTRIBUTE BY / CLUSTER BY
+
+这是 Hive 面试的高频考点。Hive 有四种排序关键字，后端开发者通常只熟悉 ORDER BY，但大数据场景下 ORDER BY 往往是最不该用的那个。
+
+**核心区别一句话**：ORDER BY 是全局排序（只有一个 Reducer），SORT BY 是分区内排序（多个 Reducer 各排各的），DISTRIBUTE BY 控制数据怎么分区（哪个 key 到哪个 Reducer），CLUSTER BY 是 DISTRIBUTE BY + SORT BY 的简写（字段相同时用）。
+
+| 关键字 | 作用范围 | Reducer 数量 | 能否指定 ASC/DESC | 典型场景 |
+|--------|---------|-------------|------------------|---------|
+| **ORDER BY** | 全局排序 | **只能 1 个** | 可以 | 数据量小、确实需要全局有序 |
+| **SORT BY** | 每个 Reducer 内部排序 | 多个 | 可以 | 大数据集、不需要全局有序 |
+| **DISTRIBUTE BY** | 控制分区规则（不排序） | 多个 | 不适用 | 搭配 SORT BY 使用 |
+| **CLUSTER BY** | 分区 + 排序（同字段） | 多个 | **只能 ASC** | DISTRIBUTE BY 和 SORT BY 字段相同时简写 |
+
+#### ORDER BY——全局排序
+
+ORDER By 对最终结果集做全局排序，底层**只会有一个 Reducer** 参与排序——即使你 `set mapreduce.job.reduces=10`，也不会生效。数据量大时单个 Reducer 会 OOM 或超时。
+
+```sql
+-- 全局按薪资降序，所有数据进一个 Reducer
+SELECT user_id, user_name, sallary
+FROM user_info
+ORDER BY sallary DESC;
+```
+
+**严格模式**：Hive 可以设置 `hive.mapred.mode=strict`，此模式下 ORDER BY 必须跟 `LIMIT` 子句，否则直接报错。这是为了防止误用 ORDER BY 把大数据集塞进单个 Reducer。
+
+```sql
+-- 严格模式下必须加 LIMIT
+SET hive.mapred.mode=strict;
+
+SELECT user_id, user_name, sallary
+FROM user_info
+ORDER BY sallary DESC
+LIMIT 100;  -- 严格模式下不加 LIMIT 会报错
+```
+
+> **生产建议**：生产环境几乎不用 ORDER BY。如果只需要 Top N，用 `ORDER BY ... LIMIT N`（严格模式下强制要求）；如果不需要全局有序，用 SORT BY + DISTRIBUTE BY。
+
+#### SORT BY——分区内排序
+
+SORT BY 在每个 Reducer 内部排序，每个 Reducer 的输出是有序的，但全局结果集不一定有序。Reducer 数量由 `mapreduce.job.reduces` 控制。
+
+```sql
+SET mapreduce.job.reduces=2;
+
+-- 每个 Reducer 内部按 dept_no 降序，但两个 Reducer 的结果合并后全局无序
+SELECT user_id, user_name, dept_no, sallary
+FROM user_info
+SORT BY dept_no DESC;
+```
+
+> **单独使用 SORT BY 的分区规则**：不指定 DISTRIBUTE BY 时，数据按内部默认算法分配到各 Reducer（非按某字段 hash），无法控制哪个 key 到哪个 Reducer。如果需要控制分区，必须搭配 DISTRIBUTE BY。
+
+#### DISTRIBUTE BY——控制分区规则
+
+DISTRIBUTE BY 指定按哪个字段做 hash 分区，类似 MapReduce 中的自定义 Partitioner。它本身不排序，通常搭配 SORT BY 使用——先 DISTRIBUTE BY 指定分区，再 SORT BY 在分区内排序。
+
+```sql
+SET mapreduce.job.reduces=4;
+
+-- 按 dept_no 分区（同部门数据进同一 Reducer），分区内按 sallary 降序
+SELECT user_id, user_name, dept_no, sallary
+FROM user_info
+DISTRIBUTE BY dept_no
+SORT BY sallary DESC;
+```
+
+底层分区算法是 HashPartitioner：`(key.hashCode() & Integer.MAX_VALUE) % numReduceTasks`。例如 dept_no=1、4 个 Reducer：1 % 4 = 1，部门 1 的数据进入 1 号 Reducer。
+
+> **DISTRIBUTE BY 与 Spark 的关系**：Spark SQL 也支持 DISTRIBUTE BY，语义一致——控制数据分发到哪个分区/Task。在 Spark 中常用于控制输出文件数量（避免小文件）和解决动态分区写入 OOM 问题。详见 [Spark 性能优化 — 小文件问题](./04-Spark-性能优化.md#小文件问题)。
+
+#### CLUSTER BY——DISTRIBUTE BY + SORT BY 的简写
+
+当 DISTRIBUTE BY 和 SORT BY 的字段相同时，可以用 CLUSTER BY 简化：
+
+```sql
+-- 以下两句等价：
+SELECT * FROM user_info DISTRIBUTE BY dept_no SORT BY dept_no;
+SELECT * FROM user_info CLUSTER BY dept_no;
+```
+
+限制：CLUSTER BY 只能升序排序，不能指定 ASC/DESC。所以实际开发中用得不多——大多数场景排序字段和分区字段不同，或者需要指定降序。
+
+#### 四种关键字的对比图
+
+```
+ORDER BY（全局排序，1 个 Reducer）：
+  全部数据 → Reducer 0 → 全局有序输出
+  数据量大时 OOM
+
+SORT BY（分区内排序，N 个 Reducer）：
+  数据 → Reducer 0 → 内部有序
+      → Reducer 1 → 内部有序
+      → Reducer 2 → 内部有序
+  全局无序，但每个输出文件内部有序
+
+DISTRIBUTE BY + SORT BY（指定分区 + 分区内排序）：
+  按 dept_no 分区 → Reducer 0（dept 4）→ 按 sallary 排序
+                  → Reducer 1（dept 1）→ 按 sallary 排序
+                  → Reducer 2（dept 2）→ 按 sallary 排序
+                  → Reducer 3（dept 3）→ 按 sallary 排序
+  同部门数据在同一文件，文件内按薪资排序
+
+CLUSTER BY（分区字段 = 排序字段，只能 ASC）：
+  按 dept_no 分区 → Reducer 0 → 按 dept_no 升序
+                  → Reducer 1 → 按 dept_no 升序
+                  → Reducer 2 → 按 dept_no 升序
+  等价于 DISTRIBUTE BY dept_no SORT BY dept_no
+```
+
+> **面试速答**：ORDER BY 全局排序只有一个 Reducer（大数据量会 OOM），SORT BY 每个 Reducer 内部排序但全局无序，DISTRIBUTE BY 控制 hash 分区规则（搭配 SORT BY 使用），CLUSTER BY 是 DISTRIBUTE BY + SORT BY 字段相同时的简写（只能升序）。
+
 ---
 
 ## 三、SQL 差异速查——后端开发者最容易踩的坑

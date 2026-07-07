@@ -197,6 +197,76 @@ Executor 6: 读磁盘文件 → 反序列化 → [继续处理]
 
 宽依赖触发 Shuffle，也触发 Stage 的划分。
 
+### 2.4 共享变量——广播变量与累加器
+
+Spark 的算子代码（如 `rdd.filter(...)` 中的 lambda）会被 Driver 序列化后发送到每个 Executor。同样，算子中引用的外部变量也会被复制到每个 Task——如果一个变量 100MB、有 200 个 Task，就会复制 200 份共 20GB 网络传输。广播变量和累加器就是解决这个问题的两种共享变量。
+
+#### 广播变量（Broadcast）
+
+**问题**：Driver 上有一个大 List（如维表数据、配置字典），每个 Task 都需要用到它。如果不做处理，每个 Task 会拷贝一份，导致网络带宽和内存浪费。
+
+**解决**：广播变量让每个 Executor 只持有一份副本，该 Executor 上的所有 Task 共享这一份。
+
+```
+不用广播变量：
+  Driver 有 list（100MB）
+    → Task 1 拷贝一份（100MB）→ Executor 1
+    → Task 2 拷贝一份（100MB）→ Executor 1（同一个 Executor，重复了！）
+    → Task 3 拷贝一份（100MB）→ Executor 2
+    → Task 4 拷贝一份（100MB）→ Executor 2（又重复了！）
+    → 200 个 Task = 200 份 = 20GB 网络传输
+
+使用广播变量：
+  Driver 有 list（100MB）
+    → broadcast(list) → Executor 1 拉取一份（100MB），所有 Task 共享
+    → broadcast(list) → Executor 2 拉取一份（100MB），所有 Task 共享
+    → 10 个 Executor = 10 份 = 1GB 网络传输（减少 95%）
+```
+
+使用方式：
+
+```scala
+// Driver 端定义广播变量
+val broadcastVal = sc.broadcast(List("hello", "world"))
+
+// Executor 端读取（所有 Task 共享同一份）
+rdd.filter(x => broadcastVal.value.contains(x)).foreach(println)
+
+// 注意：广播变量只能在 Driver 端定义和修改，Executor 端只能读取
+```
+
+注意事项：不能广播 RDD（RDD 不存储数据，只是数据的抽象）；广播变量在 Driver 端定义后不可修改（只读）。
+
+> **广播变量 vs Broadcast Join**：Spark SQL 的 Broadcast Join 底层就是用了广播变量——把小表 broadcast 到所有 Executor，然后大表在本地做 Hash Join，避免 Shuffle。区别是 Broadcast Join 是 Spark 自动做的，而广播变量是开发者手动使用的。
+
+#### 累加器（Accumulator）
+
+**问题**：分布式计算中，每个 Task 跑在独立的 Executor 上，普通的计数器变量无法跨 Executor 共享——Task 1 把 `counter` 加 1，Task 2 看不到这个修改。
+
+**解决**：累加器提供了一个跨 Executor 的全局计数器——在 Driver 端定义初始值，Executor 端只能 `add`，最终在 Driver 端读取汇总值。
+
+```scala
+// Driver 端定义累加器
+val accumulator = sc.longAccumulator("error_count")
+
+// Executor 端累加（每个 Task 调用 add）
+rdd.foreach { x =>
+  if (isError(x)) {
+    accumulator.add(1)  // 只能 add，不能读取
+  }
+}
+
+// Driver 端读取最终值
+println(accumulator.value)  // 输出全局错误总数
+```
+
+> **累加器的坑**：累加器在 Transformation 算子（如 `filter`、`map`）中使用时，如果对应的 RDD 被重复计算（如没有 cache 导致重新执行），累加器会被重复累加——这是一个经典的陷阱。正确做法是在 Action 算子中使用累加器，或者先 `cache()` RDD 再使用累加器。
+
+| 共享变量 | 解决的问题 | Driver 端 | Executor 端 | 典型场景 |
+|---------|-----------|-----------|-------------|---------|
+| **广播变量** | 大变量重复拷贝 | 定义 + 修改 | 只读 | 维表数据下发、配置字典 |
+| **累加器** | 跨 Executor 全局计数 | 定义 + 读取 | 只能 add | 错误计数、有效记录统计 |
+
 ---
 
 ## 三、执行架构
@@ -468,7 +538,130 @@ OS 层：         1 个 JVM 进程，4 个工作线程，受 cgroup 约束
 
 > **一个 slot 对应一个物理核吗？** 不对应。slot 是逻辑概念，对应 vcore（虚拟核），vcore 和物理核没有绑定关系。一台 32 物理核的机器，YARN 可以配 40 个 vcore（超分）或 16 个 vcore（欠分）。Task 线程跑在哪个物理核上由操作系统调度器决定，Spark 和 YARN 都不关心。
 
-### 3.3 YARN 资源管理架构——Spark 运行的底层基础设施
+#### DAGScheduler 的 Stage 划分算法
+
+上面讲了 Job/Stage/Task 是什么，这里讲 **Stage 是怎么划分出来的**——这是 DAGScheduler 的核心工作。
+
+```
+代码示例：
+  rdd.map(...).filter(...).reduceByKey(...).filter(...).collect()
+       ↑窄依赖    ↑窄依赖    ↑宽依赖(Shuffle)  ↑窄依赖    ↑Action
+
+DAGScheduler 的划分过程（从后往前遍历）：
+
+  ① 从 Action 算子 collect() 开始，为最终 RDD 创建 finalStage（Stage 1）
+     → 此时 Stage 1 = [filter → collect]
+
+  ② 继续往前遍历，遇到 filter → 窄依赖，加入当前 Stage
+     → Stage 1 = [filter → filter → collect]
+
+  ③ 继续往前遍历，遇到 reduceByKey → 宽依赖！
+     → 在此处切刀，reduceByKey 之前的 RDD 归入新的 Stage 0
+     → Stage 0 = [map → filter → reduceByKey]
+     → Stage 1 依赖 Stage 0（Stage 0 完成后 Stage 1 才能开始）
+
+  ④ 继续往前遍历，遇到 filter → 窄依赖，加入 Stage 0
+     → Stage 0 = [map → filter → filter → reduceByKey]
+
+  ⑤ 继续往前遍历，遇到 map → 窄依赖，加入 Stage 0
+     → Stage 0 = [map → filter → filter → reduceByKey]
+
+  ⑥ 遍历完毕，划分结束
+     → 最终：Stage 0 → Stage 1
+```
+
+算法的核心规则：
+
+```
+DAGScheduler Stage 划分算法：
+
+1. 从 Action 算子开始，从后往前遍历 DAG
+2. 为最后一个 RDD 创建 finalStage
+3. 遍历过程中：
+   - 遇到窄依赖 → 加入当前 Stage，继续往前
+   - 遇到宽依赖 → 在此处切刀，创建新 Stage
+     （该 RDD 成为新 Stage 的最后一个 RDD）
+4. 重复直到遍历完整个 DAG
+```
+
+> **为什么从后往前遍历？** 因为 Spark 是惰性执行——代码从前往后写，但执行计划从 Action 开始往前推。从后往前遍历可以自然地确定 Stage 之间的依赖关系（后面的 Stage 依赖前面的 Stage）。
+
+DAGScheduler 还负责两件事：一是追踪每个 RDD 和 Stage 的物化情况（是否已缓存/Checkpoint），如果某个 RDD 已经缓存，划分 Stage 时会跳过它的上游计算；二是处理 Shuffle 数据丢失的情况，重新提交对应的 Stage。这两点在面试中提到可以加分。
+
+### 3.3 TaskScheduler 与本地化调度
+
+DAGScheduler 把 Stage 拆成 TaskSet 后，就交给 TaskScheduler 了。TaskScheduler 负责把 Task 发到哪个 Executor 上执行——这里面的核心是**数据本地化（Data Locality）**。
+
+#### TaskScheduler 的工作流程
+
+```
+TaskScheduler 的职责链：
+
+DAGScheduler → 提交 TaskSet → TaskScheduler
+                                  ↓
+                          ① 向 Cluster Manager 注册 Application
+                                  ↓
+                          ② 创建 TaskSetPool 调度池（FIFO / FAIR）
+                                  ↓
+                          ③ 为每个 Task 选择最优 Executor（本地化调度）
+                                  ↓
+                          ④ 序列化 Task，通过 RPC 发送到 Executor
+                                  ↓
+                          ⑤ 监控 Task 执行状态（成功/失败/重试）
+```
+
+#### Task 分配算法
+
+TaskScheduler 决定"哪个 Task 发给哪个 Executor"时，核心原则是**移动计算而非移动数据**——尽量把 Task 分配到数据所在的节点上，避免网络传输。
+
+```
+Task 分配算法：
+
+1. 获取所有已注册的 Executor 列表（含 IP、Port 信息）
+2. 将 Executor 列表打乱（避免热点集中）
+3. 对每个 Task，依次尝试不同的本地化级别：
+   PROCESS_LOCAL → NODE_LOCAL → NO_PREF → RACK_LOCAL → ANY
+   （从最优先到最不优先，逐级降级）
+4. 找到满足当前本地化级别的 Executor → 分配 Task
+5. 序列化 Task 分配结果，通过 RPC 发送给 Executor
+```
+
+#### 五个本地化级别
+
+| 级别 | 含义 | 性能 | 示例 |
+|------|------|------|------|
+| **PROCESS_LOCAL** | Task 和数据在**同一个 Executor 进程**中 | 最快（无传输） | RDD 分区缓存在 Executor 1，Task 也发到 Executor 1 |
+| **NODE_LOCAL** | Task 和数据在**同一个节点**的不同进程 | 快（跨进程，不跨机器） | 数据在 Executor 1，Task 发到同机器的 Executor 2 |
+| **NO_PREF** | **无位置偏好** | 中等 | 从 JDBC/MySQL 读取的数据，在哪个节点都一样 |
+| **RACK_LOCAL** | Task 和数据在**同一机架**的不同节点 | 慢（跨机器，不跨机架） | 数据在节点 A，Task 发到同机架的节点 B |
+| **ANY** | 数据在**不同机架** | 最慢（跨机架网络） | 数据在机架 1，Task 发到机架 2 |
+
+> **类比**：你在公司找同事 review 代码——PROCESS_LOCAL 是同工位的同事（转身就能说），NODE_LOCAL 是同楼层的同事（走两步），RACK_LOCAL 是同栋楼不同楼层（坐个电梯），ANY 是不同园区的同事（得发邮件等回复）。
+
+#### 本地化降级机制
+
+TaskScheduler 不会无限等待最高本地化级别。它会先尝试最高级别（PROCESS_LOCAL），如果在等待时间内没有对应的 Executor 空闲，就降级到下一级别：
+
+```
+降级流程：
+  尝试 PROCESS_LOCAL → 等待 spark.locality.wait（默认 3s）
+    → 超时，降级到 NODE_LOCAL → 等待 spark.locality.wait
+      → 超时，降级到 RACK_LOCAL → 等待 spark.locality.wait
+        → 超时，降级到 ANY → 直接分配（不再等待）
+```
+
+本地化调优参数：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `spark.locality.wait` | 3s | 全局本地化等待时长，降级前的等待时间 |
+| `spark.locality.wait.process` | 3s | PROCESS_LOCAL 降级等待时长（覆盖全局） |
+| `spark.locality.wait.node` | 3s | NODE_LOCAL 降级等待时长 |
+| `spark.locality.wait.rack` | 3s | RACK_LOCAL 降级等待时长 |
+
+> **调优思路**：如果 Spark UI 上看到大量 Task 的 Locality Level 是 ANY 或 RACK_LOCAL，说明数据本地化不好——可能是数据倾斜导致某些节点数据过多，或者 Executor 数量不足。适当加大 `spark.locality.wait` 可以让 TaskScheduler 多等一会儿，但不宜过大（默认 3s 已经够用），因为等待期间 Executor 是空闲的。更好的做法是增加分区数、调整 Executor 数量，让数据分布更均匀。
+
+### 3.4 YARN 资源管理架构——Spark 运行的底层基础设施
 
 上面多次提到 YARN 的 Container、ResourceManager 等概念，这里把 YARN 的完整架构说清楚。理解 YARN 是排查 Spark 作业资源问题和日志问题的前提。
 
@@ -723,6 +916,55 @@ spark.sql("""
 ```
 
 **Catalyst 优化器**：Spark SQL 的查询会经过 Catalyst 优化器（逻辑优化 → 物理优化），类似 MySQL 的查询优化器。它能在**部分场景下**自动做谓词下推、列裁剪、Join 策略选择等优化——但"自动"不等于"万能"。Catalyst 在 INNER JOIN 下表现良好（过滤条件写在 WHERE 还是 ON 里效果一样），但在**外连接（LEFT/RIGHT JOIN）场景下存在明显局限**：右表的过滤条件写在 WHERE 中不会被下推（因为下推会把 LEFT JOIN 变成 INNER JOIN，改变语义）。此外，分区字段被函数包裹、隐式类型转换、视图遮挡底层分区字段等情况，Catalyst 也无法自动处理。这些需要开发者手动优化的场景，详见 [性能优化专题 — 分区裁剪失效六大场景](./04-Spark-性能优化.md#61-减少数据量)。
+
+### 4.2 Spark SQL 的执行流程
+
+上面提到 Catalyst 优化器，这里把 Spark SQL 从 SQL 语句到 RDD 执行的**完整链路**说清楚。这条链路和 Hive SQL 的执行过程类似（都是 SQL → 逻辑计划 → 物理计划 → 执行），区别在于底层引擎是 Spark 而非 MapReduce。
+
+```
+SQL 语句
+  │
+  ▼
+① SqlParser（解析器）
+  │  词法分析 + 语法分析，生成 Unresolved Logical Plan（未解析的逻辑计划）
+  │  此时只知道"从某个表选某些列"，但不知道表在哪、列类型是什么
+  │  类比：你写了个 SQL，语法检查过了，但表名/列名是否真实存在还没验证
+  │
+  ▼
+② Analyzer（分析器）
+  │  查询 Catalog（元数据），绑定真实的表名、列名、数据类型
+  │  生成 Resolved Logical Plan（已解析的逻辑计划）
+  │  此时知道数据在 HDFS 的哪个路径、每列的类型是什么
+  │  类比：编译器的语义分析阶段，检查变量是否存在、类型是否匹配
+  │
+  ▼
+③ Optimizer（优化器）—— Catalyst 的核心
+  │  对逻辑计划做等价变换，生成 Optimized Logical Plan（优化后的逻辑计划）
+  │  常见优化规则：
+  │  - 谓词下推（Predicate Pushdown）：把 WHERE 条件推到数据源端
+  │  - 列裁剪（Column Pruning）：只读取用到的列，跳过不需要的列
+  │  - 常量替换（Constant Folding）：1+1 直接算成 2
+  │  - Join 重排：多表 JOIN 时选择最优的 JOIN 顺序
+  │  类比：编译器的优化阶段，做常量折叠、死代码消除等
+  │
+  ▼
+④ Planner（计划器）
+  │  将逻辑计划转化为物理计划（Physical Plan）
+  │  生成多个候选物理计划，通过代价模型选择最优的一个
+  │  关键决策：Join 用 BroadcastHashJoin 还是 SortMergeJoin？
+  │           聚合用 HashAggregate 还是 SortAggregate？
+  │  类比：编译器选择用哪种指令实现同一个操作
+  │
+  ▼
+⑤ Execution（执行）
+  │  物理计划转化为 RDD 的 Transformation 和 Action
+  │  交给 Spark Core 的 DAGScheduler → TaskScheduler → Executor 执行
+  │  最终就是前面讲的 Job → Stage → Task 流程
+```
+
+> **一条 SQL 变成了什么 RDD 操作**：`SELECT name FROM users WHERE age > 18` 经过上述流程后，最终变成 `rdd.filter(row => row.age > 18).map(row => row.name)`——Catalyst 帮你把 SQL 翻译成了 RDD 算子链。这也是为什么 DataFrame 比 RDD 快：Catalyst 知道整个查询的意图，可以做全局优化（比如把 filter 和 map 融合到一个 Task 里），而手写 RDD 时每个算子是独立的，Spark 不知道你的整体意图。
+
+> **Catalyst 的局限与 AQE 的关系**：上面流程中 ③ 和 ④ 都是在**编译期**做的，依赖表的统计信息（行数、大小）。但统计信息可能不准——比如过滤条件 `WHERE dt='2024-01-01'` 过滤掉了 99% 的数据，编译期不知道。Spark 3.0 引入的 AQE 就是在 ④ 之后、⑤ 之前插入了一个**运行时重新优化**的步骤——Shuffle 写完后拿到真实数据量，重新决定 JOIN 策略和分区数。
 
 ---
 

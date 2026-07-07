@@ -1012,6 +1012,34 @@ spark-submit \
 
 #### 内存模型与 memory.fraction
 
+Spark Executor 的 JVM 堆内存管理经历了两代演进：
+
+**第一代：静态内存管理（StaticMemoryManager，Spark 1.5 及以前）**
+
+静态管理将堆内存按固定比例分配给 Storage 和 Execution，两者**互不借用**：
+
+```
+静态内存管理（已废弃）：
+
+  Heap × 20%    → Other/Reserved（系统预留）
+  Heap × 60%    → Storage Memory（缓存 RDD）   ← spark.storage.memoryFraction = 0.6
+  Heap × 20%    → Execution Memory（Shuffle/JOIN） ← spark.shuffle.memoryFraction = 0.2
+
+  问题：Storage 和 Execution 之间有硬边界，不能跨界借用
+  → 某些任务 Shuffle 重但不用缓存 → Execution 不够用，Storage 空着浪费
+  → 某些任务疯狂 cache 但不 Shuffle → Storage 不够用，Execution 空着浪费
+```
+
+![静态内存管理模型（已废弃）——Storage/Execution 硬隔离，不可借用](assets/spark-memory-static.png)
+
+> **注意**：上图是旧版静态内存管理的结构。其中 `spark.storage.memoryFraction=0.6`、`spark.shuffle.memoryFraction=0.2` 等参数是 Spark 1.5 及以前静态管理的参数，Spark 1.6+ 已废弃。统一内存管理后，用 `spark.memory.fraction` 和 `spark.memory.storageFraction` 替代，但底层逻辑更灵活。
+
+**第二代：统一内存管理（UnifiedMemoryManager，Spark 1.6+，默认）**
+
+统一管理把 Storage 和 Execution 放进同一个池子，可以动态借用——这就是下面要讲的四层模型。Spark 1.6+ 默认使用统一管理，静态管理的代码在 Spark 3.0 已被移除。
+
+> **为什么统一管理更好？** 因为实际任务中 Storage 和 Execution 的需求是动态变化的——ETL 任务几乎不用缓存（Storage 空闲），而迭代式机器学习任务疯狂缓存（Execution 空闲）。统一管理让两者共享空间，谁需要谁用，避免"一半撑死一半饿死"。代价是 Storage 的缓存可能被 Execution 驱逐（但缓存可以从磁盘重建，而计算中间数据不能丢，所以这个优先级设计是合理的）。
+
 Spark Executor 的 JVM 堆内存从下到上分为四个层次（Unified Memory Management，Spark 1.6+）：
 
 ```
@@ -1047,12 +1075,44 @@ Spark Executor 的 JVM 堆内存从下到上分为四个层次（Unified Memory 
 └─────────────────────────────────────────────────────────┘
 ```
 
-**关键参数**：
+**关键参数——与内存模型的逐层对应关系**：
 
-| 参数 | 默认值 | 控制什么 |
-|------|--------|---------|
-| `spark.memory.fraction` | 0.6（Spark 2.0+） | 统一内存占可用内存（Heap - 300MB）的比例 |
-| `spark.memory.storageFraction` | 0.5 | 统一内存中 Storage 的初始比例（其余给 Execution） |
+```
+模型结构（从上到下）与参数的对应：
+
+┌─────────────────────────────────────────────────────────┐
+│  Executor JVM Heap（spark.executor.memory）              │
+│                                                          │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Unified Memory                                    │   │
+│  │  ┌────────────────────┐  ┌────────────────────┐  │   │
+│  │  │  Storage Memory    │  │  Execution Memory  │  │   │
+│  │  │  ← storageFraction │  │  ← 1-storageFraction│  │   │
+│  │  └────────────────────┘  └────────────────────┘  │   │
+│  │           ↑                                        │   │
+│  │    spark.memory.fraction 控制这一整块的大小         │   │
+│  └──────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  User Memory  ← 1 - spark.memory.fraction         │   │
+│  └──────────────────────────────────────────────────┘   │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │  Reserved Memory（固定 300MB，不可配置）            │   │
+│  └──────────────────────────────────────────────────┘   │
+├─────────────────────────────────────────────────────────┤
+│  堆外内存（spark.executor.memoryOverhead + offHeap.size）│
+└─────────────────────────────────────────────────────────┘
+```
+
+| 参数 | 默认值 | 对应模型哪一层 | 公式 | 调大/调小的影响 |
+|------|--------|--------------|------|----------------|
+| `spark.executor.memory` | — | 整个 JVM 堆 | 即 `-Xmx` | 调大增加总内存，但受 YARN Container 上限制约 |
+| `spark.memory.fraction` | 0.6 (Spark 2.0+) | Unified Memory 占可用堆的比例 | `(Heap - 300MB) × fraction` | 调大→ Execution/Storage 增多，User Memory 减少（UDF 可能 OOM） |
+| `spark.memory.storageFraction` | 0.5 | Unified Memory 中 Storage 的**初始**保留比例 | `Unified × storageFraction` | 调大→ Storage 初始保留更多，Execution 可借用空间减少 |
+| `spark.executor.memoryOverhead` | memory × 0.1 | 堆外内存（JNI/网络/Python UDF） | 独立于堆 | 调大避免堆外 OOM 被 YARN kill，但不参与统一管理 |
+| `spark.memory.offHeap.enabled` | false | 是否启用堆外统一内存 | — | 启用后堆外也有 Storage/Execution 分区，与堆内互不影响 |
+| `spark.memory.offHeap.size` | 0 | 堆外统一内存总量 | 需启用 offHeap | 堆外 Execution 内存不受 GC 影响，适合大 Shuffle 场景 |
+
+> **参数与模型的对应关系速记**：`executor.memory` 决定整个蛋糕大小 → 减去 300MB Reserved → 乘以 `memory.fraction` 得到 Unified Memory（Execution + Storage 共享池）→ 再乘以 `storageFraction` 得到 Storage 的初始保留量 → 剩余给 Execution。User Memory 是 `1 - memory.fraction` 那部分，Spark 不管，由用户代码自由使用。
 
 > **公司平台默认值问题**：很多公司大数据平台将 `memory.fraction` 默认值设为 **0.3**（最初为兼容 Hive UDF），这意味着 8G 的 Executor 只有 2.4G 用于 Shuffle/JOIN/聚合——严重偏低。如果你的任务不使用自定义 UDF，建议调整到 **0.6**，执行内存翻倍，Spill 大幅减少。
 
@@ -1075,6 +1135,13 @@ Storage 和 Execution 共享统一内存池，但有一个**优先级差异**：
 ③ 两者都不足时 → 触发 Spill 到磁盘
 ```
 
+![统一内存管理的动态借用机制——三种场景](assets/spark-memory-dynamic-borrow.png)
+
+> **图说明**：从左到右三阶段。
+> ① 双方空间都被占满后，新增内容双方都需要存储到硬盘（Spill to disk）。
+> ② Storage 不足时借用 Execution 空闲内存，后续 Execution 可强制驱逐（Eviction）。
+> ③ Execution 占用 Storage 内存不可被淘汰（No Eviction），Storage 只能等待 Execution 释放。
+
 > **关键区别**：Execution 内存有**优先权**。当 Execution 需要内存时，可以强制回收 Storage 借用的部分（驱逐缓存数据到磁盘）。反之，Storage 不能强制回收 Execution 的内存——只能等待 Execution 主动释放。这是合理的：计算中的中间数据不能丢，但缓存的数据可以从磁盘重新读取。
 
 **完整公式（以 8GB Executor 为例）**：
@@ -1091,7 +1158,76 @@ Heap = 8GB = 8192MB
   堆外内存 = memoryOverhead（默认 8GB × 0.1 = 819MB，最小 384MB）
 ```
 
-> **Task 内存分配**：`spark.executor.cores = N` 时，每个 Task 能申请到的内存为 `1/2N ~ 1/N`。例如 N=4、内存 8GB → 每个 Task 1GB ~ 2GB。如果某个 Task 需要更多内存，可以申请 Execution 内存池中未使用的部分（包括向 Storage 借的部分）。
+> **Task 内存分配与调度机制**：`spark.executor.cores = N` 时，每个 Task 能申请到的内存为 `1/2N ~ 1/N`。例如 N=4、Execution Memory 为 4735MB → 每个 Task 初始可申请 4735/8 ≈ 592MB，最大可扩展到 4735/4 ≈ 1184MB。
+
+**Task 内存的挂起与唤醒**：
+
+Executor 中每个 Task 以线程方式运行，共享 Execution Memory。Spark 用 `memoryForTask`（HashMap）跟踪每个 Task 的内存使用量。当多个 Task 竞争内存时：
+
+```
+Task 内存调度规则（n = 当前活跃 Task 数）：
+
+① 每个 Task 的内存下限 = Execution Memory × 1/2n
+   → 当剩余内存 < 1/2n 时，新 Task 被挂起（等待内存释放）
+
+② 每个 Task 的内存上限 = Execution Memory × 1/n
+   → Task 可以在 [1/2n, 1/n] 区间内申请内存
+
+③ Task 挂起后，当其他 Task 完成释放内存，剩余内存 ≥ 1/2n 时被唤醒
+
+④ 如果 Task 申请内存失败（无空闲且无法驱逐 Storage）→ 抛出 OutOfMemoryError
+
+举例（Execution Memory = 4000MB，4 个 Task）：
+  每个 Task 区间 = [500MB, 1000MB]
+  Task 1 启动 → 占用 500MB（下限）→ 可扩展到 1000MB
+  Task 2 启动 → 占用 500MB
+  Task 3 启动 → 占用 500MB
+  Task 4 启动 → 占用 500MB（此时 4 × 500 = 2000MB 已用，剩余 2000MB）
+  Task 1 需要更多内存 → 扩展到 1000MB（从剩余 2000MB 中拿 500MB）
+  Task 2 需要更多内存 → 扩展到 1000MB
+  此时剩余 0MB，Task 3 和 4 无法扩展 → 如果强制申请 → OutOfMemoryError 或 Spill
+```
+
+> **为什么是 1/2n ~ 1/n 而不是均分 1/n？** 因为 Spark 允许 Task 动态扩展内存——先到的 Task 可以用到 1/n（上限），后到的 Task 保底有 1/2n（下限）。这比严格均分更灵活：短 Task 快速完成释放内存，长 Task 可以借用其份额。代价是先到的 Task 可能"占便宜"用更多内存，后到的 Task 内存偏少——这就是为什么同一个 Stage 中有时个别 Task OOM 而其他 Task 正常。
+
+**堆外内存作为 Task 的稳定缓冲区**：
+
+```
+没有启用堆外统一内存时（默认）：
+  Task 内存范围 = [Execution/2n, Execution/n]
+  → 完全依赖堆内 Execution Memory，Task 间竞争激烈
+  → 某个 Task 用多了，其他 Task 可能不够用
+
+启用堆外统一内存后（spark.memory.offHeap.enabled=true）：
+  堆内 Execution = (Heap - 300MB) × fraction × (1 - storageFraction)
+  堆外 Execution = spark.memory.offHeap.size × (1 - storageFraction)
+  Task 可用总量 = 堆内 + 堆外
+
+  → 堆外内存不受 GC 影响，不会被 GC 停顿打断
+  → 堆外内存作为"共享缓冲区"，降低 Task 因内存不足被挂起/失败的概率
+  → 但堆外内存使用的是操作系统的物理内存，需要确保机器有足够剩余
+```
+
+![堆外内存的 Storage/Execution 动态借用——与堆内统一管理一致](assets/spark-memory-offheap.png)
+
+> **图说明**：堆外内存同样划分为 Storage（50%）和 Execution（50%），虚线表示动态占用机制。启用 `spark.memory.offHeap.enabled=true` 后，堆外也参与统一内存管理，与堆内互不影响。
+
+**Unroll 内存——缓存展开的预分配机制**：
+
+当 Spark 把 RDD 分区缓存到内存（Storage Memory）时，数据需要从序列化的紧凑格式"展开"（Unroll）成 Java 对象。展开过程需要临时内存：
+
+```
+Unroll 过程：
+  ① 先遍历整个分区的数据，计算展开后需要多少内存
+  ② 向 MemoryManager 预约这块内存（currentUnrollMemory）
+  ③ 如果内存足够 → 展开数据，存入 Storage Memory，释放 Unroll 预留
+  ④ 如果内存不够 → 放弃内存缓存，改为磁盘缓存（或不缓存）
+
+注意：Unroll 内存是"预约制"——先申请再写入，防止写到一半 OOM
+     预约期间这部分内存被标记为占用，但实际还没存数据
+```
+
+> **为什么 Unroll 要预分配？** 因为 RDD 分区的数据可能是序列化的字节数组，展开成 Java 对象后体积会膨胀 2-5 倍（对象头、引用、对齐填充等开销）。如果不预分配直接展开，可能展开到一半内存不够，前面的工作全白费。预分配机制确保"要么全部缓存成功，要么直接放弃不开始"，避免半成品浪费内存。
 
 **真实案例**：某推荐团队的 LTV 指标计算任务，executor.memory = 8g 但 memory.fraction = 0.3，导致执行内存仅 2.4G。核心 Stage 处理 3.4TB 数据时 Memory Spill 高达 1751GB、Disk Spill 78GB，单个 Stage 耗时 25 分钟。将 memory.fraction 从 0.3 调到 0.6 后（执行内存从 2.4G 变为 4.8G），Stage 耗时从 25 分钟降至约 12 分钟，**零风险、不增加资源申请量**——这是性价比最高的优化手段。
 
@@ -1289,6 +1425,8 @@ spark.sql.shuffle.partitions = 200（默认值，通常偏小）
   → AQE 会在写入前自动合并过小分区，配合 DISTRIBUTE BY 效果更好
 ```
 
+> **Hive 四种排序关键字在 Spark SQL 中的支持情况**：Spark SQL 兼容 Hive 的 ORDER BY、SORT BY、DISTRIBUTE BY、CLUSTER BY 语法，语义一致。关键区别：Spark SQL 中 ORDER BY 不再强制单 Reducer——当查询有 LIMIT 时，Spark 会用 Top-K 算法（TakeOrdered）避免全量排序；没有 LIMIT 时仍是全局排序但可以多分区并行收集后合并。DISTRIBUTE BY 在 Spark 中最常用于控制输出文件数和解决动态分区写入 OOM，而非排序场景。详见 [Hive — 四种排序关键字](./03-Hive.md#26-四种排序关键字order-by--sort-by--distribute-by--cluster-by)。
+
 #### spark.default.parallelism vs spark.sql.shuffle.partitions——两个最容易混淆的参数
 
 ```
@@ -1396,6 +1534,72 @@ coalesce vs repartition：
   repartition(40) → 内部调用 coalesce(40, shuffle=true)，触发 Shuffle，数据更均匀
   → 减少 partition 数用 coalesce（不 Shuffle，快）
   → 增加 partition 数或需要均匀分布用 repartition（Shuffle，慢但均匀）
+```
+
+#### cache vs persist——RDD 缓存的正确姿势
+
+**cache() 和 persist() 的关系**：
+
+```scala
+// cache() 内部就是调用了 persist()，使用默认存储级别 MEMORY_ONLY
+def cache(): this.type = persist()
+
+// persist() 可以指定存储级别
+def persist(storageLevel: StorageLevel): this.type
+def persist(newLevel: StorageLevel, allowOverride: Boolean): this.type
+```
+
+| 方法 | 存储级别 | 说明 |
+|------|---------|------|
+| `cache()` | MEMORY_ONLY | 只存内存，放不下就丢弃（不落盘） |
+| `persist()` | 可指定 | 默认和 cache() 一样，但可以选其他级别 |
+
+**Spark 的 12 种存储级别**：
+
+| 存储级别 | 含义 | 适用场景 |
+|---------|------|---------|
+| MEMORY_ONLY | 只存内存，放不下丢弃 | 数据量不大、频繁读取（默认） |
+| MEMORY_ONLY_2 | 同上，但复制 2 份到不同节点 | 需要容错 |
+| MEMORY_AND_DISK | 先存内存，放不下写磁盘 | 数据量较大、可以接受部分磁盘读取 |
+| MEMORY_AND_DISK_2 | 同上，复制 2 份 | 大数据 + 容错 |
+| DISK_ONLY | 只存磁盘 | 数据量极大、内存不够 |
+| DISK_ONLY_2 | 只存磁盘，复制 2 份 | 大数据 + 容错 |
+| MEMORY_ONLY_SER | 序列化后存内存（省空间） | 内存紧张、能接受序列化开销 |
+| MEMORY_AND_DISK_SER | 序列化存内存，放不下写磁盘 | 内存紧张 + 大数据 |
+| OFF_HEAP | 堆外内存 | 避免GC影响（需配置 spark.memory.offHeap.enabled） |
+
+> **选哪个级别？** 大多数场景用默认的 MEMORY_ONLY 就够了。如果 RDD 数据量大于 Executor 内存，用 MEMORY_AND_DISK。如果 GC 压力大（缓存数据导致频繁 Full GC），考虑 OFF_HEAP。_SER 后缀的级别在内存紧张时可以省 50%+ 空间，但序列化/反序列化有 CPU 开销，Spark 2.x 后 Tungsten 已经自动做了高效序列化，手动用 _SER 的场景变少了。
+
+**SQL 级别：CACHE TABLE**
+
+```sql
+-- Spark SQL 的缓存语法（底层也是 persist）
+CACHE TABLE hot_data AS SELECT * FROM big_table WHERE dt='2024-01-01';
+
+-- 释放缓存
+UNCACHE TABLE hot_data;
+```
+
+CACHE TABLE 默认使用 MEMORY_AND_DISK 存储级别（和 RDD 的 MEMORY_ONLY 不同），因为 DataFrame/Dataset 的数据量通常较大。
+
+**缓存的注意事项**：
+
+```
+① 缓存是惰性的——cache() / persist() 只是标记，真正触发缓存是在第一次 Action 执行时
+   rdd.cache()       ← 此时不会缓存
+   rdd.count()       ← 第一次 Action，触发计算并缓存
+   rdd.collect()     ← 第二次 Action，直接从缓存读取，不重新计算
+
+② 缓存不会自动释放——用完必须手动 unpersist()
+   rdd.unpersist()   ← 释放缓存，否则会占用内存直到 Application 结束
+
+③ 缓存丢失后会自动重建——如果内存不够被 evict（MEMORY_ONLY 场景），
+   下次使用时会重新计算，不会报错但会有性能损失
+
+④ Checkpoint vs Cache：
+   Cache：存内存/磁盘，生命周期随 Application，Driver 崩溃就没了
+   Checkpoint：存 HDFS，生命周期持久，RDD 血缘会被截断（不再依赖上游）
+   → Checkpoint 适合超长血缘链（防止重建代价过大）和需要持久化的场景
 ```
 
 #### OOM / Spill 排查路径
