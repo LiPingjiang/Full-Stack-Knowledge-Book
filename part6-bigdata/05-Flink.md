@@ -853,7 +853,7 @@ graph TD
 
 读取一条数据时，最坏情况下需要从 L0 到 LN 逐层查找。每层可能需要读取一个 SST 文件的 Index Block + Data Block。L0 的文件之间没有排序，需要全部扫描。读放大 = 需要读取的 SST 文件数。
 
-RocksDB 通过 **Bloom Filter** 缓解读放大：每个 SST 文件附带一个 Bloom Filter，可以快速判断"这个 key 肯定不在这个文件里"，跳过不必要的磁盘读取。Flink 默认启用了 Bloom Filter（`state.backend.rocksdb.bloom-filter.per-key-bits`）。
+RocksDB 通过 **[Bloom Filter](../part3-java-deep/A1-核心数据结构原理.md#三布隆过滤器bloom-filter用-1-的误判换-99-的内存节省)** 缓解读放大：每个 SST 文件附带一个 Bloom Filter，可以快速判断"这个 key 肯定不在这个文件里"，跳过不必要的磁盘读取。Flink 默认启用了 Bloom Filter（`state.backend.rocksdb.bloom-filter.per-key-bits`）。
 
 **空间放大（Space Amplification）**
 
@@ -1036,7 +1036,7 @@ flink run -s hdfs://path/to/savepoint -n -c com.example.MyJob my-job.jar
 
 ### 5.7 大 State 处理策略（体系化排查思路）
 
-> **本节内容已独立拆分为专题文档，详见 [05-Flink-大State专题.md](./05-Flink-大State专题.md)**
+> **本节内容已独立拆分为专题文档，详见 [05-Flink-大State专题.md](./05-Flink-大State专题.md)。RocksDB / Checkpoint / 并行度等完整配置参数另见 [05-Flink-配置参数速查.md](./05-Flink-配置参数速查.md)。**
 
 生产环境中 State 膨胀到几十 GB 甚至几百 GB 时，会导致运行时反压、Checkpoint 超时、启停扩缩容慢三类问题。专题文档按 6 步体系化排查思路逐层递进：
 

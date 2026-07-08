@@ -561,11 +561,11 @@ FROM (
 
 优点：精确，不需要外部依赖。缺点：状态无限增长（所有用户 ID 都要存）。**必须设置 TTL**，比如"只保留 7 天内的用户状态"，超期的用户可以重新算一次（业务上通常可接受）。
 
-**方案二：Bloom Filter 去重**
+**方案二：[Bloom Filter](../part3-java-deep/A1-核心数据结构原理.md#三布隆过滤器bloom-filter用-1-的误判换-99-的内存节省) 去重**
 
 用 Bloom Filter 近似判断用户是否已出现。优点：内存占用极小（百万级用户只需几 MB）。缺点：有误判率（可能把新用户误判为已存在，漏掉首次行为）。适合允许少量误差的场景（如广告曝光去重）。
 
-**方案三：HyperLogLog 去重**
+**方案三：[HyperLogLog](../part3-java-deep/A1-核心数据结构原理.md#九hyperlogloghll用-12kb-估算亿级基数) 去重**
 
 如果只需要统计 UV 数量而不需要精确知道每个用户是否首次，可以用 HyperLogLog 近似计数。Flink SQL 的 `COUNT(DISTINCT)` 底层会自动优化。
 
