@@ -67,6 +67,7 @@
 - [05-Flink-配置参数速查.md](./05-Flink-配置参数速查.md) — RocksDB / Checkpoint / 并行度等完整配置参数
 - [05-Flink-面试深度剖析.md](./05-Flink-面试深度剖析.md) — 20 个高频面试考点深度解析
 - [A3-两阶段提交.md](../part3-java-deep/A3-两阶段提交.md) — 2PC 通用原理（数据库 / 分布式 / Flink 三个战场）
+- [05-Flink-反压机制详解.md](./05-Flink-反压机制详解.md) — 反压物理传播机制、Credit-based 流控、Checkpoint 对齐二次反压、Buffer Debloating
 ---
 
 ## 一、流处理的核心挑战
@@ -900,6 +901,8 @@ stream.sinkTo(sink);
 ---
 
 ## 五、背压（Backpressure）
+
+> **深度专题**：反压的物理传播机制（ResultSubpartition/InputChannel 级别 Buffer 流转）、Credit-based 源码链路、Checkpoint 对齐导致的二次反压、Buffer Debloating 原理等详见 [05-Flink-反压机制详解.md](./05-Flink-反压机制详解.md)。本节覆盖核心原理和生产定位方法。
 
 ### 5.1 什么是背压
 
