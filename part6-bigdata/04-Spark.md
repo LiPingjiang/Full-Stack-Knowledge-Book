@@ -197,6 +197,70 @@ Executor 6: 读磁盘文件 → 反序列化 → [继续处理]
 
 宽依赖触发 Shuffle，也触发 Stage 的划分。
 
+### 2.3.1 序列化框架选择：Java 原生 vs Kryo
+
+Shuffle 的四个性能地雷中，序列化/反序列化是 CPU 开销的主要来源。选对序列化框架能直接降低这部分开销，同时减小网络传输量。
+
+Spark 内置支持两种序列化器：
+
+| 维度 | Java 原生序列化（默认） | Kryo（推荐生产使用） |
+|------|----------------------|-------------------|
+| **速度** | 慢 | ⚡ 快 5-10 倍 |
+| **字节体积** | 大（含完整类元信息） | 小（~25% of Java 原生） |
+| **接入成本** | 零配置 | 需切换配置，推荐注册核心类 |
+| **跨语言** | ❌ 仅 Java | ❌ 仅 Java |
+| **Schema 演进** | 弱（依赖 serialVersionUID） | ❌ 不支持（字段顺序变化会损坏数据） |
+| **适用场景** | 默认兜底、零配置场景 | Spark/Flink 内部短暂传输 |
+
+**为什么 Spark 默认不用 Kryo？** Kryo 需要预注册类才能发挥最大性能——未注册的类会退化到把类全名写进字节流，优势大幅缩水；而且 `registrationRequired=true` 时遇到未注册类直接报错。Java 原生序列化虽然慢，但零配置、零风险，适合作为默认值。
+
+**Kryo 的核心原理**：用整数 ID 代替类名，序列化时只写数据本身，不写类型描述。
+
+```
+Java 原生序列化：
+  [类名: "com.example.Person"][字段名: "name"][值: "Alice"][字段名: "age"][值: 30]
+  → 字节流里大量字符串，体积大，解析慢
+
+Kryo（已注册）：
+  [类ID: 42]["Alice"][30]
+  → 只有数据，体积极小，解析极快
+```
+
+**在 Spark 中启用 Kryo**：
+
+```scala
+val conf = new SparkConf()
+  .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+  // 注册业务核心类，获得最大性能收益
+  .registerKryoClasses(Array(
+    classOf[MyEvent],
+    classOf[UserRecord]
+  ))
+```
+
+**Kryo vs Protobuf**：两者经常被拿来比较，但定位不同——
+
+```
+Kryo：零 Schema、零侵入，直接序列化已有 Java 对象
+  → 适合框架内部短暂传输（Spark Shuffle、广播变量、RDD 缓存）
+  → 不适合持久化存储：字段顺序变化会导致旧数据反序列化错乱
+
+Protobuf：需要定义 .proto 文件 + 代码生成，但换来跨语言 + 强 Schema 演进
+  → 适合微服务 RPC（gRPC）、消息队列持久化、对外 API 协议
+  → 字段编号机制保证新旧版本数据互相兼容
+
+// Protobuf 字段编号机制示例：
+message User {
+  string name  = 1;   // 编号 1，永远不变
+  int32  age   = 2;   // 编号 2
+  string email = 3;   // 新增字段，旧数据读到 email="" 默认值，完全正常
+}
+// 旧代码遇到编号 3 → 直接跳过，不报错
+// Kryo 没有编号，靠字段声明顺序，插入新字段会导致后续字段全部错位
+```
+
+> **一句话总结**：Kryo 管 JVM 内部的短暂传输，Protobuf 管跨系统的长期协议。Spark 生产环境建议切换到 Kryo 并注册核心数据类，能明显降低 Shuffle 的 CPU 和网络开销。
+
 ### 2.4 共享变量——广播变量与累加器
 
 Spark 的算子代码（如 `rdd.filter(...)` 中的 lambda）会被 Driver 序列化后发送到每个 Executor。同样，算子中引用的外部变量也会被复制到每个 Task——如果一个变量 100MB、有 200 个 Task，就会复制 200 份共 20GB 网络传输。广播变量和累加器就是解决这个问题的两种共享变量。

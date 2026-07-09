@@ -184,9 +184,23 @@ RocksDB 的存储模型是 key-value 对。对于 `ValueState<T>`，Flink 在 Ro
 
 注意：`ListState` 有一个容易踩的坑——`add()` 操作在 RocksDB backend 上确实是 O(1)（追加一个 KV 对），但 `get()` 返回的 `Iterable` 需要读取该 key 下的所有 entry 并逐条反序列化，是 O(n) 的。如果你频繁读取 ListState，性能可能比预期差很多。
 
-**1.3 使用 Protobuf / Avro 替代 Java 原生序列化**
+**1.3 自定义 TypeSerializer：当 POJO Serializer 不够用时的兜底方案**
 
-如果 State 中存储了复杂对象且数据量大，Protobuf 序列化后的体积通常比 Java 原生序列化小 50% 以上，反序列化速度也快数倍。
+> **关于 Kryo 的定位澄清**：Flink 中 Kryo 是最差的兜底序列化器（1.1 节已说明性能损失 75%），而不是像 Spark 中那样是"推荐的高性能替代方案"。Flink 的优化路径是：**让类满足 POJO 条件 → 用 Flink POJO Serializer**（这已经足够高效）。只有当类结构复杂、无法满足 POJO 条件、且已经 fallback 到 Kryo 时，才需要考虑自定义 TypeSerializer。自定义 Serializer 的实现可以用 Protobuf、Avro 或手写二进制格式，核心目标是**绕过 Kryo 的性能损失**，而不是"替代 Java 原生序列化"（Flink State 本身就不用 Java 原生序列化）。
+
+**什么时候需要自定义 TypeSerializer？**
+
+```
+优先级（从高到低）：
+  ① 让类满足 POJO 条件 → Flink 自动用 PojoSerializer（最简单，性能好）
+  ② 用 Flink 原生 Tuple 类型 → TupleSerializer（最快，但可读性差）
+  ③ 自定义 TypeSerializer → 完全控制序列化逻辑（最灵活，但开发成本高）
+
+只有以下场景才需要走到 ③：
+  - 类包含 Flink 无法推断的嵌套泛型（如 Map<String, List<MyObj>>）
+  - 类来自第三方库，无法修改使其满足 POJO 条件
+  - 对序列化体积有极致要求（如 State 几百 GB，每字节都要省）
+```
 
 **"自定义 TypeSerializer" 到底指什么？** 下面的代码示例中有两个角色：`TypeInformation`（类型信息）是"自定义序列化"的关键——它告诉 Flink "这个类的结构是什么，应该用哪个 Serializer 来处理"。`ValueStateDescriptor` 只是一个 State 的描述符（名字 + 类型），它本身不做序列化。真正的序列化逻辑由 `TypeInformation` 内部关联的 `TypeSerializer` 完成：
 
@@ -202,30 +216,99 @@ TypeInformation<MyState> stateType = TypeInformation.of(new TypeHint<MyState>() 
 ValueStateDescriptor<MyState> descriptor = new ValueStateDescriptor<>("state", stateType);
 ```
 
-如果你需要完全控制序列化逻辑（比如用 Protobuf），可以实现自定义的 `TypeSerializer<MyState>` 并通过 `ValueStateDescriptor` 的构造函数直接传入：
+如果你需要完全控制序列化逻辑（比如用 Protobuf），可以实现自定义的 `TypeSerializer<MyState>` 并通过 `ValueStateDescriptor` 的构造函数直接传入。下面是一个**完整可运行的骨架**：
 
 ```java
-// 完全自定义序列化：实现 TypeSerializer 接口
+import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.api.common.typeutils.TypeSerializerSnapshot;
+import org.apache.flink.core.memory.DataInputView;
+import org.apache.flink.core.memory.DataOutputView;
+
+/**
+ * 用 Protobuf 实现的自定义 TypeSerializer。
+ * 适用场景：MyState 无法满足 POJO 条件，且 Kryo fallback 性能不可接受。
+ */
 public class MyProtobufSerializer extends TypeSerializer<MyState> {
+
+    // ===== 序列化 =====
     @Override
-    public void serialize(MyState record, DataOutputView target) {
+    public void serialize(MyState record, DataOutputView target) throws IOException {
         byte[] bytes = record.toProto().toByteArray();  // Protobuf 序列化
-        target.writeInt(bytes.length);
-        target.write(bytes);
+        target.writeInt(bytes.length);                   // 先写长度
+        target.write(bytes);                             // 再写字节
     }
+
+    // ===== 反序列化 =====
     @Override
-    public MyState deserialize(DataInputView source) {
+    public MyState deserialize(DataInputView source) throws IOException {
         int len = source.readInt();
         byte[] bytes = new byte[len];
         source.readFully(bytes);
         return MyState.fromProto(MyStateProto.parseFrom(bytes));  // Protobuf 反序列化
     }
-    // ... 还需实现 snapshotConfiguration, duplicate, copy 等方法
+
+    @Override
+    public MyState deserialize(MyState reuse, DataInputView source) throws IOException {
+        return deserialize(source);  // 不复用对象，直接新建
+    }
+
+    // ===== 复制（Checkpoint 时需要深拷贝）=====
+    @Override
+    public MyState copy(MyState from) {
+        // 通过 Protobuf 序列化/反序列化实现深拷贝（简单但有 CPU 开销）
+        return MyState.fromProto(from.toProto());
+    }
+
+    @Override
+    public MyState copy(MyState from, MyState reuse) {
+        return copy(from);
+    }
+
+    @Override
+    public void copy(DataInputView source, DataOutputView target) throws IOException {
+        int len = source.readInt();
+        target.writeInt(len);
+        byte[] bytes = new byte[len];
+        source.readFully(bytes);
+        target.write(bytes);
+    }
+
+    // ===== 元信息 =====
+    @Override
+    public boolean isImmutableType() { return false; }
+
+    @Override
+    public TypeSerializer<MyState> duplicate() { return this; }  // 无状态，可共享
+
+    @Override
+    public MyState createInstance() { return new MyState(); }
+
+    @Override
+    public int getLength() { return -1; }  // 变长
+
+    @Override
+    public boolean equals(Object obj) { return obj instanceof MyProtobufSerializer; }
+
+    @Override
+    public int hashCode() { return MyProtobufSerializer.class.hashCode(); }
+
+    // ===== Snapshot（State 兼容性演进需要）=====
+    @Override
+    public TypeSerializerSnapshot<MyState> snapshotConfiguration() {
+        return new MyProtobufSerializerSnapshot();
+    }
 }
 
+// ===== 使用方式 =====
 // 直接传入自定义 Serializer，完全绕过 Flink 的类型推断
-ValueStateDescriptor<MyState> descriptor = new ValueStateDescriptor<>("state", new MyProtobufSerializer());
+ValueStateDescriptor<MyState> descriptor = new ValueStateDescriptor<>(
+    "my-state",
+    new MyProtobufSerializer()
+);
+ValueState<MyState> state = getRuntimeContext().getState(descriptor);
 ```
+
+> **开发成本提醒**：自定义 TypeSerializer 需要实现约 15 个方法（包括 `snapshotConfiguration` 用于 State 兼容性演进），还需要配套实现 `TypeSerializerSnapshot`。如果你的类只是因为缺少无参构造函数或字段不是 public 而 fallback 到 Kryo，**优先修改类本身使其满足 POJO 条件**，成本远低于自定义 Serializer。
 
 ### 第 2 步：缩短 State 生命周期（TTL 与清理）
 
@@ -241,12 +324,44 @@ ValueStateDescriptor<MyState> descriptor = new ValueStateDescriptor<>("state", n
 | 实时 TopN | 统计周期 + 缓冲（如 1 天 + 2 小时） |
 
 ```java
+// ===== 第一步：构建 TTL 配置 =====
 StateTtlConfig ttl = StateTtlConfig.newBuilder(Time.days(7))
-    .setUpdateType(OnCreateAndWrite)          // 创建和写入时刷新 TTL
-    .setStateVisibility(NeverReturnExpired)    // 不返回已过期的状态
-    .cleanupIncrementally(10, true)            // 增量清理：每 10 条读取触发一次
+    .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)   // 创建和写入时刷新 TTL
+    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)  // 不返回已过期的状态
+    .cleanupIncrementally(10, true)   // 增量清理：每次读取时顺带检查 10 条，true=也在 Checkpoint 时清理
     .build();
+
+// ===== 第二步：绑定到 StateDescriptor =====
+// 注意：enableTimeToLive() 必须在 getRuntimeContext().getState() 之前调用
+ValueStateDescriptor<UserSession> descriptor =
+    new ValueStateDescriptor<>("user-session", UserSession.class);
+descriptor.enableTimeToLive(ttl);   // ← 绑定 TTL，这一步是关键
+
+// ===== 第三步：注册 State（在 open() 方法中）=====
+private ValueState<UserSession> sessionState;
+
+@Override
+public void open(Configuration parameters) throws Exception {
+    ValueStateDescriptor<UserSession> descriptor =
+        new ValueStateDescriptor<>("user-session", UserSession.class);
+    descriptor.enableTimeToLive(ttl);          // 绑定 TTL
+    sessionState = getRuntimeContext().getState(descriptor);
+}
+
+// MapState / ListState 的绑定方式完全一样：
+MapStateDescriptor<String, Long> mapDesc =
+    new MapStateDescriptor<>("click-map", String.class, Long.class);
+mapDesc.enableTimeToLive(ttl);   // 同样调用 enableTimeToLive()
+MapState<String, Long> clickMap = getRuntimeContext().getMapState(mapDesc);
 ```
+
+**TTL 的三个 UpdateType 选项说明**：
+
+| UpdateType | 含义 | 适用场景 |
+|-----------|------|---------|
+| `OnCreateAndWrite` | 创建和每次写入时重置 TTL（最常用） | 活跃用户会话、滑动窗口去重 |
+| `OnReadAndWrite` | 读取和写入都重置 TTL | 需要"最近访问时间"语义的场景 |
+| `Disabled` | 不更新 TTL，只在创建时设置一次 | 固定过期时间（如 7 日留存窗口） |
 
 **注意**：State TTL 的清理不是精确的——过期数据不会立刻被删除，而是在下次访问或 RocksDB Compaction 时才被清理。如果需要更及时的清理，可以用 Timer 回调主动删除：
 
@@ -282,7 +397,7 @@ public void onTimer(long timestamp, OnTimerContext ctx, Collector<Result> out) {
 - 无窗口场景：LocalKeyBy 预聚合（在 keyBy 上游用 buffer 攒一批数据预聚合后再发下游）
 - Flink SQL 场景：开启 LocalGlobal（`table.optimizer.agg-phase-strategy: TWO_PHASE`）和 Split Distinct
 
-**二次聚合的真实场景和代码示例**：假设你要统计每个城市的实时订单量，但 `city_id = "北京"` 的订单占 80%（热点 key），导致一个 Sub-Task 的 State 远大于其他。解决办法是在第一阶段给北京的 key 加随机后缀打散，第二阶段再合并回来：
+**有窗口场景——两阶段聚合代码示例**：假设你要统计每个城市的实时订单量，但 `city_id = "北京"` 的订单占 80%（热点 key），导致一个 Sub-Task 的 State 远大于其他。解决办法是在第一阶段给 key 加随机后缀打散，第二阶段再合并回来：
 
 ```java
 // ===== 真实 case：城市维度的实时订单量统计，北京是热点 key =====
@@ -290,17 +405,15 @@ public void onTimer(long timestamp, OnTimerContext ctx, Collector<Result> out) {
 // 第一阶段：加随机后缀打散热点 key
 DataStream<Tuple2<String, Long>> firstStage = orderStream
     .map(order -> {
-        String cityKey = order.getCityId();
         // 给所有 key 加随机后缀（0~9），热点 key 被分散到 10 个 Sub-Task
-        String saltedKey = cityKey + "_" + ThreadLocalRandom.current().nextInt(10);
+        String saltedKey = order.getCityId() + "_" + ThreadLocalRandom.current().nextInt(10);
         return Tuple2.of(saltedKey, 1L);
     })
     .returns(Types.TUPLE(Types.STRING, Types.LONG))
     .keyBy(t -> t.f0)
     .window(TumblingEventTimeWindows.of(Time.minutes(1)))
     .reduce((a, b) -> Tuple2.of(a.f0, a.f1 + b.f1));
-    // 此时 State 中有 "北京_0"、"北京_1" ... "北京_9" 共 10 个 key
-    // 每个 key 的 State 只有原来的 1/10
+    // State 中有 "北京_0"..."北京_9" 共 10 个 key，每个 State 只有原来的 1/10
 
 // 第二阶段：去掉后缀，合并回真正的 city_id
 DataStream<Tuple2<String, Long>> result = firstStage
@@ -312,7 +425,155 @@ DataStream<Tuple2<String, Long>> result = firstStage
     // 最终输出：("北京", 总订单量)
 ```
 
-这种两阶段聚合在有窗口的场景下是标准做法。注意第二阶段的窗口必须和第一阶段一致（都是 1 分钟滚动窗口），否则不同窗口的数据会被混在一起。对于无窗口的实时聚合，应该使用 LocalKeyBy 预聚合（详见面试考点 15 的 `LocalKeyByFlatMap` 代码），而不是这种两阶段窗口聚合。
+注意第二阶段的窗口必须和第一阶段一致（都是 1 分钟滚动窗口），否则不同窗口的数据会被混在一起。
+
+---
+
+**无窗口场景——LocalKeyBy 预聚合前后对比**：
+
+无窗口的实时聚合（如持续统计每个 key 的累计 PV）不能用上面的两阶段窗口聚合，因为没有窗口触发点。LocalKeyBy 的思路是：**在 keyBy 上游的每个 Sub-Task 本地攒一批数据先做局部聚合，再发给下游 keyBy 算子**，大幅减少发往下游的数据量和 State 写入压力。
+
+```java
+// ===== 改造前：直接 keyBy，热点 key 全部打到同一个 Sub-Task =====
+// 问题：所有 "北京" 的事件都路由到同一个 Sub-Task，该 Sub-Task 的 State 和 CPU 成为瓶颈
+stream
+    .keyBy(Event::getCityId)
+    .process(new CityPvCounter());   // 每条数据都要读写一次 State
+
+// ===== 改造后：LocalKeyBy 预聚合，先在本地攒批再发下游 =====
+stream
+    .flatMap(new LocalKeyByFlatMap(100))  // ← 本地攒 100 条后预聚合，再发下游
+    .keyBy(t -> t.f0)                     // 下游收到的数据量已大幅减少
+    .process(new CityPvCounter());
+
+/**
+ * LocalKeyBy 核心实现：在本地用 HashMap 攒批，达到阈值后批量输出
+ * 每个 Sub-Task 独立维护一个本地 HashMap，不涉及 Flink State（不需要 Checkpoint）
+ */
+public class LocalKeyByFlatMap
+        extends RichFlatMapFunction<Event, Tuple2<String, Long>> {
+
+    private final int batchSize;
+    private Map<String, Long> localBuffer = new HashMap<>();  // 本地聚合缓冲区
+    private int count = 0;
+
+    public LocalKeyByFlatMap(int batchSize) {
+        this.batchSize = batchSize;
+    }
+
+    @Override
+    public void flatMap(Event event, Collector<Tuple2<String, Long>> out) {
+        // 本地累加（不走 Flink State，只是普通 HashMap）
+        localBuffer.merge(event.getCityId(), 1L, Long::sum);
+        count++;
+
+        if (count >= batchSize) {
+            // 达到阈值，把本地聚合结果发给下游 keyBy 算子
+            localBuffer.forEach((city, cnt) -> out.collect(Tuple2.of(city, cnt)));
+            localBuffer.clear();
+            count = 0;
+        }
+    }
+
+    @Override
+    public void close() {
+        // 任务结束时把剩余数据 flush 出去，避免数据丢失
+        localBuffer.forEach((city, cnt) -> /* 需要 Collector，此处略 */ {});
+    }
+}
+```
+
+**改造效果对比**：
+
+| 维度 | 改造前（直接 keyBy） | 改造后（LocalKeyBy） |
+|------|--------------------|--------------------|
+| 下游数据量 | 每条原始数据都发下游 | 每 100 条聚合成少量结果再发 |
+| 下游 State 写入次数 | 每条数据写一次 | 每批写一次（减少 ~99%） |
+| 热点 key 压力 | 全部集中在一个 Sub-Task | 上游各 Sub-Task 分担了大部分 |
+| 延迟 | 实时（每条触发） | 轻微增加（攒满 batchSize 才输出） |
+| 精确性 | 精确 | 精确（只是延迟了输出，不影响最终结果） |
+
+> **LocalKeyBy 的局限**：`batchSize` 是按条数触发的，如果某个 key 的数据量很少（如冷门城市），可能长时间攒不满 batchSize，导致输出延迟。生产中通常结合定时 flush（如每 200ms 强制输出一次）来解决。
+
+---
+
+**Flink SQL 场景——`TWO_PHASE` 参数 vs 手工两个 GROUP BY**：
+
+Flink SQL 的 `table.optimizer.agg-phase-strategy: TWO_PHASE` 是自动两阶段聚合，和手工写两个 GROUP BY 的核心逻辑相同，但有重要区别：
+
+| 维度 | `TWO_PHASE` 参数（自动） | 手工两个 GROUP BY |
+|------|------------------------|-----------------|
+| **适用范围** | 只对 `count(distinct)` 生效，普通 `count/sum` 不拆分 | 对所有聚合生效 |
+| **打散粒度** | 由 `distinct-agg.split.bucket-num` 控制（如 1024） | 手工控制（如 `MOD(HASH_CODE(union_id), 4096)`） |
+| **多 distinct key** | 每个 distinct key 独立打散，不能同时处理多个 | 可以同时处理多个 distinct key（`event_identifier` 和 `union_id`） |
+| **多维 UNION ALL** | 不支持，无法自动展开多维组合 | 手工写多个 UNION ALL 分支，完全可控 |
+| **透明度** | 黑盒，出问题难排查 | 白盒，逻辑完全可控 |
+| **适合场景** | 简单单维聚合，快速开启 | 复杂多维聚合（多个 distinct key + 多维 UNION ALL） |
+
+**自动 TWO_PHASE 的改写原理**：
+
+```sql
+-- 原始 SQL（单个 count distinct）
+SELECT city_id, count(distinct user_id) as uv
+FROM t GROUP BY city_id
+
+-- Flink 自动改写为两阶段（等价于手工写法）：
+-- 第一阶段：加 bucket 维度，在桶内做局部去重
+SELECT city_id,
+       MOD(HASH_CODE(user_id), 1024) as bucket,
+       count(distinct user_id) as partial_uv
+FROM t
+GROUP BY city_id, MOD(HASH_CODE(user_id), 1024)
+
+-- 第二阶段：去掉 bucket，sum 合并各桶结果
+SELECT city_id, SUM(partial_uv) as uv
+FROM first_stage
+GROUP BY city_id
+```
+
+**为什么同一个 `user_id` 不会被重复计数？** 因为 `HASH_CODE(user_id)` 是固定的，同一个 `user_id` 永远落在同一个桶里。第一阶段在桶内做 `count(distinct user_id)`，同一个桶内的去重是精确的；第二阶段 `SUM` 各桶的去重结果，由于不同桶之间没有重叠，加起来就是全局精确去重数。
+
+**你的 SQL 分析**：你的作业手工实现了两阶段聚合，用 `MOD(HASH_CODE(union_id), 4096)` 打散，逻辑完全正确。因为你同时有 `count(distinct event_identifier)` 和 `count(distinct union_id)` 两个 distinct key，且有多维 UNION ALL 组合，手工写比开 `TWO_PHASE` 参数更合适——自动参数无法同时处理两个 distinct key 的打散，也无法自动展开你的多维组合。
+
+抽取核心示例代码（去掉业务细节，保留两阶段聚合的骨架）：
+
+```sql
+-- ===== Flink SQL 手工两阶段聚合核心示例 =====
+-- 场景：统计每个 city 的 UV（count distinct user_id），user_id 存在热点倾斜
+
+-- 第一阶段：加 bucket 维度打散，在桶内局部去重
+-- MOD(HASH_CODE(user_id), 4096) 保证同一 user_id 永远落在同一个桶，不会重复计数
+CREATE VIEW first_stage AS
+SELECT
+    TUMBLE_START(event_time, INTERVAL '10' MINUTE) AS window_start,
+    TUMBLE_ROWTIME(event_time, INTERVAL '10' MINUTE) AS event_time,  -- 保留 ROWTIME 属性供第二阶段使用
+    city_id,
+    MOD(HASH_CODE(user_id), 4096) AS bucket,   -- 打散维度，4096 个桶
+    count(DISTINCT user_id) AS partial_uv       -- 桶内精确去重
+FROM source_table
+GROUP BY
+    TUMBLE(event_time, INTERVAL '10' MINUTE),
+    MOD(HASH_CODE(user_id), 4096),             -- bucket 必须在 GROUP BY 里
+    city_id;
+
+-- 第二阶段：去掉 bucket，SUM 合并各桶结果
+INSERT INTO sink_table
+SELECT
+    DATE_FORMAT(TUMBLE_START(event_time, INTERVAL '10' MINUTE), 'yyyy-MM-dd HH:mm') AS window_start,
+    city_id,
+    SUM(partial_uv) AS uv    -- 各桶结果相加，等于全局精确去重数
+FROM first_stage
+GROUP BY
+    TUMBLE(event_time, INTERVAL '10' MINUTE),  -- 窗口必须与第一阶段一致
+    city_id;                                    -- 去掉 bucket，只保留业务维度
+
+-- ===== 关键点说明 =====
+-- 1. 第一阶段用 TUMBLE_ROWTIME（保留事件时间属性），第二阶段才能继续用事件时间窗口
+--    如果用 TUMBLE_START（返回普通 TIMESTAMP），第二阶段无法再用事件时间窗口
+-- 2. bucket 只在第一阶段的 GROUP BY 中出现，第二阶段去掉它
+-- 3. 两阶段的窗口大小必须完全一致，否则不同窗口的数据会被混在一起
+-- 4. 同一 user_id 的 HASH_CODE 固定 → 永远落在同一个桶 → 不会跨桶重复计数
+```
 
 ### 第 4 步：切换 RocksDB + 参数调优
 
@@ -365,8 +626,8 @@ graph TD
 几个关键澄清：
 
 - **不存在"先用 HashMap 再自动切换到 RocksDB"的机制**。选择哪种 State Backend 是部署时配置的，运行时不会自动切换。
-- **数据一上来就进 RocksDB**。写入时先进 RocksDB 的 MemTable（native 内存，不在 JVM 堆上），MemTable 写满后 flush 到磁盘的 [SST 文件](./05-Flink.md#lsm-tree-的三种放大效应)。所以写操作确实先进内存，但这是 RocksDB 内部的 MemTable，不是 Flink 的 HashMapStateBackend。
-- **RocksDB 并没有"根据阈值选择存内存还是硬盘"**。所有数据最终都会落盘为 [SST 文件](./05-Flink.md#lsm-tree-的三种放大效应)（MemTable 满了就刷盘），读取时通过 Block Cache 缓存热点数据到内存。
+- **数据一上来就进 RocksDB**。写入时先进 RocksDB 的 MemTable（native 内存，不在 JVM 堆上），MemTable 写满后 flush 到磁盘的 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)（Sorted String Table，有序字符串表）。所以写操作确实先进内存，但这是 RocksDB 内部的 MemTable，不是 Flink 的 HashMapStateBackend。
+- **RocksDB 并没有"根据阈值选择存内存还是硬盘"**。所有数据最终都会落盘为 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)（MemTable 满了就刷盘），读取时通过 Block Cache 缓存热点数据到内存。
 - **MemTable 和 Block Cache 的总内存**由 Flink 的 Managed Memory 控制（`taskmanager.memory.managed.fraction`，默认 0.4），Flink 通过 Write Buffer Manager 确保 RocksDB 不超出预算。
 
 **RocksDB Compaction 的触发机制**：Compaction 不是定时执行的，而是由 SST 文件数量或文件大小触发的。RocksDB 有两种主要的 Compaction 策略：
@@ -380,13 +641,50 @@ Compaction 期间会消耗 CPU 和磁盘 I/O。如果 Compaction 速度跟不上
 
 理论上可以——RocksDB 数据存在本地磁盘，不受 JVM 堆限制，上限就是磁盘容量。但实际生产中有三个约束：
 
-1. **Managed Memory 限制运行性能**：MemTable + Block Cache 的内存受限（由 `taskmanager.memory.managed.fraction` 控制，默认 0.4）。你的理解是对的——MemTable 的固定大小（如 64MB × 3 个 = 192MB）确实不会因为磁盘上的 State 增大而"撑爆"内存，因为它只是一个写缓冲区，写满就刷盘。但 State 越大，影响的是**读性能**：磁盘上的 SST 文件越多，热点数据在 Block Cache 中的命中率越低 → 更多读请求需要走磁盘 I/O → 算子处理延迟上升。同时 MemTable 在大 State 场景下也会间接影响性能：如果写入 QPS 很高，MemTable 写满的频率增加 → Immutable MemTable 堆积 → flush 和 Compaction 更频繁 → 磁盘 I/O 竞争加剧 → 拖慢整体吞吐。所以 Managed Memory 的限制不是"撑爆内存"，而是**限制了最高运行性能**。
+1. **Managed Memory 限制运行性能**：MemTable + Block Cache 的内存受限（由 `taskmanager.memory.managed.fraction` 控制，默认 0.4）。但 **State 总量大 ≠ 性能差，真正的触发条件是"热点工作集超出 Block Cache"**。
+
+   具体分析：MemTable 是写缓冲区（默认 64MB × 3 个 = 192MB），写满就刷盘，它的大小不会因为磁盘上的 State 增大而"撑爆"内存。Block Cache 是读缓存，缓存热点 SST 数据块。两者共享 Managed Memory 预算，调大一个会挤压另一个。
+
+   ```
+   性能瓶颈的精确触发条件：
+
+   ① 读瓶颈（最常见）：
+      热点工作集大小 > Block Cache 大小 → Cache Miss 率飙升 → 大量磁盘 I/O
+      
+      例 1：State 100GB，但每秒访问的热点 key 只有 500MB
+        → Block Cache 1GB 就够，性能完全正常，和 State 1GB 时没有区别
+      
+      例 2：State 10GB，但热点 key 均匀分布在全部 10GB 上
+        → Block Cache 再大也不够（除非开到 10GB），每次都走磁盘
+        → 这种场景才是真正的性能崩溃
+
+   ② 写瓶颈（高 QPS 场景）：
+      写入 QPS 极高 → MemTable 频繁写满 → Immutable MemTable 堆积
+      → flush 和 Compaction 更频繁 → 磁盘 I/O 竞争 → Write Stall
+      
+      假设把 MemTable 从 64MB 开到 10GB：
+      → 刷盘频率从"每 64MB 刷一次"变成"每 10GB 刷一次"
+      → Compaction 频率大幅降低，写性能确实能撑住
+      → 但代价：10GB MemTable 挤压了 Block Cache 的内存预算
+      → 读性能反而可能变差（Block Cache 被压缩）
+      → 且故障时 WAL 回放 10GB 数据，恢复时间极长
+
+   ③ 结论：
+      "State 到达一个限度才体现性能问题"——这个限度不是 State 总量
+      而是：热点工作集 > Block Cache（读瓶颈）
+      或者：写入 QPS > MemTable flush 速度（写瓶颈）
+      
+      调大 MemTable 能缓解写瓶颈，但不能解决读瓶颈，且会挤压 Block Cache
+      正确做法是根据读写比例合理分配 MemTable 和 Block Cache 的内存占比
+   ```
+
+   > **参数调优建议**：读多写少的场景（如大量 State 查询），优先调大 Block Cache（`state.backend.rocksdb.block.cache-size`）；写多读少的场景（如高 QPS 写入），优先调大 MemTable（`state.backend.rocksdb.writebuffer.size` + `writebuffer.count`）。两者总量受 Managed Memory 约束，需要在读写之间做 trade-off。详见 [A1 附录 · LSM-Tree 与 SST 文件 · Block Cache 与 MemTable 的内存分工](../part3-java-deep/A1-核心数据结构原理.md#117-block-cache-与-memtable-的内存分工)。
 2. **Checkpoint 上传瓶颈**：本地 State 越大，Checkpoint 时上传到 HDFS/S3 的数据越多。即使是增量 Checkpoint，也有增量链回溯开销。超过 `checkpoint.timeout` 就会失败。
 3. **磁盘 I/O 写放大**：LSM-Tree 的多层 Compaction 导致实际写入磁盘的数据量是用户数据的 10~30 倍。HDD 上 State 几十 GB 就可能把 I/O 打满。
 
 生产建议：单个 TaskManager 的 State 控制在几十 GB 以内，磁盘务必使用 SSD。
 
-> **关于 [SST 文件](./05-Flink.md#lsm-tree-的三种放大效应)、LSM-Tree 等存储引擎的通用知识**（MemTable → Immutable MemTable → SST → Compaction 的分层结构），不仅 RocksDB 使用，Doris（底层也是 RocksDB / 类似 LSM 结构）、HBase（HFile + MemStore）、Cassandra（SSTable + Memtable）等都采用了类似架构。这些存储引擎的共性原理和调优思路可参考主文档的 [LSM-Tree 的三种放大效应](./05-Flink.md#lsm-tree-的三种放大效应)。
+> **关于 SST 文件、LSM-Tree 等存储引擎的通用知识**（MemTable → Immutable MemTable → SST → Compaction 的分层结构），不仅 RocksDB 使用，Doris BE、HBase（HFile + MemStore）、Cassandra（SSTable + Memtable）等都采用了类似架构。这些存储引擎的共性原理、三种放大效应和调优思路已独立成节，详见 [A1 附录 · 十一、LSM-Tree 与 SST 文件](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)。
 
 RocksDB 参数调优详见主文档 5.3 节（包括多磁盘目录、SSD 优化、Block Cache、MemTable 参数等）。
 
@@ -424,7 +722,7 @@ sequenceDiagram
     HDFS-->>JM: 5. 上传完成，确认 Checkpoint
 ```
 
-**为什么大 State 的 Checkpoint 瓶颈是上传而不是运行时？** 运行时 RocksDB 的读写性能可以通过 SSD、Block Cache、增加并行度来解决，但 Checkpoint 时必须把所有 [SST 文件](./05-Flink.md#rocksdb-增量-checkpoint-原理)（全量）或新增 SST 文件（增量）上传到 HDFS/S3，这个过程受网络带宽限制。10GB 的 State 即使用增量 Checkpoint，首次全量上传仍然需要几十秒；增量链过长时，恢复需要回溯多个增量快照叠加，恢复时间可能比全量 Checkpoint 还长。
+**为什么大 State 的 Checkpoint 瓶颈是上传而不是运行时？** 运行时 RocksDB 的读写性能可以通过 SSD、Block Cache、增加并行度来解决，但 Checkpoint 时必须把所有 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#112-sst-文件是什么)（全量）或新增 SST 文件（增量）上传到 HDFS/S3，这个过程受网络带宽限制。10GB 的 State 即使用增量 Checkpoint，首次全量上传仍然需要几十秒；增量链过长时，恢复需要回溯多个增量快照叠加，恢复时间可能比全量 Checkpoint 还长。
 
 **Checkpoint 调优参数**：
 
@@ -450,7 +748,7 @@ config.enableUnalignedCheckpoints();
 | `checkpoint_state_size` | 单次 Checkpoint 状态大小 | 持续增长且无收敛趋势告警 |
 | `rocksdb_estimate_live_data_size` | RocksDB 实际数据量（按 Sub-Task） | 某个 Sub-Task 远大于其他 → 数据倾斜 |
 | `rocksdb_num_immutable_mem_tables` | 不可变 MemTable 数量 | > 3 告警，写入压力过大 flush 不及时 |
-| `rocksdb_compaction_times` | Compaction 次数 | 突增告警，可能 [SST 文件](./05-Flink.md#lsm-tree-的三种放大效应)过多 |
+| `rocksdb_compaction_times` | Compaction 次数 | 突增告警，可能 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)过多 |
 
 ### 哪些场景需要 State？（不只是聚合）
 
