@@ -369,23 +369,82 @@ ValueStateDescriptor<UserSession> descriptor =
     new ValueStateDescriptor<>("user-session", UserSession.class);
 descriptor.enableTimeToLive(ttl);   // ← 绑定 TTL，这一步是关键
 
-// ===== 第三步：注册 State（在 open() 方法中）=====
-private ValueState<UserSession> sessionState;
+// ===== 第三步：在 KeyedProcessFunction 的 open() 中注册 State =====
+// open() 是 Flink 算子的生命周期方法，在算子初始化时调用一次（类似 Spring 的 @PostConstruct）
+// 它所在的外部框架是 KeyedProcessFunction —— Flink 中最灵活的有状态算子
 
-@Override
-public void open(Configuration parameters) throws Exception {
-    ValueStateDescriptor<UserSession> descriptor =
-        new ValueStateDescriptor<>("user-session", UserSession.class);
-    descriptor.enableTimeToLive(ttl);          // 绑定 TTL
-    sessionState = getRuntimeContext().getState(descriptor);
+/**
+ * KeyedProcessFunction 是 Flink DataStream API 中最底层的有状态处理函数。
+ * 泛型参数：<KEY类型, 输入类型, 输出类型>
+ * 它提供了：State ���问、Timer 注册、侧输出 等能力。
+ */
+public class SessionTracker extends KeyedProcessFunction<String, Event, SessionResult> {
+
+    // State 声明为类的成员变量（不能在构造函数中初始化，必须在 open() 中）
+    private transient ValueState<UserSession> sessionState;
+
+    // TTL 配置（可以定义为常量或在 open() 中构建）
+    private static final StateTtlConfig TTL_CONFIG = StateTtlConfig.newBuilder(Time.days(7))
+        .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+        .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+        .cleanupIncrementally(10, true)
+        .build();
+
+    /**
+     * open() —— 算子生命周期初始化方法
+     * 在每个 Sub-Task 启动时调用一次，用于初始化 State、连接外部系统等。
+     * 类比：Spring Bean 的 @PostConstruct / Servlet 的 init()
+     */
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        // ValueStateDescriptor 的作用：
+        //   1. 给 State 命名（"user-session"）—— 用于 Checkpoint 持久化和恢复时的标识
+        //   2. 声明 State 的值类型（UserSession.class）—— Flink 据此选择序列化器
+        //   3. 绑定 TTL 配置 —— 控制 State 的自动过期清理
+        //   4. （可选）指定自定义 Serializer —— 绕过默认的类型推断
+        ValueStateDescriptor<UserSession> descriptor =
+            new ValueStateDescriptor<>("user-session", UserSession.class);
+        descriptor.enableTimeToLive(TTL_CONFIG);   // 绑定 TTL
+        // descriptor.setDefaultValue(new UserSession());  // 可选：设置默认值
+
+        // getRuntimeContext().getState() 向 Flink 运行时注册这个 State
+        // 返回的 ValueState 对象是当前 key 的 State 句柄
+        sessionState = getRuntimeContext().getState(descriptor);
+    }
+
+    /**
+     * processElement() —— 每条数据到达时调用
+     * 这里可以读写 State、注册 Timer、输出结果
+     */
+    @Override
+    public void processElement(Event event, Context ctx, Collector<SessionResult> out) throws Exception {
+        UserSession session = sessionState.value();  // 读 State（当前 key 的）
+        if (session == null) {
+            session = new UserSession();
+        }
+        session.addEvent(event);
+        sessionState.update(session);  // 写 State
+        // ... 业务逻辑
+    }
 }
 
 // MapState / ListState 的绑定方式完全一样：
 MapStateDescriptor<String, Long> mapDesc =
     new MapStateDescriptor<>("click-map", String.class, Long.class);
-mapDesc.enableTimeToLive(ttl);   // 同样调用 enableTimeToLive()
+mapDesc.enableTimeToLive(TTL_CONFIG);   // 同样调用 enableTimeToLive()
 MapState<String, Long> clickMap = getRuntimeContext().getMapState(mapDesc);
 ```
+
+**ValueStateDescriptor 能设置哪些内容**：
+
+| 设置项 | 方法 | 作用 |
+|-------|------|------|
+| **State 名称** | 构造函数第 1 参数 | Checkpoint 持久化标识，改���会导致旧 State 丢失 |
+| **值类型** | 构造函数第 2 参数（Class 或 TypeInformation） | Flink 据此选择序列化器 |
+| **TTL** | `enableTimeToLive(StateTtlConfig)` | 自动过期清理 |
+| **默认值** | `setDefaultValue(T)` | `value()` 返回 null 时的替代值（已废弃，建议代码中判空） |
+| **自定义序列化器** | 构造函数传入 `TypeSerializer<T>` | 完全控制序列化逻辑（见 1.3 节） |
+| **可查询 State** | `setQueryable(String name)` | 允许外部客户端查询此 State（Queryable State，生产少用） |
 
 **TTL 的三个 UpdateType 选项说明**：
 
@@ -398,18 +457,67 @@ MapState<String, Long> clickMap = getRuntimeContext().getMapState(mapDesc);
 **注意**：State TTL 的清理不是精确的——过期数据不会立刻被删除，而是在下次访问或 RocksDB Compaction 时才被清理。如果需要更及时的清理，可以用 Timer 回调主动删除：
 
 ```java
-// 用 Timer 主动清理过期状态（比 TTL 更精确）
-public void processElement(Event event, Context ctx, Collector<Result> out) {
-    state.update(event);
-    // 注册一个 24 小时后的 Timer，到期后主动清理
-    ctx.timerService().registerEventTimeTimer(event.getTimestamp() + 24 * 3600 * 1000);
+// ===== Timer 主动清理的完整外部框架 =====
+// 同样继承 KeyedProcessFunction，泛型：<KEY类型, 输入类型, 输出类型>
+public class EventStateWithTimer extends KeyedProcessFunction<String, Event, Result> {
+
+    private transient ValueState<Event> state;
+
+    @Override
+    public void open(Configuration parameters) throws Exception {
+        // State 在 open() 中初始化（不带 TTL，由 Timer 手动控制清理时机）
+        ValueStateDescriptor<Event> descriptor =
+            new ValueStateDescriptor<>("event-state", Event.class);
+        state = getRuntimeContext().getState(descriptor);
+    }
+
+    /**
+     * processElement() —— 每条数据到达时调用
+     * 写入 State，并注册一个 24 小时后的 Timer
+     */
+    @Override
+    public void processElement(Event event, Context ctx, Collector<Result> out) throws Exception {
+        state.update(event);
+        // 注册一个 24 小时后的事件时间 Timer
+        // registerEventTimeTimer：基于事件时间（Watermark 推进时触发）
+        // registerProcessingTimeTimer：基于处理时间（系统时钟到达时触发）
+        ctx.timerService().registerEventTimeTimer(event.getTimestamp() + 24 * 3600 * 1000L);
+    }
+
+    /**
+     * onTimer() —— Timer 到期时由 Flink 框架回调
+     * 注意：onTimer 和 processElement 不会并发执行（同一个 key 串行），无需加锁
+     *
+     * @param timestamp  触发的 Timer 时间戳（就是注册时传入的那个值）
+     * @param ctx        OnTimerContext，可以获取当前 key、时间域等信息
+     * @param out        输出收集器，可以在 Timer 回调里输出结果
+     */
+    @Override
+    public void onTimer(long timestamp, OnTimerContext ctx, Collector<Result> out) throws Exception {
+        // Timer 到期，主动清理 State（比 TTL 更精确，精确到毫秒）
+        state.clear();
+        // 也可以在这里输出一个超时告警：
+        // out.collect(new Result(ctx.getCurrentKey(), "expired"));
+    }
 }
 
-@Override
-public void onTimer(long timestamp, OnTimerContext ctx, Collector<Result> out) {
-    state.clear();  // Timer 到期，主动清理状态
-}
+// ===== 使用方式：接入 DataStream =====
+DataStream<Event> eventStream = ...;
+DataStream<Result> result = eventStream
+    .keyBy(Event::getUserId)                    // 按 userId 分区，State 按 key 隔离
+    .process(new EventStateWithTimer());         // 挂载上面的 ProcessFunction
 ```
+
+**`KeyedProcessFunction` 的核心能力对比**：
+
+| 能力 | KeyedProcessFunction | WindowFunction | FlatMapFunction |
+|------|---------------------|----------------|-----------------|
+| **访问 State** | ✅ 任意 State 类型 | ✅ 窗口内 State | ❌ 无 State |
+| **注册 Timer** | ✅ 事件时间 + 处理时间 | ❌ | ❌ |
+| **侧输出（Side Output）** | ✅ | ✅ | ❌ |
+| **访问当前 key** | ✅ `ctx.getCurrentKey()` | ✅ | ❌ |
+| **灵活性** | 最高（完全自定义触发逻辑） | 中（窗口触发） | 最低（无状态） |
+| **典型场景** | 去重、CEP、超时检测、自定义窗口 | 标准时间窗口聚合 | 无状态转换 |
 
 **检查聚合 key 粒度是否合理**：key 粒度对 State 总量的影响取决于你在 State 里存什么。需要分两种情况理解：
 
