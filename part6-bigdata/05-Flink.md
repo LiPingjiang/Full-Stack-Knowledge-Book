@@ -18,7 +18,7 @@
   - [3.2 数据传输与 Network Buffer](#32-数据传输与-network-buffer)
 - [四、容错机制——Checkpoint + Exactly-Once](#四容错机制checkpoint--exactly-once)
   - [4.1 Checkpoint（检查点）](#41-checkpoint检查点)
-    - Chandy-Lamport 分布式快照算法
+    - [Chandy-Lamport 分布式快照算法](../part3-java-deep/A9-Chandy-Lamport分布式快照算法.md)
     - Watermark 与 Barrier 的区别
     - 非对齐 Checkpoint（Unaligned Checkpoint）
     - 生产环境 Checkpoint 配置
@@ -585,9 +585,9 @@ TaskManager 之间的数据传输以 **Network Buffer** 为最小单位（默认
 
 ### 4.1 Checkpoint（检查点）
 
-#### Chandy-Lamport 分布式快照算法
+#### [Chandy-Lamport 分布式快照算法](../part3-java-deep/A9-Chandy-Lamport分布式快照算法.md)
 
-Flink 的容错核心是 **Chandy-Lamport 分布式快照算法**。这个算法解决的问题是：在一个持续流动的分布式数据流中，如何在不暂停计算的情况下，给整个系统拍一个一致的"全局快照"。
+Flink 的容错核心是 **[Chandy-Lamport 分布式快照算法](../part3-java-deep/A9-Chandy-Lamport分布式快照算法.md)**。这个算法解决的问题是：在一个持续流动的分布式数据流中，如何在不暂停计算的情况下，给整个系统拍一个一致的"全局快照"。
 
 核心思路是引入 **Marker（标记消息）**——在 Chandy-Lamport 原始论文中叫 marker，Flink 里叫 **Barrier（屏障）**。它是一种特殊的控制消息，混在数据流里跟普通数据一起传输，思路跟 Watermark 类似。
 
