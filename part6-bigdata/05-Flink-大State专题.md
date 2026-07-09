@@ -885,6 +885,47 @@ cp-3（增量）：本地 [D E F]（A B 被 Compaction 删了，新增 F）
 
 **增量链的隐患**：随着时间推移，manifest 引用的文件可能散落在几十个历史 cp 目录里，恢复时需要从 HDFS 下载大量分散文件，恢复时间可能比全量 Checkpoint 还长。Flink 通过 `state.checkpoints.num-retained` 控制保留数量，旧目录自动清理（被引用的 SST 文件受引用计数保护不会误删）。
 
+**恢复时需要多少文件？——取决于 manifest 清单，而非 Checkpoint 次数**
+
+```
+关键认知：恢复一个增量 Checkpoint 不需要"回溯所有历史增量"
+
+恢复所需的文件数 = 当前 RocksDB 实例中实际存在的 SST 文件数
+（不是 Checkpoint 次数，也不是增量链长度）
+
+原因：manifest 记录的是"当前时刻 RocksDB 里有哪些 SST 文件"
+      这些文件可能来自不同历史 cp 目录，但总数 = 当前活跃的 SST 文件数
+
+示例：State 100GB，RocksDB 当前有 500 个 SST 文件
+
+  全量 Checkpoint 恢复：
+    下载 1 个 cp 目录里的 500 个文件 → 100GB
+    来源集中，下载快
+
+  增量 Checkpoint 恢复（假设已经跑了 50 次增量 cp）：
+    读 manifest → 仍然是 500 个文件（= 当前活跃的 SST 数量）
+    但这 500 个文件散落在多个历史 cp 目录里：
+      200 个来自 cp-48（上上次 Compaction 产物）
+      150 个来自 cp-49（上次 Compaction 产物）
+      150 个来自 cp-50（本次新增）
+    总下载量仍然 ≈ 100GB（和全量一样）
+    但需要从 3 个目录分别拉取 → 更多 HDFS 元数据操作 → 可能更慢
+
+  为什么不是"回溯 50 次增量叠加"？
+    因为 Compaction 会合并旧 SST 文件为新文件
+    旧文件被删除后，manifest 不再引用它们
+    所以 manifest 里的文件数 ≈ 当前活跃 SST 数，不会随 cp 次数线性增长
+
+  什么时候增量恢复真的比全量慢？
+    当 state.checkpoints.num-retained 设得很大（如 10）
+    且 Compaction 不频繁（旧文件长期不被合并）
+    → manifest 引用的文件散落在 10 个 cp 目录里
+    → HDFS 需要打开 10 个目录、逐个定位文件
+    → 元数据开销 + 小文件随机读 → 比集中下载一个全量目录慢
+```
+
+> **生产建议**：`state.checkpoints.num-retained` 设为 2~3（默认 1 太少，故障时没有备选；太多则增量链过长，恢复变慢）。如果恢复速度是硬性要求（如 SLA < 5 分钟），可以定期手动触发 Savepoint（全量快照），作为快速恢复的基线。
+
 **为什么大 State 的 Checkpoint 瓶颈是上传？** 运行时 RocksDB 的读写性能可以通过 SSD、Block Cache、增加并行度来解决，但 Checkpoint 时必须把 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#112-sst-文件是什么)上传到 HDFS/S3，这个过程受网络带宽限制。
 
 **"State 大导致 Checkpoint 慢"的精确触发条件**（不只是全量）：
