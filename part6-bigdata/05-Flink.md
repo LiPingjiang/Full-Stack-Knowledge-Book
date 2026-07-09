@@ -10,19 +10,9 @@
 - [二、核心概念](#二核心概念)
   - [2.1 事件时间 vs 处理时间](#21-事件时间-vs-处理时间)
   - [2.2 Watermark（水位线）——解决乱序](#22-watermark水位线解决乱序)
-    - Watermark 解决乱序的本质
-    - Watermark 生成逻辑：maxTimestamp 只增不减
-    - Watermark 不是数据字段，是流里的特殊记录
-    - 每个 Task 维护一个事件时间时钟
-    - Watermark 实时处理，单调递增不回退
-    - Watermark 不仅驱动窗口
-    - Watermark 的代码示例
+    - Watermark 解决乱序的本质 / 生成逻辑 / 特殊记录 / 时钟 / 单调递增 / 代码示例
   - [2.3 窗口（Window）](#23-窗口window)
-    - 滚动窗口（Tumbling Window）
-    - 滑动窗口（Sliding Window）
-    - 会话窗口（Session Window）
-    - 累积窗口（Cumulative Window）
-    - 全局窗口（Global Window）+ 自定义触发器
+    - 滚动 / 滑动 / 会话 / 累积 / 全局窗口
 - [三、架构](#三架构)
   - [3.1 算子链（Operator Chain）](#31-算子链operator-chain)
   - [3.2 数据传输与 Network Buffer](#32-数据传输与-network-buffer)
@@ -30,63 +20,53 @@
   - [4.1 Checkpoint（检查点）](#41-checkpoint检查点)
     - Chandy-Lamport 分布式快照算法
     - Watermark 与 Barrier 的区别
-    - 非对齐 Checkpoint（Unaligned Checkpoint）的精确原理
+    - 非对齐 Checkpoint（Unaligned Checkpoint）
     - 生产环境 Checkpoint 配置
-  - [4.2 端到端 Exactly-Once 语义](#42-端到端-exactly-once-语义)
-    - Checkpoint 与两阶段提交（2PC）的关系
-    - 4.2.1 幂等写入
-    - 4.2.2 事务写入
-    - 4.2.3 两阶段提交的完整时序
-    - 4.2.4 2PC 对外部 Sink 系统的要求
-    - 4.2.5 Flink + Kafka 端到端 Exactly-Once
-    - 4.2.6 生产环境配置与常见踩坑
-    - 4.2.7 API 演进：FlinkKafkaProducer 与 KafkaSink
-    - 4.2.8 2PC 与 at-least-once + 幂等的权衡
+    - Flink Checkpoint vs Spark Checkpoint
+  - [4.2 消息投递语义（Delivery Semantics）](#42-消息投递语义delivery-semantics)
+    - At-Most-Once / At-Least-Once / Exactly-Once 实现原理
+  - [4.3 端到端 Exactly-Once 语义](#43-端到端-exactly-once-语义)（[2PC 通用原理 →](../part3-java-deep/A3-两阶段提交.md)）
+    - 4.3.1 幂等写入
+    - 4.3.2 事务写入（WAL / 2PC）
+    - 4.3.3 两阶段提交的完整时序
+    - 4.3.4 2PC 对外部 Sink 系统的要求
+    - 4.3.5 Flink + Kafka 端到端 Exactly-Once
+    - 4.3.6 生产环境配置与常见踩坑
+    - 4.3.7 API 演进：FlinkKafkaProducer 与 KafkaSink
+    - 4.3.8 2PC 与 at-least-once + 幂等的权衡
 - [五、背压（Backpressure）](#五背压backpressure)
   - [5.1 什么是背压](#51-什么是背压)
-  - [5.2 背压的产生原理](#52-背压的产生原理)
-  - [5.3 如何定位背压](#53-如何定位背压)
+  - [5.2 背压的产生原理（Credit-based 流控）](#52-背压的产生原理)
+  - [5.3 如何定位背压（Web UI + Metrics）](#53-如何定位背压)
   - [5.4 常见根因与解决方案](#54-常见根因与解决方案)
   - [5.5 背压与 Checkpoint 的关系](#55-背压与-checkpoint-的关系)
 - [六、状态管理](#六状态管理)
-  - [6.1 State 分类](#61-state-分类)
-    - Broadcast State 详解
+  - [6.1 State 分类](#61-state-分类)（Keyed / Operator / Broadcast State）
   - [6.1.1 State TTL（状态过期清理）](#611-state-ttl状态过期清理)
   - [6.2 为算子设置 UID——Savepoint 恢复的关键](#62-为算子设置-uidsavepoint-恢复的关键)
-  - [6.3 State 存储后端](#63-state-存储后端)
-    - RocksDB 增量 Checkpoint 原理
-    - LSM-Tree 的三种放大效应 → [详见 A1 附录](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)
-    - 增量 vs 全量 Checkpoint 的选择
+  - [6.3 State 存储后端](#63-state-存储后端)（RocksDB 增量 Checkpoint / LSM-Tree 放大效应）
   - [6.4 State 重分布——改变并行度时的状态分配](#64-state-重分布改变并行度时的状态分配)
   - [6.5 最大并行度（Max Parallelism）](#65-最大并行度max-parallelism)
   - [6.6 Savepoint 恢复规则](#66-savepoint-恢复规则)
   - [6.7 大 State 处理策略（体系化排查思路）→ 详见大 State 专题](./05-Flink-大State专题.md)
 - [七、Flink SQL](#七flink-sql)
   - [7.1 Flink SQL 调优](#71-flink-sql-调优)
-    - 7.1.1 MiniBatch 微批处理（提升吞吐）
-    - 7.1.2 LocalGlobal 两阶段聚合（解决数据热点）
-    - 7.1.3 Split Distinct（解决 COUNT DISTINCT 热点）
-    - 7.1.4 AGG WITH FILTER（多维 COUNT DISTINCT 共享状态）
-    - 7.1.5 TopN 优化
-    - 7.1.6 SQL 调优参数总结
-  - [7.2 KafkaSource 调优](#72-kafkasource-调优)
-    - 7.2.1 动态发现分区（新旧 API 对比）
-    - 7.2.2 per-partition Watermark 生成
-    - 7.2.3 空闲分区处理（withIdleness）
-    - 7.2.4 Kafka offset 消费策略
-    - 7.2.5 并行度设置实践
+    - MiniBatch / LocalGlobal / Split Distinct / AGG WITH FILTER / TopN
+  - [7.2 KafkaSource 调优](#72-kafkasource-调优)（新旧 API 对比）
+    - 动态分区发现 / per-partition Watermark / 空闲分区 / offset 策略 / 并行度
   - [7.3 双流 Join](#73-双流-join)
-    - Regular Join（常规双流 Join）
-    - Interval Join（时间区间 Join）
-    - Temporal Join（时态 Join）
-    - Lookup Join（维表 Join）
-    - Join 选型指南
+    - Regular / Interval / Temporal / Lookup Join + 选型指南
+  - [7.4 Metrics 监控体系](#74-metrics-监控体系)
+    - Gauge / Counter / Meter / Histogram 四种类型
+    - 内置关键 Metrics（吞吐 / 背压 / Checkpoint / 状态）
+    - Metric Reporter（Prometheus / JMX / 自定义）
 - [八、面试深度剖析 → 详见面试专题](./05-Flink-面试深度剖析.md)
 
 **附录文档**：
 - [05-Flink-大State专题.md](./05-Flink-大State专题.md) — 大 State 体系化排查与优化
 - [05-Flink-配置参数速查.md](./05-Flink-配置参数速查.md) — RocksDB / Checkpoint / 并行度等完整配置参数
 - [05-Flink-面试深度剖析.md](./05-Flink-面试深度剖析.md) — 20 个高频面试考点深度解析
+- [A3-两阶段提交.md](../part3-java-deep/A3-两阶段提交.md) — 2PC 通用原理（数据库 / 分布式 / Flink 三个战场）
 ---
 
 ## 一、流处理的核心挑战
@@ -678,13 +658,91 @@ Flink 1.11+ 可以通过代码 `env.getCheckpointConfig().enableUnalignedCheckpo
 任务失败时，从最近一次成功的 Checkpoint 恢复 State，数据源（如 Kafka）从对应 offset 重放，实现 **Exactly-Once** 语义。
 
 
-### 4.2 端到端 Exactly-Once 语义
+#### Flink Checkpoint vs Spark Checkpoint
+
+Flink 和 Spark 都提供了 Checkpoint 机制，但设计哲学和实现方式有本质区别：
+
+| 对比维度 | Flink Checkpoint | Spark Checkpoint |
+|---------|-----------------|-----------------|
+| **设计目标** | 为有状态流处理提供精确一次容错 | 为 RDD 血缘链过长时截断 lineage，加速恢复 |
+| **触发方式** | JobManager 定期自动触发（可配置间隔） | 用户手动调用 `rdd.checkpoint()` 或 Structured Streaming 自动触发 |
+| **快照算法** | 基于 Chandy-Lamport 分布式快照（Barrier 对齐） | 无分布式快照算法，直接将 RDD/状态写入 HDFS |
+| **快照粒度** | 每个算子（Operator）的状态 + 流中数据位置（如 Kafka offset） | Driver 元数据 + RDD 数据（Spark Streaming）；或算子状态（Structured Streaming） |
+| **增量快照** | 支持（RocksDB 增量 Checkpoint，只上传新增 SST 文件） | 不支持，每次全量写入 |
+| **异步快照** | 支持（异步写入不阻塞数据处理） | 同步写入（Checkpoint 期间阻塞计算） |
+| **一致性语义** | 支持 Exactly-Once 和 At-Least-Once | Spark Streaming 仅保证 At-Least-Once；Structured Streaming 支持 Exactly-Once |
+| **恢复粒度** | 单个算子级别恢复，精确到每个 SubTask 的状态 | 作业级别恢复，整个 Stage 重算 |
+| **恢复速度** | 快（只恢复受影响的算子状态） | 慢（需要从 HDFS 读取完整 RDD 或重算 Stage） |
+| **对运行性能的影响** | 轻量（异步 + 增量，对吞吐影响小） | 较重（同步全量写入，Checkpoint 期间吞吐下降明显） |
+| **存储位置** | 可配置：HDFS / S3 / 本地（State Backend 决定） | 通常是 HDFS |
+
+**一句话总结**：Flink Checkpoint 是"持续的、细粒度的、异步的分布式快照"，Spark Checkpoint 是"偶尔的、粗粒度的、同步的全量持久化"。Flink 的设计更适合 7×24 小时不间断运行的流处理场景。
+
+---
+
+### 4.2 消息投递语义（Delivery Semantics）
+
+在讨论端到端一致性之前，需要先理解三种消息投递语义——它们定义了"一条数据从产生到最终处理完成，会被处理几次"：
+
+| 语义 | 含义 | 数据风险 | Flink 实现方式 |
+|------|------|---------|--------------|
+| **At-Most-Once（至多一次）** | 数据最多被处理一次，可能丢失 | 丢数据 | 不开启 Checkpoint（故障后不回溯，丢失未处理的数据） |
+| **At-Least-Once（至少一次）** | 数据至少被处理一次，可能重复 | 数据重复 | 开启 Checkpoint + `EXACTLY_ONCE` 模式关闭 Barrier 对齐（或设置 `AT_LEAST_ONCE` 模式） |
+| **Exactly-Once（精确一次）** | 数据恰好被处理一次，不丢不重 | 无 | 开启 Checkpoint + Barrier 对齐（Flink 内部）；端到端还需 Source 可重放 + Sink 事务/幂等 |
+
+#### At-Most-Once 的实现
+
+最简单——**不开启 Checkpoint**。数据处理完就丢弃，故障后从最新位置重新消费（不回溯），中间丢失的数据不会被重新处理。
+
+适用场景：对数据完整性要求不高的监控、日志采样等。
+
+#### At-Least-Once 的实现
+
+开启 Checkpoint，但**不做 Barrier 对齐**（或显式设置 `CheckpointingMode.AT_LEAST_ONCE`）：
+
+```java
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.AT_LEAST_ONCE);
+```
+
+不对齐意味着：当多输入算子收到第一个输入的 Barrier 后，**不暂停该输入**，继续处理所有输入的数据。这样 Barrier 之后的数据可能在快照之前就被处理了，故障恢复时这些数据会被重新处理一次——导致重复。
+
+**优点**：没有对齐等待，延迟更低，Checkpoint 更快完成。
+**代价**：下游可能收到重复数据，需要业务层或 Sink 层做幂等去重。
+
+#### Exactly-Once 的实现（Flink 内部）
+
+开启 Checkpoint + **Barrier 对齐**（默认模式）：
+
+```java
+env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+```
+
+Barrier 对齐确保：快照中的状态精确对应 Barrier 之前的所有数据，Barrier 之后的数据不会被提前处理。故障恢复时，从快照恢复状态 + 从 Source 重放 Barrier 位置之后的数据，每条数据恰好被处理一次。
+
+**注意**：这里的 Exactly-Once 只保证 **Flink 内部状态**的一致性。要实现端到端 Exactly-Once（包括外部系统），还需要 Sink 端配合（2PC 事务或幂等写入），详见下一节。
+
+#### 端到端 Exactly-Once 的实现
+
+端到端 Exactly-Once = Flink 内部 Exactly-Once + Source 可重放 + Sink 事务/幂等：
+
+```
+Source（可重放，如 Kafka offset）
+  + Flink 内部（Checkpoint + Barrier 对齐）
+  + Sink（2PC 事务提交 或 幂等写入）
+= 端到端 Exactly-Once
+```
+
+具体实现方式详见下一节 §4.3。
+
+---
+
+### 4.3 端到端 Exactly-Once 语义
 
 #### Checkpoint 与两阶段提交（2PC）的关系
 
 首先需要澄清一个常见误区：**Checkpoint 本身只保证 Flink 内部算子状态的 exactly-once**——即算子状态在故障恢复后不丢不重。但 Checkpoint 不负责 Sink 写入外部系统（如 Kafka、MySQL）的一致性。如果 Sink 在 Checkpoint 完成后、数据真正写入外部系统前崩溃，外部系统仍可能丢失或重复数据。
 
-**两阶段提交（2PC）解决的是 Sink 端与外部系统的一致性**。它不是在替代 Checkpoint，而是在 Checkpoint 保证内部一致性的基础上，**额外保证外部系统的一致性**。两者的关系是协作：Checkpoint 负责"算子状态不丢不重"，2PC 负责"外部写入不丢不重"。只有 Sink 需要事务时，才需要 2PC；Source 端只需要支持按 offset 重放（不需要 2PC）。
+**[两阶段提交（2PC）](../part3-java-deep/A3-两阶段提交.md)解决的是 Sink 端与外部系统的一致性**。它不是在替代 Checkpoint，而是在 Checkpoint 保证内部一致性的基础上，**额外保证外部系统的一致性**。两者的关系是协作：Checkpoint 负责"算子状态不丢不重"，2PC 负责"外部写入不丢不重"。只有 Sink 需要事务时，才需要 2PC；Source 端只需要支持按 offset 重放（不需要 2PC）。
 
 Exactly-Once 不是 Flink 单方面保证的，而是整个数据管道所有组件一致性的**木桶效应**——整个端到端一致性级别取决于所有组件中最弱的一环。具体可以划分为三个层面：
 
@@ -696,11 +754,11 @@ Exactly-Once 不是 Flink 单方面保证的，而是整个数据管道所有组
 
 Flink 通过**两阶段提交（2PC）**协议与支持事务的 Sink（如 Kafka 0.11+）配合，实现真正的端到端 Exactly-Once。
 
-#### 4.2.1 幂等写入（Idempotent Writes）
+#### 4.3.1 幂等写入（Idempotent Writes）
 
 幂等操作是指重复执行多次，只导致一次结果更改。如果 Sink 系统天然支持幂等（如按主键去重的数据库、按 doc id 索引的 Elasticsearch），可以用 **at-least-once + 下游幂等** 替代 2PC，性能更好。典型做法是：为每条数据生成唯一标识（如业务主键），Sink 写入时冲突即覆盖或忽略。
 
-#### 4.2.2 事务写入
+#### 4.3.2 事务写入
 
 事务写入的核心思想是：**构建的事务对应着 Checkpoint，等到 Checkpoint 真正完成时，才把所有对应结果写入 Sink 系统**。DataStream API 提供了 `GenericWriteAheadSink`（预写日志 WAL）和 `TwoPhaseCommitSinkFunction`（两阶段提交）两种事务性写入模板。
 
@@ -710,7 +768,9 @@ Flink 通过**两阶段提交（2PC）**协议与支持事务的 Sink（如 Kafk
 
 ##### 两阶段提交（2PC）
 
-两阶段提交协议（Two-Phase Commit）是分布式系统中协调多节点事务一致性的经典算法。在 Flink 中，它被用来协调 Sink 与 Checkpoint 的提交节奏：
+> 2PC 的通用原理（协调者/参与者模型、Prepare/Commit 两阶段、故障场景分析）详见 [附录 A3：两阶段提交](../part3-java-deep/A3-两阶段提交.md)。本节只讲 Flink 中 2PC 与 Checkpoint 的协作方式。
+
+两阶段提交协议（Two-Phase Commit）是分布式系统中协调多节点事务一致性的经典算法。在 Flink 中，它被用来协调 Sink 与 Checkpoint 的提交节奏：在 Flink 中，它被用来协调 Sink 与 Checkpoint 的提交节奏：
 
 **第一阶段（预提交）**：当 Checkpoint 启动时，JobManager 向数据流注入 Barrier。Sink 收到 Barrier 后，将当前事务中的数据写入外部系统（如 Kafka），但**不提交**——此时数据处于预提交状态，对外部消费者不可见（Kafka 的 `read_committed` 隔离级别下）。然后 Sink 将当前事务 ID 等状态保存到 Checkpoint。
 
@@ -718,7 +778,7 @@ Flink 通过**两阶段提交（2PC）**协议与支持事务的 Sink（如 Kafk
 
 如果 Checkpoint 失败或作业崩溃，Flink 从最近一次成功的 Checkpoint 恢复，Sink 会重新执行 `commit()`（因为 Checkpoint 中已记录待提交的事务信息）。这要求**提交操作必须是幂等的**——Kafka 在相同事务 ID 下重复调用 `commitTransaction` 是安全的。
 
-#### 4.2.3 两阶段提交的完整时序
+#### 4.3.3 两阶段提交的完整时序（[2PC 通用原理 →](../part3-java-deep/A3-两阶段提交.md)）
 
 以 Flink + Kafka 为例，端到端 exactly-once 的时序如下：
 
@@ -746,7 +806,7 @@ sequenceDiagram
 
 关键点：预提交阶段的数据已写入 Kafka 的日志，但消费者通过 `read_committed` 隔离级别看不到；只有 `commitTransaction` 后，事务内消息才从 `uncommitted` 变为 `committed`。
 
-#### 4.2.4 2PC 对外部 Sink 系统的要求
+#### 4.3.4 2PC 对外部 Sink 系统的要求
 
 并非所有 Sink 都支持 2PC，需要满足以下条件：
 
@@ -756,7 +816,7 @@ sequenceDiagram
 - Sink 必须能在**进程失败后恢复事务**（通过 Checkpoint 中的事务状态）。
 - **提交事务必须是幂等操作**（支持重复提交相同事务）。
 
-#### 4.2.5 Flink + Kafka 端到端 Exactly-Once
+#### 4.3.5 Flink + Kafka 端到端 Exactly-Once
 
 Flink + Kafka 是经典的端到端 exactly-once 数据管道（Kafka 进、Kafka 出）。各组件的职责如下：
 
@@ -782,7 +842,7 @@ producer.send(new ProducerRecord<>("topic", "key", "value"));
 producer.commitTransaction(); // 或 abortTransaction()
 ```
 
-#### 4.2.6 生产环境配置与常见踩坑
+#### 4.3.6 生产环境配置与常见踩坑
 
 **事务超时与 Checkpoint 间隔的匹配**
 
@@ -806,7 +866,7 @@ KafkaSink<String> sink = KafkaSink.<String>builder()
 - `transactional.id` 冲突：同一个 `transactional.id` 不能同时被两个 Producer 实例使用，否则 Kafka 会报错。Flink 通过 `subtaskIndex` 来生成唯一的事务 ID，确保每个并行子任务互不冲突。
 - 事务协调器故障：Kafka 的 Transaction Coordinator 负责管理事务状态，如果 Coordinator 发生故障转移，正在等待提交的 2PC 事务可能会超时，需要合理设置超时参数。
 
-#### 4.2.7 API 演进：FlinkKafkaProducer 与 KafkaSink
+#### 4.3.7 API 演进：FlinkKafkaProducer 与 KafkaSink
 
 Flink 的 Kafka Sink API 经历了演进：
 
@@ -827,7 +887,7 @@ KafkaSink<String> sink = KafkaSink.<String>builder()
 stream.sinkTo(sink);
 ```
 
-#### 4.2.8 2PC 与 at-least-once + 幂等的权衡
+#### 4.3.8 2PC 与 at-least-once + 幂等的权衡
 
 | 方案 | 优点 | 缺点 | 适用场景 |
 |------|------|------|---------|
@@ -1760,6 +1820,129 @@ ON o.user_id = u.user_id;
 两条流，需要全量历史关联，或数据量小？
   → Regular Join（必须设 State TTL）
 ```
+
+
+### 7.4 Metrics 监控体系
+
+Flink 提供了一套完整的 Metrics 框架，让任务运行状态从"黑盒"变为"可观测"。通过分析 Metrics，可以定位背压、调整资源、监控 Checkpoint 稳定性、排查数据倾斜等问题。
+
+#### 7.4.1 四种 Metric 类型
+
+Flink 的所有指标都实现了 `Metric` 接口，分为四种类型：
+
+| 类型 | 含义 | 典型用途 | 示例 |
+|------|------|---------|------|
+| **Gauge** | 瞬时值，直接返回当前状态 | 队列当前长度、内存使用量 | `numRecordsInFlight`（当前在途记录数） |
+| **Counter** | 累计计数，支持 `inc()` / `dec()` | 处理记录总数、错误次数 | `numRecordsIn`（累计输入记录数） |
+| **Meter** | 速率，事件发生的频率（TPS/QPS） | 吞吐量监控 | `numRecordsInPerSecond`（每秒输入记录数） |
+| **Histogram** | 分布统计，含最大/最小/平均/分位数 | 延迟分布、处理时间分布 | `latency`（端到端延迟分布） |
+
+#### 7.4.2 自定义 Metric
+
+在算子中通过 `getRuntimeContext().getMetricGroup()` 注册自定义指标：
+
+```java
+// Counter 示例：统计处理记录数
+public class MyMapper extends RichMapFunction<String, String> {
+    private transient Counter processedCounter;
+    private transient Gauge<Integer> queueSizeGauge;
+
+    @Override
+    public void open(Configuration config) {
+        // 注册 Counter
+        this.processedCounter = getRuntimeContext()
+            .getMetricGroup()
+            .counter("processedRecords");
+
+        // 注册 Gauge（返回当前队列大小）
+        this.queueSizeGauge = getRuntimeContext()
+            .getMetricGroup()
+            .gauge("queueSize", () -> myQueue.size());
+    }
+
+    @Override
+    public String map(String value) throws Exception {
+        processedCounter.inc();
+        return value;
+    }
+}
+```
+
+#### 7.4.3 Flink 内置关键 Metrics
+
+**吞吐量相关**：
+
+| Metric 名称 | 含义 | 监控建议 |
+|------------|------|---------|
+| `numRecordsInPerSecond` | 算子每秒输入记录数 | 与上游对比，差距大说明有背压 |
+| `numRecordsOutPerSecond` | 算子每秒输出记录数 | 与下游对比，差距大说明下游是瓶颈 |
+| `numBytesInPerSecond` | 每秒输入字节数 | 评估网络带宽占用 |
+
+**背压相关**（详见 §五 背压章节）：
+
+| Metric 名称 | 含义 | 判断口诀 |
+|------------|------|---------|
+| `outPoolUsage` | 输出缓冲区使用率（0~1） | **Out 高看下游**：下游处理慢 |
+| `inPoolUsage` | 输入缓冲区使用率（0~1） | **In 高看自己**：本算子处理慢 |
+| `busyTimeMsPerSecond` | 每秒算子繁忙时间（ms） | 接近 1000 说明满负荷 |
+| `backPressuredTimeMsPerSecond` | 每秒被背压阻塞时间（ms） | > 0 说明被下游拖住 |
+
+**Checkpoint 相关**：
+
+| Metric 名称 | 含义 | 监控建议 |
+|------------|------|---------|
+| `lastCheckpointDuration` | 最近一次 Checkpoint 耗时（ms） | 持续增大说明有背压或状态膨胀 |
+| `lastCheckpointSize` | 最近一次 Checkpoint 大小（bytes） | 持续增大说明 State 在膨胀 |
+| `numberOfFailedCheckpoints` | 失败的 Checkpoint 次数 | > 0 需立即排查 |
+| `numberOfCompletedCheckpoints` | 成功完成的 Checkpoint 次数 | 与失败次数对比 |
+
+**状态相关**：
+
+| Metric 名称 | 含义 |
+|------------|------|
+| `managedMemoryUsed` | RocksDB 托管内存使用量 |
+| `rocksdb.estimate-live-data-size` | RocksDB 估算的有效数据大小 |
+
+#### 7.4.4 Metric Reporter（上报到外部系统）
+
+Flink 支持将 Metrics 上报到多种外部监控系统：
+
+| Reporter | 说明 | 适用场景 |
+|---------|------|---------|
+| **Prometheus** | 最常用，配合 Grafana 做可视化 | 生产环境首选 |
+| **JMX** | Java 自带，无需额外依赖 | 本地调试 |
+| **InfluxDB** | 时序数据库，适合高频指标 | 高精度监控 |
+| **Graphite** | 老牌监控系统 | 遗留系统集成 |
+| **Slf4j** | 直接打印到日志 | 快速调试 |
+
+**Prometheus Reporter 配置示例**（`flink-conf.yaml`）：
+
+```yaml
+metrics.reporters: prometheus
+metrics.reporter.prometheus.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+metrics.reporter.prometheus.port: 9249
+```
+
+**自定义 Reporter**：实现 `MetricReporter` 接口，重写四个方法：
+
+```java
+public interface MetricReporter {
+    void open(MetricConfig config);      // 初始化（连接外部系统）
+    void close();                         // 关闭（释放资源）
+    void notifyOfAddedMetric(Metric metric, String metricName, MetricGroup group);   // 新 Metric 注册时回调
+    void notifyOfRemovedMetric(Metric metric, String metricName, MetricGroup group); // Metric 移除时回调
+}
+```
+
+如果需要定期上报（而不是事件驱动），还需实现 `Scheduled` 接口，在 `report()` 方法中批量推送数据到外部系统。
+
+#### 7.4.5 获取 Metrics 的三种方式
+
+| 方式 | 适用场景 | 说明 |
+|------|---------|------|
+| **Flink Web UI** | 快速查看，定位问题 | 直观，但历史数据有限 |
+| **REST API** | 自动化脚本、程序集成 | `GET /jobs/:jobid/vertices/:vertexid/metrics` |
+| **Metric Reporter** | 生产监控、告警 | 推送到 Prometheus/Grafana，支持历史趋势和告警规则 |
 
 
 ---
