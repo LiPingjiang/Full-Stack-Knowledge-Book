@@ -722,7 +722,48 @@ sequenceDiagram
     HDFS-->>JM: 5. 上传完成，确认 Checkpoint
 ```
 
-**为什么大 State 的 Checkpoint 瓶颈是上传而不是运行时？** 运行时 RocksDB 的读写性能可以通过 SSD、Block Cache、增加并行度来解决，但 Checkpoint 时必须把所有 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#112-sst-文件是什么)（全量）或新增 SST 文件（增量）上传到 HDFS/S3，这个过程受网络带宽限制。10GB 的 State 即使用增量 Checkpoint，首次全量上传仍然需要几十秒；增量链过长时，恢复需要回溯多个增量快照叠加，恢复时间可能比全量 Checkpoint 还长。
+**增量 Checkpoint 的工作机制**：Flink 的增量 Checkpoint 不是"定期打全量 + 后续打增量"的模式，而是**每次都增量**（首次除外）。它依赖 SST 文件的不可变性——SST 文件一旦生成就不会被修改，上次已上传的文件这次不需要重传，只上传新增的 SST 文件，并记录一份 manifest（文件清单）指向所有需要的文件（可能散落在多个历史 Checkpoint 目录里）。
+
+```
+增量 Checkpoint 示意：
+
+cp-1（首次，必须全量）：本地 [A B C]（10GB）→ 全部上传
+  manifest-1：{ A, B, C }
+
+cp-2（增量）：本地 [A B D E]（C 被 Compaction 删了，新增 D E）
+  只上传 D + E → HDFS/cp-2/
+  manifest-2：{ A←cp-1, B←cp-1, D, E }   ← A B 直接引用 cp-1，不重传
+
+cp-3（增量）：本地 [D E F]（A B 被 Compaction 删了，新增 F）
+  只上传 F → HDFS/cp-3/
+  manifest-3：{ D←cp-2, E←cp-2, F }
+
+恢复到 cp-3：读 manifest-3 → 下载 D（cp-2）+ E（cp-2）+ F（cp-3）
+  → 不需要 cp-1，因为 A B 已经被 Compaction 合并进更新的文件了
+  → 只需按 manifest 清单下载所需文件，无需"找全量再叠增量"
+```
+
+**增量链的隐患**：随着时间推移，manifest 引用的文件可能散落在几十个历史 cp 目录里，恢复时需要从 HDFS 下载大量分散文件，恢复时间可能比全量 Checkpoint 还长。Flink 通过 `state.checkpoints.num-retained` 控制保留数量，旧目录自动清理（被引用的 SST 文件受引用计数保护不会误删）。
+
+**为什么大 State 的 Checkpoint 瓶颈是上传？** 运行时 RocksDB 的读写性能可以通过 SSD、Block Cache、增加并行度来解决，但 Checkpoint 时必须把 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#112-sst-文件是什么)上传到 HDFS/S3，这个过程受网络带宽限制。
+
+**"State 大导致 Checkpoint 慢"的精确触发条件**（不只是全量）：
+
+```
+① 首次 Checkpoint（增量模式下）：必须全量上传，State 100GB → 上传 100GB
+   → 这是最慢的一次，可能需要几十分钟
+
+② 后续增量 Checkpoint（正常情况）：只上传新增 SST
+   State 100GB，每次间隔内新增 500MB → 只上传 500MB，很快
+
+③ 后续增量 Checkpoint（Compaction 密集时）：Compaction 把旧 SST 合并成新 SST
+   新文件需要重新上传，即使数据内容没变化
+   State 100GB，Compaction 重写了 50GB → 增量上传 50GB，和全量差不多慢
+   → 高写入 QPS + 大 State 场景下，Compaction 是增量 Checkpoint 退化的主因
+
+结论：State 大造成的 Checkpoint 瓶颈，首次全量是最显著的，
+但高 Compaction 场景下每次增量也可能很慢。
+```
 
 **Checkpoint 调优参数**：
 
