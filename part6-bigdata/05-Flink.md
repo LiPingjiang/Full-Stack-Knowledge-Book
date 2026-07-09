@@ -4,6 +4,73 @@
 
 ---
 
+## 目录
+
+- [一、流处理的核心挑战](#一流处理的核心挑战)
+- [二、核心概念](#二核心概念)
+  - [2.1 事件时间 vs 处理时间](#21-事件时间-vs-处理时间)
+  - [2.2 Watermark（水位线）——解决乱序](#22-watermark水位线解决乱序)
+    - Watermark 解决乱序的本质
+    - Watermark 生成逻辑：maxTimestamp 只增不减
+    - Watermark 不是数据字段，是流里的特殊记录
+    - 每个 Task 维护一个事件时间时钟
+    - Watermark 实时处理，单调递增不回退
+    - Watermark 不仅驱动窗口
+    - Watermark 的代码示例
+  - [2.3 窗口（Window）](#23-窗口window)
+    - 滚动窗口（Tumbling Window）
+    - 滑动窗口（Sliding Window）
+    - 会话窗口（Session Window）
+    - 累积窗口（Cumulative Window）
+    - 全局窗口（Global Window）+ 自定义触发器
+- [三、架构](#三架构)
+- [四、容错机制——Checkpoint + Exactly-Once](#四容错机制checkpoint--exactly-once)
+  - [4.1 Checkpoint（检查点）](#41-checkpoint检查点)
+    - Chandy-Lamport 分布式快照算法
+    - Watermark 与 Barrier 的区别
+    - 非对齐 Checkpoint（Unaligned Checkpoint）的精确原理
+    - 生产环境 Checkpoint 配置
+  - [4.2 端到端 Exactly-Once 语义](#42-端到端-exactly-once-语义)
+    - Checkpoint 与两阶段提交（2PC）的关系
+    - 4.2.1 幂等写入
+    - 4.2.2 事务写入
+    - 4.2.3 两阶段提交的完整时序
+    - 4.2.4 2PC 对外部 Sink 系统的要求
+    - 4.2.5 Flink + Kafka 端到端 Exactly-Once
+    - 4.2.6 生产环境配置与常见踩坑
+    - 4.2.7 API 演进：FlinkKafkaProducer 与 KafkaSink
+    - 4.2.8 2PC 与 at-least-once + 幂等的权衡
+- [五、状态管理](#五状态管理)
+  - [5.1 State 分类](#51-state-分类)
+    - Broadcast State 详解
+  - [5.1.1 State TTL（状态过期清理）](#511-state-ttl状态过期清理)
+  - [5.2 为算子设置 UID——Savepoint 恢复的关键](#52-为算子设置-uidsavepoint-恢复的关键)
+  - [5.3 State 存储后端](#53-state-存储后端)
+    - RocksDB 增量 Checkpoint 原理
+    - LSM-Tree 的三种放大效应 → [详见 A1 附录](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)
+    - 增量 vs 全量 Checkpoint 的选择
+  - [5.4 State 重分布——改变并行度时的状态分配](#54-state-重分布改变并行度时的状态分配)
+  - [5.5 最大并行度（Max Parallelism）](#55-最大并行度max-parallelism)
+  - [5.6 Savepoint 恢复规则](#56-savepoint-恢复规则)
+  - [5.7 大 State 处理策略（体系化排查思路）](#57-大-state-处理策略体系化排查思路) → [详见大 State 专题](./05-Flink-大State专题.md)
+- [六、Flink SQL](#六flink-sql)
+  - [6.1 Flink SQL 调优](#61-flink-sql-调优)
+    - 6.1.1 MiniBatch 微批处理（提升吞吐）
+    - 6.1.2 LocalGlobal 两阶段聚合（解决数据热点）
+    - 6.1.3 Split Distinct（解决 COUNT DISTINCT 热点）
+    - 6.1.4 AGG WITH FILTER（多维 COUNT DISTINCT 共享状态）
+    - 6.1.5 TopN 优化
+    - 6.1.6 SQL 调优参数总结
+  - [6.2 KafkaSource 调优](#62-kafkasource-调优)
+    - 6.2.1 动态发现分区
+    - 6.2.2 per-partition Watermark 生成
+    - 6.2.3 空闲分区处理（withIdleness）
+    - 6.2.4 Kafka offset 消费策略
+    - 6.2.5 并行度设置实践
+- [七、面试深度剖析](#七面试深度剖析)
+
+---
+
 ## 一、流处理的核心挑战
 
 实时计算和批处理最大的区别是：**数据没有尽头**。批处理有明确的输入边界（昨天的日志文件），处理完就结束。流处理面对的是源源不断涌入的事件，永远不会"处理完"。
