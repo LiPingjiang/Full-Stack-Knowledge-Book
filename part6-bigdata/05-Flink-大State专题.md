@@ -4,6 +4,38 @@
 
 ---
 
+## 目录
+
+- [大 State 处理策略（体系化排查思路）](#大-state-处理策略体系化排查思路)
+  - [第 0 步：从业务层面避免不必要的 State](#第-0-步从业务层面避免不必要的-state)
+    - 误用 1：把维度数据存在 State 里做 Join
+    - 误用 2：存储原始明细而不是增量聚合结果
+    - 误用 3：Flink SQL 聚合在高 QPS 下频繁访问 State
+    - 误用 4：不需要精确去重时使用精确 State
+    - 误用 5：State 中存储可重复计算的冗余信息
+  - [第 1 步：优化 State 内容体积（序列化与数据结构）](#第-1-步优化-state-内容体积序列化与数据结构)
+    - [1.1 序列化优化：避免 Kryo fallback](#11-序列化优化避免-kryo-fallback)
+    - [1.2 MapState 替代 ValueState<集合>](#12-mapstate-替代-valuestate集合)
+    - [1.3 自定义 TypeSerializer：当 POJO Serializer 不够用时的兜底方案](#13-自定义-typeserializer当-pojo-serializer-不够用时的兜底方案)
+  - [第 2 步：缩短 State 生命周期（TTL 与清理）](#第-2-步缩短-state-生命周期ttl-与清理)
+  - [第 3 步：检查数据倾斜](#第-3-步检查数据倾斜)
+    - 有窗口场景——两阶段聚合
+    - 无窗口场景——LocalKeyBy 预聚合
+    - Flink SQL 场景——TWO_PHASE 参数 vs 手工两个 GROUP BY
+  - [第 4 步：切换 RocksDB + 参数调优](#第-4-步切换-rocksdb--参数调优)
+  - [第 5 步：增加并行度分散 State](#第-5-步增加并行度分散-state)
+  - [持续监控 + Checkpoint 调优](#持续监控--checkpoint-调优)
+    - 增量 Checkpoint 工作机制
+    - Checkpoint 调优参数
+    - 监控指标
+  - [哪些场景需要 State？（不只是聚合）](#哪些场景需要-state不只是聚合)
+    - 场景 1：去重（Deduplication）
+    - 场景 2：CEP 复杂事件处理
+    - 场景 3：Interval Join
+    - 场景 4：自定义窗口触发器 / Timer
+
+---
+
 ## 大 State 处理策略（体系化排查思路）
 
 生产环境中，State 可能膨胀到几十 GB 甚至几百 GB，导致三类问题：运行时反压（State 读写慢）、Checkpoint 超时（State 上传慢）、启停/扩缩容慢（State 恢复慢）。排查和优化应按以下顺序逐层递进，先从业务层面消除不必要的 State，再从技术层面优化剩余 State 的存储和管理。
