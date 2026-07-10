@@ -393,6 +393,21 @@ Flink 将 Chandy-Lamport 算法适配到流处理场景，`Marker(id=N)` 对应 
 | **状态存储** | 由应用自定义 | State Backend（Memory / RocksDB）+ 外部存储（HDFS/S3） |
 | **快照编号** | 快照 id=N | Checkpoint ID（单调递增 long） |
 
+### 为什么 Flink 比原始算法更简单
+
+原始 Chandy-Lamport 中，**任意进程都可以发起快照**，发起者只向自己的出边发 Marker，然后靠"收到 Marker 的进程再转发给自己的出边"这一规则，让 Marker 在图中扩散，最终覆盖全图。这个转发逻辑是必要的，因为原始算法面对的是**任意拓扑**（可以有环、有任意连接方式），发起者不知道全局拓扑，只能靠 Marker 自己"病毒式"传播。
+
+Flink 的 DAG 是**有向无环图**，数据只从 Source 流向 Sink，方向固定、无环。JobManager 只需在所有 Source 注入 Barrier，Barrier 就会沿着固定的数据流方向自动传播到所有算子——**不需要任何"扩散"逻辑，也不需要算子主动转发给"所有出边"，因为数据流本身就是唯一的传播路径**。
+
+| 维度 | 原始 Chandy-Lamport | Flink |
+|------|---------------------|-------|
+| 图结构 | 任意拓扑，可有环 | DAG，无环，方向固定 |
+| Marker 注入点 | 任意进程（发起者） | 仅 Source（由 JobManager 触发） |
+| Marker 传播方式 | 收到后主动转发给所有出边（病毒式扩散） | 沿数据流方向自然流动，无需额外转发逻辑 |
+| 发起者数量 | 多个（并发快照需 id 区分） | 仅 JobManager，id 单调递增，无并发竞争 |
+
+> **一句话**：原始算法的"收到 Marker 后再转发"是为了应对任意拓扑；Flink 的 DAG 结构天然保证了从 Source 注入就能覆盖全图，所以这一步可以省掉。
+
 ### Barrier 对齐 vs 非对齐
 
 ```mermaid
