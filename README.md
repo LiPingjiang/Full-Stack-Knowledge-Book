@@ -26,9 +26,9 @@
 
 ## 全书脉络：七章递进
 
-这本书的七章是一条精心设计的学习路径，环环相扣：
+这本书的前七章是一条精心设计的学习路径，环环相扣。第八章是全栈知识的综合应用案例——以 Notebook 平台为切入点，串联前端、后端、数据、AI 四大领域：
 
-> **先重装思维 → 补齐前端短板 → 夯实 Java 基准 → 横向对比拓宽语言视野 → 用 AI 加速整个过程 → 掌握大数据与 AI 工程。**
+> **先重装思维 → 补齐前端短板 → 夯实 Java 基准 → 横向对比拓宽语言视野 → 用 AI 加速整个过程 → 掌握大数据与 AI 工程 → Notebook 平台全栈案例。**
 
 ```mermaid
 flowchart LR
@@ -38,6 +38,7 @@ flowchart LR
     C4 --> C5["第五章<br/>AI Coding 方法论<br/>(加速学习)"]
     C5 --> C6["第六章<br/>大数据基础<br/>(数据视野)"]
     C6 --> C7["第七章<br/>AI 工程基础<br/>(理解大模型)"]
+    C7 --> C8["第八章<br/>Notebook 平台架构<br/>(全栈综合案例)"]
     REF["并发模型引用库<br/>(被三、四章共享引用)"] -.被引用.- C3
     REF -.被引用.- C4
 ```
@@ -161,15 +162,31 @@ flowchart LR
 - [7.6 Agent 基础：Function Calling / MCP 协议 / Multi-Agent / NL2SQL](./part7-ai-engineering/06-Agent基础.md)
 - [7.7 分布式训练：数据并行 / 流水线并行 / 张量并行 / 3D 混合并行](./part7-ai-engineering/07-分布式训练.md)
 
+### 第八章 · Notebook 平台架构：全栈开发的绝佳研究案例 〔综合应用〕
+
+Notebook 是一个"麻雀虽小五脏俱全"的全栈系统——前端有编辑器和渲染、后端有进程管理和通信协议、数据层有 Spark/Hive 集成、AI 层有代码补全和 Agent 化单元格。用 Notebook 作为全栈开发的研究切入点，能把前面七章的知识全部串联起来。后续还会扩展 Data Agent、答疑 Chatbot 等细分场景 Case。
+
+- [本章导读](./part8-notebook-platform/README.md)
+- [8.1 Notebook 技术全景与知识体系：三种编程模型、知识图谱](./part8-notebook-platform/01-技术全景与知识体系.md)
+- [8.2 通信协议全景对比：Jupyter / marimo / Zeppelin / Polynote / Observable](./part8-notebook-platform/02-通信协议全景对比.md)
+- [8.3 Jupyter Notebook v7 源码架构深度分析：六大模块、三大重点、六大难点](./part8-notebook-platform/03-Jupyter源码架构分析.md)
+- [8.4 marimo 源码架构与响应式执行模型：AST 分析、DirectedGraph、DAG 执行](./part8-notebook-platform/04-marimo源码架构分析.md)
+- [8.5 执行引擎深度剖析：IPython Kernel vs Python REPL、PySpark Kernel vs spark-shell](./part8-notebook-platform/05-执行引擎深度剖析.md)
+- [8.6 开源 Notebook 项目全景对比：8 大开源项目、技术路线选择矩阵](./part8-notebook-platform/06-开源项目全景对比.md)
+- [8.7 大厂 Notebook 产品与架构：腾讯/阿里/字节/百度/华为四层模型](./part8-notebook-platform/07-大厂产品与架构.md)
+- [8.8 核心难点与解决方案：多租户、Spark 交互、Kernel 生命周期、安全权限](./part8-notebook-platform/08-核心难点与解决方案.md)
+- [8.9 业务场景关注点与最佳实践：6 大场景、5 项最佳实践](./part8-notebook-platform/09-业务场景与最佳实践.md)
+- [8.10 面试高频问题与参考回答：8 道高频面试题](./part8-notebook-platform/10-面试高频问题.md)
+
 ---
 
 ## 如何阅读
 
 推荐两种路径：
 
-**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章 → 第六章 → 第七章。前三章是地基，第四章是融会贯通，第五章是加速器，第六章是数据视野，第七章是 AI 工程认知。
+**路径 A · 按部就班（推荐首次阅读）**：第一章 → 第二章 → 第三章 → 第四章（遇到并发模型链接就跳进引用库）→ 第五章 → 第六章 → 第七章 → 第八章。前三章是地基，第四章是融会贯通，第五章是加速器，第六章是数据视野，第七章是 AI 工程认知，第八章是全栈综合应用案例。
 
-**路径 B · 问题驱动（带着具体问题查阅）**：直接从第四章的对比案例切入，遇到 Java 基准不熟就回溯第三章，遇到前端概念不懂就回溯第二章，遇到思维卡壳就回第一章。AI 相关问题直接查第七章。
+**路径 B · 问题驱动（带着具体问题查阅）**：直接从第四章的对比案例切入，遇到 Java 基准不熟就回溯第三章，遇到前端概念不懂就回溯第二章，遇到思维卡壳就回第一章。AI 相关问题直接查第七章。Notebook 开发面试或平台架构设计直接查第八章。
 
 全书所有 `.md` 文件之间用相对路径超链接互相串联，你可以在任意支持 Markdown 渲染的编辑器（VS Code、Typora、Obsidian）或 Git 平台中点击跳转，像在网页里冲浪一样阅读。
 
