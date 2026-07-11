@@ -1,6 +1,6 @@
 # 8.3 Jupyter Notebook v7 源码架构深度分析
 
-> 源码路径：`/Users/lipingjiang/Codes/notebook-projects/jupyter-notebook`（Jupyter Notebook v7 官方仓库）
+> 源码：Jupyter Notebook v7 官方仓库（https://github.com/jupyter/notebook）
 
 ### 1. 整体架构定位
 

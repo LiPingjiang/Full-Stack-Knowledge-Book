@@ -2,7 +2,7 @@
 
 ## 五、marimo 源码架构与响应式 Notebook 分析
 
-> 源码路径：`/Users/lipingjiang/Codes/notebook-projects/marimo`（marimo 官方仓库）
+> 源码：marimo 官方仓库（https://github.com/marimo-team/marimo）
 
 ### 1. marimo 是什么
 
