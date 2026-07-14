@@ -185,9 +185,10 @@ Notebook 是一个"麻雀虽小五脏俱全"的全栈系统——前端有编辑
 
 - [本章导读](./part9-case-autonomous-driving/README.md)
 - [9.1 岗位拆解：JD 逐条分析与知识映射](./part9-case-autonomous-driving/01-岗位拆解与知识映射.md)
-- [9.2 通用知识缺口：K8s 调度、对象存储、可观测性、工作流引擎](./part9-case-autonomous-driving/02-通用知识缺口.md)
-- [9.3 领域知识：自动驾驶数据闭环与仿真体系](./part9-case-autonomous-driving/03-领域知识.md)
-- [9.4 面试准备路径与高频问题](./part9-case-autonomous-driving/04-面试准备.md)
+- [9.2 基础架构全景：从车端到云端](./part9-case-autonomous-driving/02-基础架构全景.md)
+- [9.3 通用知识缺口：K8s 调度、对象存储、可观测性、工作流引擎](./part9-case-autonomous-driving/03-通用知识缺口.md)
+- [9.4 领域知识：自动驾驶数据闭环与仿真体系](./part9-case-autonomous-driving/04-领域知识.md)
+- [9.5 面试准备路径与高频问题](./part9-case-autonomous-driving/05-面试准备.md)
 
 ---
 
