@@ -136,4 +136,52 @@ NameNode 元数据全在内存，每个文件/块约占 150 字节。1 亿个小
 
 ---
 
+## 六、分布式存储的两种范式：HDFS vs 对象存储（S3/MinIO）
+
+HDFS 是文件系统语义（目录树 + 文件路径），适合 Hadoop/Spark 生态的大数据分析。但在实际工程中，很多场景需要另一种存储范式——对象存储。
+
+### 6.1 对象存储（S3/MinIO）
+
+S3（Amazon Simple Storage Service）已成为对象存储的事实标准 API。核心数据模型是扁平的——Bucket（桶）+ Object Key（对象键），没有目录树层级。每个 Object 是一个不可变文件（写入后不能修改，只能覆盖或删除）。
+
+S3 API 的核心操作：PutObject（上传，限制单次 5GB）、GetObject（下载）、Multipart Upload（分片上传——把大文件分成多个 Part 并行上传，每片最大 5GB，总共最大 5TB，支持断点续传——某片失败只需重传该片）、ListObjects（列出桶内对象，支持前缀过滤）。
+
+MinIO 是开源的 S3 兼容对象存储，用 Go 实现。核心特性是纠删码（Erasure Coding）存储——数据分成 N 个数据块 + M 个校验块，分散存储在不同节点上。任一节点故障，只要剩余数据块 + 校验块数 ≥ N 就能恢复数据。比三副本（HDFS 的策略）节省约 50% 存储空间。MinIO 是去中心化架构——没有像 HDFS NameNode 那样的中心元数据服务器，每个节点既存数据又做网关。
+
+### 6.2 HDFS vs 对象存储选型
+
+| 维度 | HDFS | S3/MinIO |
+|------|------|----------|
+| 数据模型 | 目录树 + 文件路径 | Bucket + Key，扁平命名空间 |
+| 元数据管理 | NameNode 集中管理 | 去中心化，无中心元数据服务器 |
+| 文件修改 | 支持追加，不支持随机修改 | 不可变，只能覆盖或删除 |
+| 副本策略 | 三副本（200% 空间开销） | 纠删码（约 50% 空间开销） |
+| 小文件 | 性能差（NameNode 内存瓶颈） | 无此问题（没有集中元数据） |
+| 生态集成 | Hadoop/Spark 原生 | S3A 连接器接入 Hadoop 生态 |
+| 适用场景 | 大文件分析、数据仓库 | 大文件存储、备份归档、云原生应用 |
+
+实际工程中两者经常共存——对象存储存原始大文件（传感器数据、日志、镜像），HDFS 存处理后的结构化数据（Parquet/ORC 列存表、分析结果）。
+
+---
+
+## 七、HBase 与 LSM Tree：海量时序 KV 存储
+
+HDFS 适合大文件分析，但不适合海量小记录的快速读写——比如自动驾驶场景中每辆车的每帧传感器元数据（数十亿条记录，需要毫秒级按车辆 + 时间范围查询）。HBase 解决这个问题。
+
+### 7.1 LSM Tree 原理
+
+HBase 的存储引擎是 LSM Tree（Log-Structured Merge-Tree），跟 MySQL 的 B+ Tree 是两种不同的存储引擎哲学。B+ Tree 优化读性能（有序结构，二分查找快）但写性能受限（随机写——每次插入可能触发页分裂和磁盘随机 IO）。LSM Tree 优化写性能——写入流程是顺序写 WAL（Write-Ahead Log，保证持久性）→ 写 MemTable（内存中的有序跳表/红黑树）→ MemTable 满了刷盘成 SSTable（Sorted String Table，磁盘上的有序文件）。所有写入都是顺序的，没有随机磁盘 IO。
+
+读取需要合并查询 MemTable + 多层 SSTable——先查 MemTable（内存中最新数据），再逐层查 SSTable（磁盘上历史数据）。为了加速读取，用布隆过滤器（参见 A1 核心数据结构原理）判断某个 key 是否在某个 SSTable 中，避免无效的磁盘读取。后台 Compaction 定期合并多层 SSTable，清理已删除和已覆盖的数据，减少读取时的合并层数。
+
+核心 trade-off：LSM Tree 牺牲读性能（需要合并多层数据）换取写性能（纯顺序写）。适合写多读少的场景——时序数据、日志、传感器数据。B+ Tree 牺牲写性能（随机写 + 页分裂）换取读性能（单层查找）。适合读多写少的场景——用户信息、订单记录、配置数据。
+
+### 7.2 HBase 核心架构
+
+HBase 的核心概念：RowKey 是唯一的索引——所有查询都走 RowKey（或 RowKey 前缀扫描），没有二级索引。RowKey 设计是 HBase 性能的决定因素。Region 是按 RowKey 范围分区的数据分片——数据按 RowKey 排序存储，当 Region 太大时自动分裂（Split）。RegionServer 负责管理一个或多个 Region 的读写请求。HMaster 负责 Region 分配和负载均衡。
+
+RowKey 设计实践——时序场景的经典模式是 `entity_id + reverse_timestamp`。比如自动驾驶场景的 RowKey 是 `vehicle_id + (Long.MAX_VALUE - timestamp)`——按车辆分区（同一辆车的数据在相邻 Region），按时间倒序排列（最新数据在最前面），通过 RowKey 前缀扫描快速查询某辆车某段时间的数据。避免热点问题——如果只用时间戳做 RowKey，所有写入都打到同一个 Region（因为时间戳递增，新数据总在最后），需要加随机前缀打散写入。
+
+---
+
 [← 6.1 大数据技术栈全景](./01-大数据技术栈全景.md) | [返回本章目录](./README.md) | [6.3 Hive →](./03-Hive.md)
