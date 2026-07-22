@@ -218,50 +218,98 @@ SELECT * FROM user_info CLUSTER BY dept_no;
 
 #### 四种关键字的对比图
 
+以下示例基于同一份原始数据 `user_info`（6 行），SET mapreduce.job.reduces=2：
+
 ```
-ORDER BY（全局排序，1 个 Reducer）：
-  全部数据 → Reducer 0 → 全局有序输出
-  数据量大时 OOM
+原始数据：
+| user_id | user_name | dept_no | salary |
+|---------|-----------|---------|--------|
+| 1       | 张三       | D01     | 8000   |
+| 2       | 李四       | D02     | 12000  |
+| 3       | 王五       | D01     | 15000  |
+| 4       | 赵六       | D02     | 9000   |
+| 5       | 钱七       | D01     | 11000  |
+| 6       | 孙八       | D02     | 20000  |
+```
 
-SORT BY（分区内排序，N 个 Reducer）：
-  数据 → Reducer 0 → 内部有序
-      → Reducer 1 → 内部有序
-      → Reducer 2 → 内部有序
-  全局无序，但每个输出文件内部有序
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ORDER BY salary DESC（全局排序，强制 1 个 Reducer）：
 
-  SORT BY 不是"排了又白排"——它的价值是用并行的局部排序代替昂贵的全局排序。
-  典型场景：
-  ① 下游任务需要有序输入：如 HBase BulkLoad 要求 HFile 按 RowKey 有序，
-    先 SORT BY rowkey 输出有序文件，再 BulkLoad 直接加载。
-  ② 下游做 Sort-Merge Join：两张大表各自按 join key SORT BY 写成有序文件，
-    下一个 Job 读两个有序文件做归并连接（O(n)），不需要 Hash Join 把一侧全加载到内存。
-  ③ ORC/Parquet 写入优化：文件内部有序时，min/max 统计信息更紧凑，
-    下游查询的 Predicate Pushdown 跳过更多无关行组。
+  Reducer 0 → 输出文件 part-00000：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 6       | 孙八       | D02     | 20000  |
+  | 3       | 王五       | D01     | 15000  |
+  | 2       | 李四       | D02     | 12000  |
+  | 5       | 钱七       | D01     | 11000  |
+  | 4       | 赵六       | D02     | 9000   |
+  | 1       | 张三       | D01     | 8000   |
 
-DISTRIBUTE BY + SORT BY（指定分区 + 分区内排序）：
-  按 dept_no 分区 → Reducer 0（dept 4）→ 按 sallary 排序
-                  → Reducer 1（dept 1）→ 按 sallary 排序
-                  → Reducer 2（dept 2）→ 按 sallary 排序
-                  → Reducer 3（dept 3）→ 按 sallary 排序
-  同部门数据在同一文件，文件内按薪资排序
+  → 全局有序，但所有数据挤到 1 个 Reducer，数据量大时 OOM。
 
-  示例：原始数据 6 行，SET mapreduce.job.reduces=2;
-  DISTRIBUTE BY dept_no SORT BY dept_no, salary DESC 后：
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SORT BY salary DESC（分区内排序，2 个 Reducer）：
 
-  Reducer 0（dept_no=D01）：        Reducer 1（dept_no=D02）：
-  | user_id | dept_no | salary |   | user_id | dept_no | salary |
-  |---------|---------|--------|   |---------|---------|--------|
-  | 3(王五)  | D01     | 15000  |   | 6(孙八)  | D02     | 20000  |
-  | 5(钱七)  | D01     | 11000  |   | 2(李四)  | D02     | 12000  |
-  | 1(张三)  | D01     | 8000   |   | 4(赵六)  | D02     | 9000   |
+  数据按默认算法随机分配到 2 个 Reducer（不可控）：
 
-  → 同部门一定在同一个 Reducer，组内按薪资从高到低有序。
+  Reducer 0 → 输出文件 part-00000：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 3       | 王五       | D01     | 15000  |
+  | 2       | 李四       | D02     | 12000  |
+  | 1       | 张三       | D01     | 8000   |
 
-CLUSTER BY（分区字段 = 排序字段，只能 ASC）：
-  按 dept_no 分区 → Reducer 0 → 按 dept_no 升序
-                  → Reducer 1 → 按 dept_no 升序
-                  → Reducer 2 → 按 dept_no 升序
-  等价于 DISTRIBUTE BY dept_no SORT BY dept_no
+  Reducer 1 → 输出文件 part-00001：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 6       | 孙八       | D02     | 20000  |
+  | 5       | 钱七       | D01     | 11000  |
+  | 4       | 赵六       | D02     | 9000   |
+
+  → 每个文件内部按 salary 降序，但全局无序（part-00001 的 20000 > part-00000 的 15000）。
+  → 价值：并行排序快，下游任务读单个文件时数据已有序。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+DISTRIBUTE BY dept_no SORT BY salary DESC（指定分区 + 分区内排序，2 个 Reducer）：
+
+  按 dept_no hash 分区：同部门一定进同一个 Reducer。
+
+  Reducer 0 → 输出文件 part-00000（dept_no=D01 的数据）：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 3       | 王五       | D01     | 15000  |
+  | 5       | 钱七       | D01     | 11000  |
+  | 1       | 张三       | D01     | 8000   |
+
+  Reducer 1 → 输出文件 part-00001（dept_no=D02 的数据）：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 6       | 孙八       | D02     | 20000  |
+  | 2       | 李四       | D02     | 12000  |
+  | 4       | 赵六       | D02     | 9000   |
+
+  → 同部门在同一文件，组内按薪资降序。典型用途：分组内排序。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CLUSTER BY dept_no（= DISTRIBUTE BY dept_no SORT BY dept_no ASC，2 个 Reducer）：
+
+  Reducer 0 → 输出文件 part-00000：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 1       | 张三       | D01     | 8000   |
+  | 3       | 王五       | D01     | 15000  |
+  | 5       | 钱七       | D01     | 11000  |
+
+  Reducer 1 → 输出文件 part-00001：
+  | user_id | user_name | dept_no | salary |
+  |---------|-----------|---------|--------|
+  | 2       | 李四       | D02     | 12000  |
+  | 4       | 赵六       | D02     | 9000   |
+  | 6       | 孙八       | D02     | 20000  |
+
+  → 按 dept_no 分区且按 dept_no 升序排（同一分区内 dept_no 值相同，所以排序效果不明显）。
+  → 注意：只能升序，不能指定 DESC；salary 列无序。
 ```
 
 > **面试速答**：ORDER BY 全局排序只有一个 Reducer（大数据量会 OOM），SORT BY 每个 Reducer 内部排序但全局无序，DISTRIBUTE BY 控制 hash 分区规则（搭配 SORT BY 使用），CLUSTER BY 是 DISTRIBUTE BY + SORT BY 字段相同时的简写（只能升序）。
