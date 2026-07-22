@@ -68,6 +68,145 @@
 - **Replica**：同一 Shard 的多个副本，通过 ZooKeeper 协调同步
 - **Distributed Table**：逻辑表，查询时自动路由到各 Shard 并汇总结果
 
+### 2.3 数据分布与节点职责
+
+**一张表的数据都在一个节点上吗？一个节点只存一个表吗？**
+
+都不是。一张表可以分布在多个节点（通过 Shard 分片），一个节点可以存多张表：
+
+```
+Node 1: [orders 的 Shard 1] + [users 的 Shard 1] + [events 的 Shard 1]
+Node 2: [orders 的 Shard 2] + [users 的 Shard 2] + [events 的 Shard 2]
+Node 3: [orders 的 Shard 3] + [users 的 Shard 3] + [events 的 Shard 3]
+```
+
+**ClickHouse 分片 vs Doris 分片**：
+
+| | ClickHouse | Doris |
+|--|--|--|
+| 分片方式 | 手动配置 Distributed 表 + 本地表 | `DISTRIBUTED BY HASH(col) BUCKETS N` 自动分配 |
+| 均衡 | 手动管理，无自动均衡 | FE 自动调度 Tablet，自动均衡 |
+| 扩容 | 需要手动迁移数据 | 自动 Rebalance |
+
+### 2.4 Shared-Nothing 架构与查询模式
+
+ClickHouse 是 **Shared-Nothing（无共享）架构**——每个节点独立拥有存储和计算，节点之间不共享磁盘。
+
+**Scatter-Gather 查询模式**：
+
+这是 ClickHouse 单表聚合的核心执行模式，也是它快的关键原因：
+
+```
+Scatter-Gather（分散-收集）：
+
+  客户端 → 协调节点（任意 Node 兼任）
+              │
+    ┌─────────┼─────────┐         ← Scatter（分散）：把查询发给所有 Shard
+    ↓         ↓         ↓
+  Node 1    Node 2    Node 3
+  本地扫描   本地扫描   本地扫描     ← 每个节点只读本地磁盘，独立计算
+  本地聚合   本地聚合   本地聚合     ← 在本地完成大部分计算
+    │         │         │
+    └─────────┼─────────┘         ← Gather（收集）：汇总各节点的部分结果
+              ↓
+         协调节点合并
+              ↓
+           最终结果
+
+特点：
+  ✅ 中间没有 Shuffle（节点之间不交换原始数据）
+  ✅ 每个节点只传回聚合后的小结果集（如 100 个城市的 SUM）
+  ✅ 网络传输量极小
+```
+
+**对比 Doris 的多阶段执行**：
+
+```
+Doris 单表聚合（也是 Scatter-Gather，跟 ClickHouse 一样）：
+  FE 分发 → 各 BE 本地扫描+聚合 → 汇总到某个 BE → 返回
+  → 单表聚合时，Doris 和 ClickHouse 的执行模式几乎相同
+
+Doris 多表 JOIN（需要 Shuffle）：
+  FE 分发 → 各 BE 扫描各自的表
+    → 按 JOIN Key 重新分布数据（Shuffle Exchange）← 这一步 ClickHouse 做不好
+    → 各 BE 在本地做 JOIN
+    → 汇总返回
+```
+
+**所以 Doris 单表查询时也是只扫描本地数据吗？**
+
+**是的。** 单表聚合场景下，Doris 的 BE 也是各自扫描本地 Tablet、本地聚合、最后汇总——跟 ClickHouse 的 Scatter-Gather 模式一样。**两者在单表聚合上的执行模式没有本质区别。**
+
+ClickHouse 单表更快的真正原因不是执行模式不同，而是：
+
+| 原因 | 说明 |
+|------|------|
+| **单查询吃满资源** | ClickHouse 一条查询占满整个节点的 CPU/IO；Doris 为了高并发会做资源隔离和限制 |
+| **更极致的压缩** | 更丰富的编码（Delta、DoubleDelta、Gorilla、T64），同样数据压缩后更小，IO 更少 |
+| **更激进的 SIMD 优化** | 热路径手写 SIMD 代码，不完全依赖编译器自动向量化 |
+| **无协调开销** | 没有独立 FE 进程的 RPC 开销（但这个差距很小，不是主因） |
+
+### 2.5 为什么 ClickHouse 不支持行级 UPDATE/DELETE
+
+**根本原因：MergeTree 的 Part 文件是不可变的（Immutable）。**
+
+```
+MergeTree 写入方式：
+  INSERT 100 行 → 生成 Part_1（不可变的文件目录）
+  INSERT 200 行 → 生成 Part_2（不可变的文件目录）
+  后台 Merge  → Part_1 + Part_2 合并为 Part_3（新文件，旧文件删除）
+
+Part 内部结构：
+  Part_1/
+    ├── primary.idx        ← 稀疏索引（不可变）
+    ├── city.bin           ← city 列的压缩数据块（不可变）
+    ├── city.mrk2          ← 标记文件，记录数据块偏移（不可变）
+    ├── amount.bin         ← amount 列的压缩数据块（不可变）
+    └── ...
+```
+
+**为什么不可变 = 不能行级更新**：
+
+```
+要 UPDATE 一行：
+  1. 找到目标行在哪个 Part 的哪个压缩数据块
+  2. 数据块是压缩的（如 64KB 压缩成 8KB）
+  3. 改一行必须：解压整个块 → 修改 → 重新压缩 → 重写
+  4. 但其他列的 .mrk 偏移量指向这个块，改了大小全部失效
+  5. 实际上 = 重写整个 Part（可能几百 MB）
+
+  → 改一行的代价 ≈ 重写整个 Part = 不可接受
+```
+
+**对比 MySQL InnoDB**：
+
+```
+InnoDB：数据页（16KB）是可变的
+  → 找到目标行所在的页 → 页内原地修改 → 写 redo log → 完成
+  → 改一行只影响一个 16KB 的页
+
+MergeTree：Part（几百 MB）是不可变的
+  → 改一行要重写整个 Part
+  → 所以 ClickHouse 的 UPDATE 是异步 Mutation（后台重写），不是实时生效
+```
+
+**ClickHouse 的替代方案**：
+
+| 方案 | 做法 | 适用场景 |
+|------|------|---------|
+| **Mutation** | `ALTER TABLE ... UPDATE/DELETE` → 后台异步重写 Part | 低频修正（分钟级生效） |
+| **ReplacingMergeTree** | 写入新版本行，Merge 时保留最新版本 | 需要"最新值"语义 |
+| **CollapsingMergeTree** | 写入 +1/-1 标记行，Merge 时抵消 | CDC 场景 |
+
+**本质取舍**：
+
+```
+ClickHouse：数据不可变 → 写入极快（纯追加）、压缩率极高、无锁 → 但不能实时改
+Doris/MySQL：数据可变 → 支持实时 UPDATE → 但有锁、有 WAL、有页分裂开销
+```
+
+> **面试记忆点**：ClickHouse 不支持行级 UPDATE 不是"没实现"，而是存储引擎的设计选择——不可变文件让写入和压缩都更高效，代价是不能原地修改。这是 OLAP（分析优先）vs OLTP（事务优先）的根本哲学差异。
+
 ---
 
 ## 三、MergeTree 引擎族
