@@ -236,7 +236,53 @@ SETTINGS index_granularity = 8192;    -- 索引粒度
 | **Primary Key（稀疏索引）** | 每 8192 行记录一个索引条目，定位数据块范围 |
 | **Merge** | 后台线程定期合并小 Part 为大 Part（类似 LSM Compaction） |
 
-### 3.2 MergeTree 家族
+### 3.2 MergeTree vs LSM-Tree 对比
+
+MergeTree 和 [LSM-Tree](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理) 确实非常相似——都是"追加写入 + 后台合并"的设计。但有关键差异：
+
+**相同点**：
+
+```
+两者的核心思路完全一致：
+  1. 写入时不原地修改，而是追加生成新的不可变文件
+  2. 后台异步合并（Compaction/Merge）多个小文件为大文件
+  3. 合并时可以做额外操作（去重、聚合、清理过期数据）
+  4. 读取时可能需要合并多个文件的结果
+```
+
+**关键差异**：
+
+| 维度 | LSM-Tree（RocksDB/HBase） | MergeTree（ClickHouse） |
+|------|--------------------------|------------------------|
+| **数据组织** | 行式 Key-Value（按 Key 有序） | 列式存储（按排序键有序，但每列独立文件） |
+| **内存缓冲** | MemTable（写入先到内存，满了再刷盘） | 无 MemTable（直接写磁盘 Part） |
+| **WAL** | 有 Write-Ahead Log（保证不丢数据） | 无 WAL（依赖批量写入保证） |
+| **分层** | 严格分层（Level 0 → Level 1 → ... → Level N） | 无严格层级（只有同分区的 Part 合并） |
+| **合并策略** | Leveled / Tiered / FIFO 等多种策略 | 简单的同分区 Part 合并（按大小选择） |
+| **点查能力** | 强（Bloom Filter + 有序查找） | 弱（面向批量扫描，不擅长单行查找） |
+| **设计目标** | 通用 KV 存储（读写均衡） | OLAP 分析（写入快 + 批量扫描快） |
+| **典型系统** | RocksDB、HBase、Cassandra、LevelDB | ClickHouse、Doris BE |
+
+**为什么 MergeTree 没有 MemTable 和 WAL？**
+
+```
+LSM-Tree（RocksDB）：
+  写入 → WAL（防丢）→ MemTable（内存排序）→ 满了刷盘为 SST 文件
+  → 适合高频小写入（每秒百万次 PUT）
+
+MergeTree（ClickHouse）：
+  写入 → 直接在内存排序 → 立即写磁盘生成 Part
+  → 不需要 WAL，因为 ClickHouse 要求客户端攒批写入（每次至少 1000+ 行）
+  → 如果写入过程中崩溃，丢失的只是这一批数据，客户端重试即可
+```
+
+这也解释了为什么 ClickHouse 要求"每次 INSERT 至少 1000 行、每秒不超过 1 次 INSERT"——没有 MemTable 缓冲，每次 INSERT 都直接生成一个 Part 文件，太频繁就小文件爆炸。
+
+**Doris BE 的存储引擎**也借鉴了 LSM-Tree 思想（Rowset/Segment 结构），但同样是列式存储。详见 [LSM-Tree 各系统对比](../part3-java-deep/A1-核心数据结构原理.md#116-各系统的-lsm-tree-实现对比)。
+
+> **面试记忆点**：MergeTree 是 LSM-Tree 思想在列式 OLAP 场景的变体——保留了"追加写入 + 后台合并"的核心，去掉了 MemTable 和 WAL（因为 OLAP 场景是批量写入，不需要单条写入的持久性保证），把行式 KV 换成了列式存储（为了分析查询的扫描性能）。
+
+### 3.3 MergeTree 家族
 
 | 引擎 | 特点 | 适用场景 |
 |------|------|---------|
