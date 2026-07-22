@@ -75,6 +75,55 @@ DISTRIBUTED BY HASH(city) BUCKETS 16;
 
 Doris 底层是列式存储（按列组织数据），查询时只读需要的列，IO 大幅减少。执行引擎采用向量化（Vectorized Execution）——批量处理数据而非逐行处理，充分利用 CPU 缓存和 SIMD 指令。
 
+**向量化执行引擎的核心原理**：
+
+```
+传统逐行执行（Volcano 模型）：
+  for each row:
+    读取一行 → 过滤 → 计算表达式 → 聚合
+  问题：每行都有函数调用开销，CPU 分支预测失败率高，缓存命中率低
+
+向量化执行（Doris 的方式）：
+  for each batch (4096 行):
+    批量读取一列数据到连续内存 → 批量过滤 → 批量计算 → 批量聚合
+  优势：循环内无虚函数调用，数据连续排列利用 CPU Cache Line，可用 SIMD 指令并行处理
+```
+
+**为什么快**：
+
+| 优化维度 | 逐行模型 | 向量化模型 |
+|---------|---------|-----------|
+| **函数调用** | 每行调用一次 next() 虚函数 | 每批（4096行）调用一次 |
+| **CPU 缓存** | 行式数据跨列跳跃，Cache Miss 高 | 同列数据连续排列，Cache Line 命中率高 |
+| **SIMD 指令** | 无法利用（数据不连续） | 连续 int/double 数组可用 SSE/AVX 一次处理 4-8 个值 |
+| **分支预测** | 每行判断一次 WHERE 条件 | 批量生成 selection vector（位图），无分支 |
+| **编译优化** | 循环体复杂，编译器难优化 | 紧凑循环，编译器自动向量化 |
+
+**具体执行流程**：
+
+```
+SQL: SELECT city, SUM(amount) FROM orders WHERE status = 'paid' GROUP BY city
+
+Step 1: Scan（列式读取）
+  从 Tablet 中批量读取 status 列 → [paid, refund, paid, paid, ...]  4096个值
+  从 Tablet 中批量读取 amount 列 → [100, 50, 200, 150, ...]
+  从 Tablet 中批量读取 city 列   → [北京, 上海, 北京, 广州, ...]
+
+Step 2: Filter（向量化过滤）
+  status == 'paid' → selection_vector = [1, 0, 1, 1, ...]  ← 位图，无分支判断
+  
+Step 3: Project（向量化投影）
+  根据 selection_vector 只保留命中行的 city 和 amount
+
+Step 4: Aggregate（向量化聚合）
+  批量 hash(city) → 批量累加 amount 到对应桶
+  利用 SIMD 加速 hash 计算和求和
+```
+
+**性能提升**：向量化引擎相比传统逐行模型通常快 **5-10 倍**，这也是 Doris 查湖表时虽然失去了本地索引优势，但计算速度仍然比 Trino（Java 实现，JIT 优化）和 Hive（MapReduce）快的核心原因。
+
+> **与其他系统的对比**：ClickHouse 也是向量化执行（C++ 实现），性能与 Doris 接近。Trino 虽然也做了部分向量化优化，但受限于 Java 的内存模型（对象头开销、GC 停顿），在纯计算密集场景下仍不如 C++ 实现的 Doris/ClickHouse。
+
 ### 4.2 物化视图（Materialized View）
 
 物化视图是预计算的聚合结果，查询时 Doris 自动路由到最匹配的物化视图，避免实时聚合。
