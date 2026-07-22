@@ -91,6 +91,53 @@ public class OrderService {
 | **request** | 每个 HTTP 请求一个 | Web 应用的请求级数据 |
 | **session** | 每个 HTTP Session 一个 | 用户会话数据 |
 
+**怎么设置作用域**：
+
+```java
+// 方式一：注解（最常用）
+@Component
+@Scope("prototype")  // 或 @Scope(ConfigurableBeanFactory.SCOPE_PROTOTYPE)
+public class ShoppingCart { ... }
+
+// 方式二：@Bean 方法上指定
+@Configuration
+public class AppConfig {
+    @Bean
+    @Scope("prototype")
+    public ShoppingCart shoppingCart() {
+        return new ShoppingCart();
+    }
+}
+
+// 方式三：XML（老项目）
+// <bean id="cart" class="com.example.ShoppingCart" scope="prototype"/>
+```
+
+**singleton + prototype 混用的坑**：
+
+```java
+@Service  // 默认 singleton
+public class OrderService {
+    @Autowired
+    private ShoppingCart cart;  // prototype Bean 注入到 singleton 中
+    // ❌ 问题：cart 只会在 OrderService 创建时注入一次，之后永远是同一个实例
+    //    prototype 的"每次新建"语义失效了！
+
+    // ✅ 解决方案一：注入 ObjectProvider
+    @Autowired
+    private ObjectProvider<ShoppingCart> cartProvider;
+    
+    public void process() {
+        ShoppingCart cart = cartProvider.getObject(); // 每次调用都新建
+    }
+
+    // ✅ 解决方案二：@Scope + proxyMode
+    // 在 ShoppingCart 上加：
+    // @Scope(value = "prototype", proxyMode = ScopedProxyMode.TARGET_CLASS)
+    // Spring 会注入一个 CGLIB 代理，每次调用代理方法时自动新建实例
+}
+```
+
 > 面试坑：把有状态 Bean 设为 singleton → 并发数据污染。
 
 ### 2.4 三种注入方式
@@ -250,7 +297,7 @@ public class OrderService {
 | **方法不是 public** | Spring AOP 默认只代理 public 方法 | 改为 public |
 | **异常被 catch 吞掉** | 代理看不到异常，不触发回滚 | 抛出去或手动 `setRollbackOnly` |
 | **rollbackFor 没配** | 默认只回滚 RuntimeException | 加 `rollbackFor = Exception.class` |
-| **数据库引擎不支持事务** | 如 MySQL 的 MyISAM | 换 InnoDB |
+| **数据库引擎不支持事务** | 如 MySQL 的 MyISAM（参考 → [3.9 数据库 MySQL — InnoDB vs MyISAM](./09-数据库MySQL.md#innodb-vs-myisam)） | 换 InnoDB |
 | **多数据源/非 Spring 管理的连接** | 事务管理器不匹配 | 指定 `transactionManager` |
 
 **面试必背的第一条**：同类调用失效——因为 `@Transactional` 是 AOP 实现，AOP 通过代理对象拦截，`this` 调用绕过了代理。
