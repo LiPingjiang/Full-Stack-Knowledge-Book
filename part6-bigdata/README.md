@@ -47,6 +47,20 @@ graph LR
 
 **[6.8 大模型数据工程](./08-大模型数据工程.md)** —— 预训练数据从采集到入模。文本数据处理全流程（Common Crawl → 文本提取 → 语言识别 → 质量过滤 → 去重 → 安全过滤 → 数据配比）、多模态数据处理（图文对齐与 CLIP 打分、视频帧提取与字幕对齐、音频 ASR 转录、OCR 与文档理解）、去重技术深入（MinHash + LSH、SimHash）、工程实现技术栈（Spark + Ray、Parquet/WebDataset 格式）、与传统 ETL 的对比。*面试剖析覆盖：预训练数据核心流程、去重重要性与方法、多模态核心挑战、数据质量 vs 数量、数据配比策略。*
 
+**[6.9 湖仓一体](./09-湖仓一体.md)** —— LakeHouse 架构演进（数仓→数据湖→湖仓一体）、三大开放表格式对比（Iceberg/Hudi/Paimon 的 ACID/Schema Evolution/Time Travel/Partition Evolution）、统一 Catalog（HMS/Nessie/Unity/Gravitino）、实时入湖方案（Flink+Iceberg/Flink+Paimon）、批流一体计算、湖上查询加速（Z-Order/Data Skipping/Manifest 缓存）。*面试剖析覆盖：为什么需要湖仓、Snapshot 隔离实现、CoW vs MoR 选型、小文件治理、Paimon vs Iceberg 区别。*
+
+**[6.10 语义层与指标平台](./10-语义层与指标平台.md)** —— 语义层概念（Metrics Layer/Headless BI）、维度/度量/指标/数据集建模、指标口径管理（技术口径 vs 业务口径）、SQL 生成引擎、查询下推与路由、权限过滤（行级/列级）、开源方案对比（dbt Metrics/Cube.js/MetricFlow）、与 AgentBI 的关系。*面试剖析覆盖：语义层 vs ADS 层、查询下推实现、行级权限性能、指标口径变更、指标平台架构设计。*
+
+**[6.11 ClickHouse](./11-ClickHouse.md)** —— 列式 OLAP 极致性能。列式存储 + 向量化执行 + 高压缩率、MergeTree 引擎族（Replacing/Summing/Aggregating/Collapsing）、稀疏索引与 Data Skipping、分布式架构（Shard + Replica + ZooKeeper）、物化视图、数据导入方式、ClickHouse vs Doris 深度对比与选型。*面试剖析覆盖：为什么快、Merge 过程、UPDATE/DELETE 处理、分布式查询流程、高可用方案。*
+
+**[6.12 Presto 查询引擎（附 Trino 简介）](./12-Presto查询引擎.md)** —— 分布式交互式 SQL 查询引擎。Coordinator + Worker 架构、Pipeline 执行模型（vs Spark 的 Stage 模型）、Connector 机制与联邦查询、CBO 优化与 JOIN 策略、内存管理、与 Spark SQL 的定位对比、Trino 与 PrestoDB 的关系与差异。*面试剖析覆盖：为什么比 Hive/Spark 快、Connector 工作原理、联邦 JOIN、内存不足处理、Presto vs Trino 选型。*
+
+**[6.13 任务调度](./13-任务调度.md)** —— 数据平台的中枢神经。DAG 依赖管理、Cron/事件/手动触发、失败重试与告警、资源管理与优先级、Backfill 回填、Airflow vs DolphinScheduler vs Azkaban 对比、调度系统核心设计（依赖管理/失败处理/资源控制/SLA 监控）。*面试剖析覆盖：为什么不用 crontab、Airflow vs DolphinScheduler 选型、高可用设计、依赖处理、大规模性能瓶颈。*
+
+**[6.14 数据质量](./14-数据质量.md)** —— 数据平台的质检车间。数据质量六维度（准确/完整/一致/及时/唯一/有效）、规则体系（表级/字段级/跨表/趋势）、规则引擎架构、异常检测（统计方法/ML 方法）、告警降噪、数据契约（Data Contract）、质量评分、开源方案（Great Expectations/dbt tests/Soda）。*面试剖析覆盖：质量平台设计、检查对时效的影响、告警疲劳处理、与血缘的关系、实时数据质量。*
+
+**[6.15 平台可观测性](./15-平台可观测性.md)** —— 数据链路的全景监控。任务层/引擎层/数据链路/资源层四维监控、Spark/Flink/Presto 核心指标、端到端延迟监控、SLA 达成率、资源利用率分析、故障根因分析、Grafana 大盘设计、技术选型（Prometheus/ES/Grafana/Alertmanager）。*面试剖析覆盖：与微服务可观测性的区别、端到端延迟监控、Flink 反压排查、告警体系设计、资源成本优化。*
+
 ---
 
 ## 阅读建议

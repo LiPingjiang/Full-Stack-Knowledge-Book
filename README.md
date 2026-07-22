@@ -149,6 +149,13 @@ flowchart LR
 - [6.6 Doris：MPP OLAP / 三种数据模型 / 向量化执行 / 实时导入](./part6-bigdata/06-Doris.md)
 - [6.7 数据仓库设计：维度建模 / 星型 & 雪花模型 / 拉链表 / 数据质量](./part6-bigdata/07-数据仓库设计.md)
 - [6.8 大模型数据工程：预训练数据处理 / 多模态图文视频音频 / MinHash 去重 / Spark+Ray](./part6-bigdata/08-大模型数据工程.md)
+- [6.9 湖仓一体：Iceberg / Hudi / Paimon / 统一 Catalog / 实时入湖 / 批流一体](./part6-bigdata/09-湖仓一体.md)
+- [6.10 语义层与指标平台：维度 / 度量 / 指标口径 / 查询下推 / 权限过滤 / Headless BI](./part6-bigdata/10-语义层与指标平台.md)
+- [6.11 ClickHouse：MergeTree 引擎族 / 列式存储 / 向量化 / 分布式架构 / vs Doris](./part6-bigdata/11-ClickHouse.md)
+- [6.12 Presto 查询引擎：Pipeline 执行 / Connector 联邦查询 / CBO / 附 Trino 简介](./part6-bigdata/12-Presto查询引擎.md)
+- [6.13 任务调度：DAG 依赖 / Airflow / DolphinScheduler / 重试 / SLA / 资源管理](./part6-bigdata/13-任务调度.md)
+- [6.14 数据质量：六维度 / 规则引擎 / 异常检测 / 告警降噪 / 数据契约 / 质量评分](./part6-bigdata/14-数据质量.md)
+- [6.15 平台可观测性：任务 / 引擎 / 链路 / 资源四维监控 / SLA / Grafana 大盘](./part6-bigdata/15-平台可观测性.md)
 
 ### 第七章 · AI 工程基础 〔理解大模型才能用好大模型〕
 
@@ -162,6 +169,7 @@ flowchart LR
 - [7.5 微调入门：LoRA / QLoRA / PEFT / 微调 vs RAG 选型](./part7-ai-engineering/05-微调入门.md)
 - [7.6 Agent 基础：Function Calling / MCP 协议 / Multi-Agent / NL2SQL](./part7-ai-engineering/06-Agent基础.md)
 - [7.7 分布式训练：数据并行 / 流水线并行 / 张量并行 / 3D 混合并行](./part7-ai-engineering/07-分布式训练.md)
+- [7.8 AgentBI 智能分析：自然语言问数 / 查询编排 / 图表推荐 / 多步归因 / 报告生成](./part7-ai-engineering/08-AgentBI智能分析.md)
 
 ### 第八章 · Notebook 平台架构：全栈开发的绝佳研究案例 〔综合应用〕
 
