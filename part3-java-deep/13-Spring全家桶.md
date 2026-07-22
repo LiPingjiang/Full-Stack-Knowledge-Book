@@ -593,6 +593,89 @@ public class OrderController {
 
 ### 6.3 与 Servlet 规范的关系
 
+#### Servlet 到底是什么？
+
+Servlet **不是框架，不是具体的实现包，而是一套 Java 官方定义的"规范"（Specification）**——它规定了"Java Web 应用应该长什么样"，具体来说就是一组接口和抽象类。
+
+```
+Servlet 的三层理解：
+
+① 规范（Specification）
+   → Java EE / Jakarta EE 官方定义的一套标准
+   → 规定了 Web 请求怎么接收、怎么处理、怎么响应
+   → 文档：Jakarta Servlet 6.0 Specification
+
+② 接口（Interface / Abstract Class）
+   → javax.servlet.Servlet（最顶层接口）
+   → javax.servlet.http.HttpServlet（处理 HTTP 请求的抽象类）
+   → 这些接口定义在 javax.servlet-api.jar（或 jakarta.servlet-api.jar）中
+   → 这个 jar 只有接口定义，没有实现！
+
+③ 实现（Implementation）= Servlet 容器
+   → Tomcat、Jetty、Undertow 是 Servlet 规范的具体实现
+   → 它们实现了"接收 HTTP 请求 → 调用你的 Servlet → 返回响应"这套机制
+```
+
+**类比**：
+```
+Servlet 规范 ≈ JDBC 规范
+  → JDBC 定义了 Connection、Statement、ResultSet 等接口
+  → MySQL Driver、PostgreSQL Driver 是 JDBC 的具体实现
+  → 你写代码面向 JDBC 接口，不关心底层是哪个数据库
+
+Servlet 规范也一样：
+  → Servlet 定义了 HttpServlet、HttpServletRequest、HttpServletResponse 等接口
+  → Tomcat、Jetty 是 Servlet 的具体实现（Servlet 容器）
+  → 你写代码面向 Servlet 接口，不关心底层是 Tomcat 还是 Jetty
+```
+
+**在项目中的体现**：
+
+```xml
+<!-- 这个依赖只有接口定义（编译时用），运行时由 Tomcat 提供实现 -->
+<dependency>
+    <groupId>jakarta.servlet</groupId>
+    <artifactId>jakarta.servlet-api</artifactId>
+    <version>6.0.0</version>
+    <scope>provided</scope>  <!-- provided = 编译时有，运行时由容器提供 -->
+</dependency>
+```
+
+```java
+// Servlet 规范定义的核心接口（你不需要直接实现，Spring 帮你封装了）
+public interface Servlet {
+    void init(ServletConfig config);
+    void service(ServletRequest req, ServletResponse res);  // 处理请求
+    void destroy();
+}
+
+// HttpServlet 是 Servlet 的 HTTP 特化版本（抽象类）
+public abstract class HttpServlet extends GenericServlet {
+    protected void doGet(HttpServletRequest req, HttpServletResponse resp) { ... }
+    protected void doPost(HttpServletRequest req, HttpServletResponse resp) { ... }
+}
+
+// Spring 的 DispatcherServlet 就是继承了 HttpServlet
+public class DispatcherServlet extends FrameworkServlet {  // → HttpServletBean → HttpServlet
+    // Spring MVC 的所有魔法都在这里面
+}
+```
+
+#### Spring MVC 和 Servlet 的关系
+
+```
+没有 Spring 的时代（原始 Servlet 开发）：
+  → 每个 URL 对应一个 Servlet 类
+  → 你要手动解析参数、手动转 JSON、手动路由
+  → 非常繁琐
+
+有了 Spring MVC：
+  → 只有一个 Servlet：DispatcherServlet（前端控制器模式）
+  → 它接管所有请求，内部按 @RequestMapping 分发到你的 Controller
+  → 参数绑定、JSON 序列化、异常处理全自动
+  → 你只需要写 Controller 方法
+```
+
 `DispatcherServlet` 本质是一个 `HttpServlet`（继承自 `FrameworkServlet` → `HttpServletBean` → `HttpServlet`），它注册在 Servlet 容器（Tomcat）里，接管所有请求后按 Spring MVC 的策略分发。
 
 所以 Spring MVC = Servlet 规范上的**更高层抽象**。你用 `@RequestMapping` 写的 Controller，最终还是跑在 Servlet 容器里。
