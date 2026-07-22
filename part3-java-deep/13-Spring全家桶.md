@@ -461,9 +461,41 @@ Starter = 依赖聚合 + 自动配置。引入一个 jar 就配好一切：
 </dependency>
 ```
 
-| Starter | 自动配好什么 |
-|---------|-------------|
-| `starter-web` | 内嵌 Tomcat + Spring MVC + Jackson |
+**"自动配置"具体做了什么**：
+
+```java
+// 自动配置 = 读取配置变量 + 创建 Bean（核心是创建 Bean）
+
+// ① 绑定配置变量（application.yml → Java 对象）
+@ConfigurationProperties(prefix = "spring.datasource")
+public class DataSourceProperties {
+    private String url;        // spring.datasource.url
+    private String username;   // spring.datasource.username
+    private String password;   // spring.datasource.password
+}
+
+// ② 用配置变量创建 Bean（这才是最终目的）
+@Configuration
+@EnableConfigurationProperties(DataSourceProperties.class)
+public class DataSourceAutoConfiguration {
+
+    @Bean
+    @ConditionalOnMissingBean
+    public DataSource dataSource(DataSourceProperties props) {
+        HikariDataSource ds = new HikariDataSource();
+        ds.setJdbcUrl(props.getUrl());
+        ds.setUsername(props.getUsername());
+        ds.setPassword(props.getPassword());
+        return ds;  // 最终产物是一个可用的 Bean
+    }
+}
+```
+
+**类比**：你去餐厅点了一份套餐（Starter），厨房（自动配置）根据你的口味偏好（配置变量：少盐、微辣）自动做好了一桌菜（Bean）端上来。配置变量是调味参数，Bean 才是最终产物。
+
+| Starter | 自动配好什么（创建了哪些 Bean） |
+|---------|-------------------------------|
+| `starter-web` | 内嵌 Tomcat + DispatcherServlet + Jackson 消息转换器 |
 | `starter-webflux` | 内嵌 Netty + WebFlux（响应式） |
 | `starter-data-redis` | RedisTemplate + Lettuce 连接池 |
 | `starter-data-jpa` | Hibernate + DataSource + EntityManager |
@@ -492,7 +524,74 @@ ViewResolver（视图解析，前后端分离时直接返回 JSON）
 响应客户端
 ```
 
-### 6.2 与 Servlet 规范的关系
+### 6.2 开发者写什么 vs 框架做什么
+
+**关键问题**：上面这么多组件，开发者实际写的是哪部分？
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Spring 框架自动处理（对开发者透明）                               │
+│                                                                   │
+│  DispatcherServlet ← 框架内置，你不需要写                         │
+│       ↓                                                           │
+│  HandlerMapping ← 框架根据 @RequestMapping 注解自动构建映射表      │
+│       ↓                                                           │
+│  HandlerAdapter ← 框架自动处理参数绑定（JSON→对象、路径变量等）     │
+│       ↓                                                           │
+├───────────────────────────────────────────────────────────────────┤
+│  开发者写的代码（业务逻辑）                                        │
+│                                                                   │
+│  Controller 方法 ← 你写的！接收请求、调用 Service、返回结果        │
+│       ↓                                                           │
+├───────────────────────────────────────────────────────────────────┤
+│  Spring 框架自动处理（对开发者透明）                               │
+│                                                                   │
+│  ViewResolver ← 框架内置，不是用户写的业务类                       │
+│       ↓                                                           │
+│  响应序列化 ← Jackson 自动把对象转 JSON                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**逐个澄清**：
+
+| 组件 | 谁写的 | 开发者需要关心吗 |
+|------|--------|----------------|
+| **DispatcherServlet** | Spring 框架内置 | ❌ 完全透明，你甚至不知道它存在 |
+| **HandlerMapping** | Spring 框架自动构建 | ❌ 你只需要写 `@GetMapping("/orders")`，框架自动注册映射 |
+| **HandlerAdapter** | Spring 框架内置 | ❌ 参数绑定（`@RequestBody`、`@PathVariable`）自动完成 |
+| **Controller** | **开发者写** | ✅ 这是你的业务入口 |
+| **ViewResolver** | Spring 框架内置 | ❌ 不是业务类，不是 Controller 调用的 |
+
+**ViewResolver 到底是什么**：
+
+```java
+// ViewResolver 不是用户写的业务类！它是框架内部的组件，负责"把返回值变成响应"
+
+// 场景一：传统 JSP 项目（已过时）
+@Controller
+public class PageController {
+    @GetMapping("/home")
+    public String home() {
+        return "home";  // 返回视图名 → ViewResolver 找到 /WEB-INF/views/home.jsp 渲染
+    }
+}
+// 这里 ViewResolver 把字符串 "home" 解析为一个 JSP 文件路径
+
+// 场景二：前后端分离（当前主流）
+@RestController  // = @Controller + @ResponseBody
+public class OrderController {
+    @GetMapping("/api/orders/{id}")
+    public Order getOrder(@PathVariable Long id) {
+        return orderService.findById(id);  // 返回对象 → 直接序列化为 JSON
+    }
+}
+// 前后端分离时，ViewResolver 基本不参与
+// @ResponseBody 告诉框架：不要找视图，直接把返回对象用 Jackson 转成 JSON 写入响应体
+```
+
+**一句话总结**：开发者日常只写 Controller（+ Service + DAO），Controller 之前的所有组件（DispatcherServlet、HandlerMapping、HandlerAdapter）和之后的 ViewResolver 都是 Spring 框架内置的，对开发者完全透明。前后端分离项目中 ViewResolver 几乎不存在感——`@RestController` 直接返回 JSON，不经过视图解析。
+
+### 6.3 与 Servlet 规范的关系
 
 `DispatcherServlet` 本质是一个 `HttpServlet`（继承自 `FrameworkServlet` → `HttpServletBean` → `HttpServlet`），它注册在 Servlet 容器（Tomcat）里，接管所有请求后按 Spring MVC 的策略分发。
 
