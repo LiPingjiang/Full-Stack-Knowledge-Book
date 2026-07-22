@@ -15,8 +15,8 @@ Presto = 计算引擎（读别人的数据，用 SQL 查询）
 
 | 特性 | 说明 |
 |------|------|
-| **联邦查询** | 一条 SQL 同时查 Hive + MySQL + Kafka |
-| **内存计算** | 数据在内存中流式处理，不落盘（Pipeline 执行） |
+| **联邦查询** | 一条 SQL 同时查 Hive + MySQL + Kafka，各数据源的数据拉到 Worker 内存中做 JOIN |
+| **内存计算** | 中间数据不落盘，通过网络在 Worker 之间流式传输（Pipeline 执行）——注意仍然涉及跨机器网络传输，"内存"指的是不写磁盘，不是所有数据在一台机器上 |
 | **交互式** | 秒级~分钟级响应，适合 Ad-hoc 分析 |
 | **标准 SQL** | ANSI SQL 兼容，学习成本低 |
 | **插件化** | Connector 架构，接入新数据源只需实现接口 |
@@ -87,13 +87,113 @@ Presto = 计算引擎（读别人的数据，用 SQL 查询）
 6. 最终结果流式返回 Client
 ```
 
-**关键特点**：Pipeline 执行——数据在内存中流式处理，上游产出一批数据立即传给下游，不需要等整个 Stage 完成。这是 Presto 比 Spark 快的核心原因之一（Spark 是 Stage 间全量 Shuffle 落盘）。
+**关键特点**：Pipeline 执行——数据在 Worker 之间通过网络流式传输，中间结果不落盘。注意：这**不是说所有数据在一台机器的内存里**，而是说数据在多台 Worker 之间通过 HTTP 流式传递时，不写磁盘中间文件。上游产出一批数据立即通过网络发给下游 Worker，不需要等整个 Stage 完成。
+
+### 2.4 Pipeline 执行 vs Stage-based 执行（核心差异详解）
+
+这是 Presto 和 Spark 最本质的架构区别。**不是"一步完成后做下一步"vs"一步完成后做下一步"的区别**，而是"上下游能不能同时执行"的区别：
+
+```
+Spark 的 Stage-based 执行（串行阻塞）：
+
+  时间轴 →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
+
+  Stage 1: [===扫描全部数据===][===写Shuffle文件到磁盘===]
+                                                            ↓ 等 Stage 1 全部完成
+  Stage 2:                                                  [===从磁盘读Shuffle===][===聚合===][===写磁盘===]
+                                                                                                            ↓ 等 Stage 2 全部完成
+  Stage 3:                                                                                                  [===读===][===输出===]
+
+  特点：
+    ① Stage 之间有"屏障"——上一个 Stage 的所有 Task 全部完成，下一个才能开始
+    ② 中间数据写磁盘（Shuffle Write）→ 下游从磁盘读（Shuffle Read）
+    ③ 总延迟 = Stage 1 时间 + Stage 2 时间 + Stage 3 时间（串行累加）
+```
+
+```
+Presto 的 Pipeline 执行（流水线并行）：
+
+  时间轴 →→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→→
+
+  扫描层:  [批1][批2][批3][批4][批5]...
+              ↓    ↓    ↓    ↓
+  聚合层:    [批1][批2][批3][批4]...     ← 扫描层产出批1后，聚合层立即开始处理
+                ↓    ↓    ↓
+  输出层:      [批1][批2][批3]...        ← 聚合层产出批1后，输出层立即开始
+
+  特点：
+    ① 没有"屏障"——上游产出第一批数据后，下游立即开始处理
+    ② 中间数据通过网络（HTTP Exchange）流式传输，不写磁盘
+    ③ 总延迟 ≈ 最慢那一层的时间（流水线并行，不是串行累加）
+```
+
+**用生活类比**：
+
+```
+Stage-based（Spark）= 工厂流水线停机换模式：
+  第一道工序把所有零件都加工完 → 全部搬到仓库 → 第二道工序从仓库取出来继续加工
+  → 中间有"搬运到仓库"和"等待全部完成"的时间
+
+Pipeline（Presto）= 真正的流水线：
+  第一道工序加工完一个零件 → 立即传给第二道工序 → 第二道工序立即开始
+  → 没有中间仓库，没有等待，所有工序同时运转
+```
+
+**为什么 Spark 要用 Stage-based？**
+
+```
+Spark 的设计目标是大规模 ETL（TB~PB 级），需要容错：
+  → Shuffle 数据写磁盘 = 如果下游 Task 失败，可以从磁盘重读，不需要重跑上游
+  → Stage 屏障 = 保证上游数据完整后再开始下游，避免数据不一致
+
+Presto 的设计目标是交互式查询（GB~TB 级），追求低延迟：
+  → 不落盘 = 省去磁盘 I/O 时间
+  → Pipeline = 上下游并行，减少总延迟
+  → 代价：没有容错，查询失败只能从头重跑
+```
+
+**数据在 Worker 之间的网络传输（Exchange）**：
+
+```
+Presto 的 Pipeline 执行中，数据确实要跨机器传输：
+
+  Worker 1（扫描 Split 1）──┐
+  Worker 2（扫描 Split 2）──┼── HTTP 流式传输 ──→ Worker 5（JOIN/聚合）──→ Coordinator
+  Worker 3（扫描 Split 3）──┤     （Exchange）                                ↓
+  Worker 4（扫描 Split 4）──┘                                              返回结果
+
+  "内存中流式处理"的准确含义：
+    ✅ 中间数据不写磁盘（对比 Spark 写 Shuffle 文件）
+    ✅ 数据通过网络在 Worker 之间流式传递
+    ❌ 不是说所有数据在一台机器的内存里
+    ❌ 不是说不需要网络传输
+```
 
 ---
 
 ## 三、Connector 机制
 
-### 3.1 Connector 架构
+### 3.1 为什么需要 Connector
+
+Presto 是纯计算引擎，自己不存数据。它需要对接各种数据源（HDFS、MySQL、Kafka、S3...），所以抽象出 Connector 作为统一的"适配器"接口——每种数据源实现一个 Connector，Presto 的计算引擎只需要面对统一的数据格式（Page），不需要关心底层是什么存储。
+
+```
+Presto 的 Connector 架构：
+
+  SELECT * FROM hive.db.orders o
+  JOIN mysql.db.users u ON o.user_id = u.id
+
+  Presto Coordinator
+    ├── Hive Connector    → 知道怎么读 HDFS 上的 Parquet/ORC
+    ├── MySQL Connector   → 知道怎么连 MySQL 执行查询
+    ├── Iceberg Connector → 知道怎么读 Iceberg 表的 Manifest + Data Files
+    ├── Kafka Connector   → 知道怎么消费 Kafka Topic
+    └── ...
+
+  计算引擎只看到统一的 Page（一批列式数据），不关心数据从哪来
+```
+
+### 3.2 Connector 接口
 
 ```java
 // Connector 需要实现的核心接口
@@ -104,7 +204,12 @@ public interface Connector {
 }
 ```
 
-### 3.2 主流 Connector
+每个 Connector 告诉 Presto 三件事：
+1. **有什么数据**（Metadata）：有哪些表、每张表有哪些列
+2. **怎么拆分**（SplitManager）：数据可以拆成哪些分片并行读取
+3. **怎么读取**（PageSourceProvider）：读取一个分片的数据，返回列式 Page
+
+### 3.3 主流 Connector
 
 | Connector | 数据源 | 特点 |
 |-----------|--------|------|
@@ -116,7 +221,7 @@ public interface Connector {
 | **Redis** | Redis | 查询 Redis 中的数据 |
 | **TPCH/TPCDS** | 基准测试 | 内置测试数据生成 |
 
-### 3.3 联邦查询示例
+### 3.5 联邦查询示例
 
 ```sql
 -- 同一条 SQL 查询 Hive 和 MySQL 的数据
@@ -135,6 +240,30 @@ WHERE h.dt = '2024-01-20'
 - `hive.analytics.page_view_daily` — 从 HDFS 读取 Hive 表
 - `mysql.user_db.users` — 从 MySQL 读取用户表
 - Presto 自动处理跨源 JOIN
+
+**联邦查询的执行过程**：
+
+```
+Step 1: Coordinator 解析 SQL，识别出两个数据源
+
+Step 2: 各 Worker 并行从不同数据源拉取数据
+  Worker 1-4: 通过 Hive Connector 从 HDFS 并行读 page_view_daily（多个 Split）
+  Worker 5:   通过 MySQL Connector 从 MySQL 读 users（谓词 vip_level>=3 下推到 MySQL）
+
+Step 3: 数据拉到 Worker 内存后，在 Presto 内部做 JOIN
+  → users 表较小 → 广播（Broadcast）到所有 JOIN Worker 的内存中
+  → page_view_daily 数据流式传入 JOIN Worker
+  → 在 Worker 内存中完成 Hash JOIN
+
+Step 4: 结果返回 Coordinator → 返回客户端
+```
+
+**中间数据缓存在 Worker 内存中**——各数据源的数据拉到 Worker 内存后做 JOIN，不落盘。这也是 Presto 联邦查询的局限：如果两侧数据都很大（超过集群内存），会 OOM 失败。
+
+**适合联邦查询的场景**：
+- ✅ 大表 JOIN 小表（小表广播到内存）
+- ✅ 大表经过过滤后数据量可控
+- ❌ 两张超大表 JOIN（中间数据超过集群内存 → OOM）
 
 ---
 
@@ -180,8 +309,9 @@ Presto 是纯内存计算，内存是最关键的资源：
 
 | 维度 | Presto | Spark SQL |
 |------|--------|-----------|
-| **执行模型** | Pipeline（流式） | Stage-based（批式） |
-| **中间数据** | 内存中流转，不落盘 | Shuffle 落盘 |
+| **执行模型** | Pipeline（流水线并行） | Stage-based（串行阻塞） |
+| **中间数据** | 内存中通过网络流式传输，不落盘 | Shuffle 写磁盘，下游从磁盘读 |
+| **上下游关系** | 上下游同时执行（流水线） | 上游全部完成后下游才开始（屏障） |
 | **延迟** | 秒级 | 分钟级 |
 | **容错** | 无（查询失败需重跑） | 有（RDD 血缘重算） |
 | **数据规模** | GB~TB | TB~PB |
