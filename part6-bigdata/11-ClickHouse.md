@@ -267,6 +267,22 @@ Skip Index（二级索引）：
 | **HDFS/S3 Engine** | 分钟级 | 批量导入外部文件 |
 | **clickhouse-copier** | 分钟级 | 集群间数据迁移 |
 
+**为什么 INSERT INTO 是"实时"，Kafka Engine 反而是"秒级"？**
+
+这里的延迟指**数据可见延迟**：
+
+```
+INSERT INTO（你主动写入）：
+  客户端攒好一批 → INSERT → ClickHouse 写入 Part → 立即可查
+  延迟 = 网络往返（毫秒级），你控制什么时候写
+
+Kafka Engine（ClickHouse 定时去拉）：
+  Kafka 有新消息 → ClickHouse 定时轮询 → 攒一批 → 写入 Part → 可查
+  延迟 = 轮询间隔（kafka_poll_timeout_ms，默认几秒）
+```
+
+ClickHouse 的 Kafka Engine 不是逐条消费的，而是**定时批量拉取**。因为 MergeTree 不适合高频小写入（每次写入生成一个 Part 文件，太频繁会小文件爆炸），所以故意攒批再写。
+
 **写入最佳实践**：
 - 每次 INSERT 至少 1000-10000 行（避免产生过多小 Part）
 - 每秒不超过 1 次 INSERT（让后台 Merge 跟上）
@@ -300,6 +316,87 @@ GROUP BY hour;
 - 数据写入源表时，自动增量计算并写入物化视图
 - 查询物化视图 = 查询预计算结果，极快
 - 适合固定维度的聚合场景（看板、报表）
+
+**ClickHouse 的 Engine 概念**：在 ClickHouse 中，**每张表都必须指定一个 Engine**（表引擎），Engine 决定了数据怎么存储、怎么索引、怎么合并。物化视图的目标表也是一张独立的表，有自己的 Engine：
+
+```sql
+-- 源表用 MergeTree（基础引擎，按排序键存储）
+CREATE TABLE events (...) ENGINE = MergeTree() ORDER BY (dt, user_id);
+
+-- 物化视图的目标表用 SummingMergeTree（合并时自动求和）
+CREATE MATERIALIZED VIEW hourly_gmv
+ENGINE = SummingMergeTree() ORDER BY (hour)  ← 这是目标表的 Engine
+AS SELECT ...;
+```
+
+常见 Engine 类型：
+
+| Engine | 用途 | 特点 |
+|--------|------|------|
+| MergeTree | 通用分析表 | 基础引擎，支持排序、分区、索引 |
+| SummingMergeTree | 预聚合汇总表 | Merge 时自动对数值列求和 |
+| AggregatingMergeTree | 复杂聚合表 | Merge 时执行聚合函数（物化视图常用） |
+| ReplacingMergeTree | 去重表 | Merge 时按排序键保留最新行 |
+| Kafka | Kafka 消费 | 不存数据，只是 Kafka 的读取接口 |
+| Memory | 临时表 | 数据存内存，重启丢失 |
+
+> **对比 Doris**：Doris 没有 Engine 概念，所有表用同一套存储引擎（BE 的列式存储），通过**数据模型**（Duplicate/Aggregate/Unique）区分行为。ClickHouse 的 Engine 更灵活（每张表可以选不同的存储和合并策略），但也更复杂。
+
+### 6.2 ClickHouse vs Doris 物化视图对比
+
+| 维度 | ClickHouse | Doris |
+|------|-----------|-------|
+| **触发方式** | 写入源表时同步触发 | 导入数据时同步构建 |
+| **导入方式差异** | INSERT INTO 语句 | Stream Load / Broker Load / Routine Load / INSERT |
+| **存储** | 独立目标表（有自己的 Engine） | 基表的附属 Rollup（同一 Tablet 组内） |
+| **聚合能力** | 任意 SQL（支持 JOIN、子查询） | 仅单表聚合（不支持 JOIN） |
+| **查询路由** | 需手动查目标表名 | **自动路由**——优化器自动命中最优物化视图 |
+| **历史数据** | 创建后只处理新数据，历史需手动回填 | 创建时自动构建历史数据 |
+| **DELETE 同步** | 物化视图不自动同步删除 | 引擎保证基表和物化视图一致 |
+
+**Doris 的"导入触发"是什么意思？**
+
+Doris 的数据写入不只有 INSERT INTO，还有专用的导入方式（这些才是生产中的主流）：
+
+```
+Stream Load  — HTTP 推送，实时小批量（最常用的实时导入）
+Broker Load  — 从 HDFS/S3 批量拉取
+Routine Load — 持续消费 Kafka（类似 ClickHouse 的 Kafka Engine）
+INSERT INTO  — SQL 写入（也支持，但生产中不是主流）
+```
+
+无论用哪种方式导入，Doris 都会同步更新物化视图。所以说"导入触发"比"INSERT 触发"更准确——它覆盖了所有导入路径。
+
+**查询路由的体验差异**（最大的使用区别）：
+
+```sql
+-- ClickHouse：必须知道物化视图的目标表名
+SELECT * FROM hourly_gmv;  ← 你要记住这个名字
+
+-- Doris：直接查基表，优化器自动路由
+SELECT hour, sum(amount) FROM events GROUP BY hour;
+  ← 优化器发现物化视图能满足，自动命中，用户无感
+```
+
+**Doris 2.0+ 异步物化视图**：
+
+Doris 2.0 引入了异步物化视图，弥补了同步物化视图不支持 JOIN 的限制：
+
+```sql
+-- 支持 JOIN、定时刷新
+CREATE MATERIALIZED VIEW mv_async
+BUILD DEFERRED REFRESH AUTO ON SCHEDULE EVERY 5 MINUTE
+AS SELECT o.city, p.category, sum(o.amount) AS total
+FROM orders o JOIN dim_product p ON o.prod_id = p.id
+GROUP BY o.city, p.category;
+```
+
+| | Doris 同步物化视图 | Doris 异步物化视图（2.0+） | ClickHouse 物化视图 |
+|--|--|--|--|
+| JOIN | ❌ | ✅ | ✅ |
+| 数据新鲜度 | 实时 | 有延迟（刷新间隔） | 实时 |
+| 查询路由 | 自动 | 自动 | 手动 |
+| 灵活度 | 低 | 高 | 高 |
 
 ---
 
