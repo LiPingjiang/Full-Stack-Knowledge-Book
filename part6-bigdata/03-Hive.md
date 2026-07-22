@@ -227,12 +227,33 @@ SORT BY（分区内排序，N 个 Reducer）：
       → Reducer 2 → 内部有序
   全局无序，但每个输出文件内部有序
 
+  SORT BY 不是"排了又白排"——它的价值是用并行的局部排序代替昂贵的全局排序。
+  典型场景：
+  ① 下游任务需要有序输入：如 HBase BulkLoad 要求 HFile 按 RowKey 有序，
+    先 SORT BY rowkey 输出有序文件，再 BulkLoad 直接加载。
+  ② 下游做 Sort-Merge Join：两张大表各自按 join key SORT BY 写成有序文件，
+    下一个 Job 读两个有序文件做归并连接（O(n)），不需要 Hash Join 把一侧全加载到内存。
+  ③ ORC/Parquet 写入优化：文件内部有序时，min/max 统计信息更紧凑，
+    下游查询的 Predicate Pushdown 跳过更多无关行组。
+
 DISTRIBUTE BY + SORT BY（指定分区 + 分区内排序）：
   按 dept_no 分区 → Reducer 0（dept 4）→ 按 sallary 排序
                   → Reducer 1（dept 1）→ 按 sallary 排序
                   → Reducer 2（dept 2）→ 按 sallary 排序
                   → Reducer 3（dept 3）→ 按 sallary 排序
   同部门数据在同一文件，文件内按薪资排序
+
+  示例：原始数据 6 行，SET mapreduce.job.reduces=2;
+  DISTRIBUTE BY dept_no SORT BY dept_no, salary DESC 后：
+
+  Reducer 0（dept_no=D01）：        Reducer 1（dept_no=D02）：
+  | user_id | dept_no | salary |   | user_id | dept_no | salary |
+  |---------|---------|--------|   |---------|---------|--------|
+  | 3(王五)  | D01     | 15000  |   | 6(孙八)  | D02     | 20000  |
+  | 5(钱七)  | D01     | 11000  |   | 2(李四)  | D02     | 12000  |
+  | 1(张三)  | D01     | 8000   |   | 4(赵六)  | D02     | 9000   |
+
+  → 同部门一定在同一个 Reducer，组内按薪资从高到低有序。
 
 CLUSTER BY（分区字段 = 排序字段，只能 ASC）：
   按 dept_no 分区 → Reducer 0 → 按 dept_no 升序
