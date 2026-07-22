@@ -183,6 +183,8 @@ SORT BY dept_no DESC;
 ```
 
 > **单独使用 SORT BY 的分区规则**：不指定 DISTRIBUTE BY 时，数据按内部默认算法分配到各 Reducer（非按某字段 hash），无法控制哪个 key 到哪个 Reducer。如果需要控制分区，必须搭配 DISTRIBUTE BY。
+>
+> **一个 Reducer 写几个文件？** 标准情况下一个 Reducer = 一个输出文件（part-00000, part-00001...），所以"Reducer 内有序"等价于"每个输出文件内有序"。例外是**动态分区写入**——一个 Reducer 可能处理多个分区值，写到不同分区目录下产生多个文件。此时如果 DISTRIBUTE BY 按分区字段分发（同分区值在同一 Reducer），每个分区文件内部依然有序；如果没有按分区字段 DISTRIBUTE，一个 Reducer 里交错出现不同分区的数据，拆到各分区文件时连续性可能被打断，不保证每个文件内有序。
 
 #### DISTRIBUTE BY——控制分区规则
 
