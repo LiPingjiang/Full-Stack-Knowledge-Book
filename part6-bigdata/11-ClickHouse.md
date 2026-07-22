@@ -436,7 +436,7 @@ Primary Index（稀疏）：每 8192 行一个条目
 Skip Index（二级索引）：
   - minmax: 每个 granule 的 min/max
   - set: 每个 granule 的去重值集合
-  - bloom_filter: 布隆过滤器
+  - bloom_filter: [布隆过滤器](../part3-java-deep/A1-核心数据结构原理.md#三布隆过滤器bloom-filter用-1-的误判换-99-的内存节省)
   - ngrambf_v1: N-gram 布隆过滤器（模糊匹配）
 ```
 

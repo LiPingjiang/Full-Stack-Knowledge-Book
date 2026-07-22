@@ -82,7 +82,7 @@ flink run -Dpipeline.max-parallelism=512 -c com.example.MyJob my-job.jar
 | `state.backend.rocksdb.writebuffer.size` | `64 MB` | 单个 MemTable（写缓冲区）的大小，MemTable 写满后刷盘生成 SST 文件 | 写多读少场景可适当调大（如 128MB），减少刷盘频率 |
 | `state.backend.rocksdb.writebuffer.count` | `2` | 每个 State 允许同时存在的 MemTable 数量（含正在刷盘的） | 一般保持默认；写入极高峰场景可调至 3~4，但会增加内存占用 |
 | `state.backend.rocksdb.thread.num` | `2` | RocksDB 后台线程数（用于 Compaction 和 Flush） | 大状态、Compaction 压力大时调高至 4；需权衡 CPU 资源 |
-| `state.backend.rocksdb.bloom-filter.per-key-bits` | `10`（10 bits/key，约 1% 误判率） | 每个 Key 用于构建 Bloom Filter 的 bit 数，用于快速判断 key 是否可能存在于某个 SST 文件，降低读放大 | 保持默认即可满足大部分场景，读密集型可适当调高（如 16bit）以降低误判率 |
+| `state.backend.rocksdb.bloom-filter.per-key-bits` | `10`（10 bits/key，约 1% 误判率） | 每个 Key 用于构建 [Bloom Filter](../part3-java-deep/A1-核心数据结构原理.md#三布隆过滤器bloom-filter用-1-的误判换-99-的内存节省) 的 bit 数，用于快速判断 key 是否可能存在于某个 SST 文件，降低读放大 | 保持默认即可满足大部分场景，读密集型可适当调高（如 16bit）以降低误判率 |
 | `state.backend.rocksdb.predefined-options` | `DEFAULT` | RocksDB 预定义调优模板，如 `SPINNING_DISK_OPTIMIZED`、`SPINNING_DISK_OPTIMIZED_HIGH_MEM`、`FLASH_SSD_OPTIMIZED` | 机械盘用 `SPINNING_DISK_OPTIMIZED_HIGH_MEM`；SSD 用 `FLASH_SSD_OPTIMIZED` |
 | `state.backend.rocksdb.localdir`（也写作 `state.backend.rocksdb.local-dir`） | 系统临时目录 | RocksDB 本地文件存放目录，支持配置多个目录（逗号分隔）实现多磁盘均摊 I/O | 生产必须配置到独立数据盘（优先 SSD），多盘场景配置多个路径分摊 I/O，避免多个 Sub-Task 共用一块盘导致 I/O 打满 |
 

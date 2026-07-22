@@ -123,7 +123,7 @@ ORC / Parquet 的内部结构自带多级过滤，效果已经覆盖了传统索
 | 过滤机制 | 原理 | 效果 |
 |---------|------|------|
 | **min/max 统计信息** | 每个 Stripe（行组，约 25 万行）记录每列的最小值/最大值 | `WHERE amount > 10000` 可以跳过 max < 10000 的整个 Stripe |
-| **Bloom Filter** | 对高基数列（如 user_id）建布隆过滤器 | 快速判断某个值"一定不在"这个 Stripe 中 |
+| **[Bloom Filter](../part3-java-deep/A1-核心数据结构原理.md#三布隆过滤器bloom-filter用-1-的误判换-99-的内存节省)** | 对高基数列（如 user_id）建布隆过滤器 | 快速判断某个值"一定不在"这个 Stripe 中 |
 | **Predicate Pushdown** | 把 WHERE 条件下推到文件读取层 | 不满足条件的行组直接不读入内存 |
 | **列裁剪** | 只读 SELECT 中出现的列 | `SELECT name FROM users` 只读 name 这一列的数据，跳过其他列 |
 
