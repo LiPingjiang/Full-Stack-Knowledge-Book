@@ -409,13 +409,45 @@ public class Application {
 
 ### 5.3 条件装配注解
 
-| 注解 | 含义 |
-|------|------|
-| `@ConditionalOnClass` | 类路径上有指定 class 才生效 |
-| `@ConditionalOnMissingBean` | 容器中没有该 Bean 才创建（让你可以覆盖默认） |
-| `@ConditionalOnProperty` | 配置文件中有指定属性才生效 |
-| `@ConditionalOnWebApplication` | 当前是 Web 应用才生效 |
-| `@ConditionalOnBean` | 容器中已有指定 Bean 才生效 |
+条件装配注解用在**自动配置类（`@Configuration` 类）**或其内部的 **`@Bean` 方法**上，控制"这个配置/Bean 在什么条件下才生效"。
+
+**标注位置**：
+
+```java
+// ① 标注在自动配置类上 → 整个配置类是否生效
+@Configuration
+@ConditionalOnClass(DataSource.class)  // 类路径上有 DataSource 才加载这个配置类
+public class DataSourceAutoConfiguration {
+
+    // ② 标注在 @Bean 方法上 → 单个 Bean 是否创建
+    @Bean
+    @ConditionalOnMissingBean  // 容器中没有 DataSource Bean 时才创建默认的
+    public DataSource dataSource() {
+        return new HikariDataSource();
+    }
+
+    @Bean
+    @ConditionalOnProperty(name = "app.cache.enabled", havingValue = "true")
+    public CacheManager cacheManager() {  // 配置文件里 app.cache.enabled=true 才创建
+        return new RedisCacheManager();
+    }
+}
+```
+
+**谁会用这些注解**：
+- **Spring Boot 官方的 AutoConfiguration 类**（`spring-boot-autoconfigure` 包里几百个 `XxxAutoConfiguration`）
+- **你自己写的自定义 Starter** 中的配置类
+- 普通业务代码中偶尔也会用（比如根据环境变量决定是否注册某个 Bean）
+
+| 注解 | 含义 | 典型场景 |
+|------|------|---------|
+| `@ConditionalOnClass` | 类路径上有指定 class 才生效 | 引入了 Redis jar 才配 Redis |
+| `@ConditionalOnMissingBean` | 容器中没有该 Bean 才创建（让你可以覆盖默认） | 用户自定义了 DataSource 就不用默认的 |
+| `@ConditionalOnProperty` | 配置文件中有指定属性才生效 | `app.feature.x=true` 才开启功能 |
+| `@ConditionalOnWebApplication` | 当前是 Web 应用才生效 | 非 Web 项目不注册 DispatcherServlet |
+| `@ConditionalOnBean` | 容器中已有指定 Bean 才生效 | 有了 DataSource 才配 JdbcTemplate |
+
+**一句话总结**：`@ConditionalOnXxx` 注解标注在 `@Configuration` 类或 `@Bean` 方法上，是 Spring Boot 自动配置的"开关"——决定某个配置类/Bean 在当前环境下是否应该被加载。
 
 ### 5.4 Starter 机制
 
