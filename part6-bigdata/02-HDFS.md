@@ -174,6 +174,8 @@ HDFS 适合大文件分析，但不适合海量小记录的快速读写——比
 
 ### 7.1 LSM Tree 原理
 
+> 本节是 HBase 语境下的简要介绍。LSM-Tree 的完整深入讲解（SST 文件内部结构、分层 Compaction、三种放大效应、各系统实现对比等）见 [A1 核心数据结构原理 · 第十一章](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)。
+
 HBase 的存储引擎是 LSM Tree（Log-Structured Merge-Tree），跟 MySQL 的 B+ Tree 是两种不同的存储引擎哲学。B+ Tree 优化读性能（有序结构，二分查找快）但写性能受限（随机写——每次插入可能触发页分裂和磁盘随机 IO）。LSM Tree 优化写性能——写入流程是顺序写 WAL（Write-Ahead Log，保证持久性）→ 写 MemTable（内存中的有序跳表/红黑树）→ MemTable 满了刷盘成 SSTable（Sorted String Table，磁盘上的有序文件）。所有写入都是顺序的，没有随机磁盘 IO。
 
 读取需要合并查询 MemTable + 多层 SSTable——先查 MemTable（内存中最新数据），再逐层查 SSTable（磁盘上历史数据）。为了加速读取，用布隆过滤器（参见 A1 核心数据结构原理）判断某个 key 是否在某个 SSTable 中，避免无效的磁盘读取。后台 Compaction 定期合并多层 SSTable，清理已删除和已覆盖的数据，减少读取时的合并层数。
