@@ -156,6 +156,8 @@ flowchart LR
 - [6.13 任务调度：DAG 依赖 / Airflow / DolphinScheduler / 重试 / SLA / 资源管理](./part6-bigdata/13-任务调度.md)
 - [6.14 数据质量：六维度 / 规则引擎 / 异常检测 / 告警降噪 / 数据契约 / 质量评分](./part6-bigdata/14-数据质量.md)
 - [6.15 平台可观测性：任务 / 引擎 / 链路 / 资源四维监控 / SLA / Grafana 大盘](./part6-bigdata/15-平台可观测性.md)
+- [6.16 数据接入与数据集成：CDC / Flink CDC / Debezium / DataX / SeaTunnel / Schema Registry](./part6-bigdata/16-数据接入与数据集成.md)
+- [6.17 多租户与权限体系：Ranger / 行列级权限 / 数据脱敏 / 审计 / 数据分类分级](./part6-bigdata/17-多租户与权限体系.md)
 
 ### 第七章 · AI 工程基础 〔理解大模型才能用好大模型〕
 

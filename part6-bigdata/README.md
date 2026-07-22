@@ -61,6 +61,10 @@ graph LR
 
 **[6.15 平台可观测性](./15-平台可观测性.md)** —— 数据链路的全景监控。任务层/引擎层/数据链路/资源层四维监控、Spark/Flink/Presto 核心指标、端到端延迟监控、SLA 达成率、资源利用率分析、故障根因分析、Grafana 大盘设计、技术选型（Prometheus/ES/Grafana/Alertmanager）。*面试剖析覆盖：与微服务可观测性的区别、端到端延迟监控、Flink 反压排查、告警体系设计、资源成本优化。*
 
+**[6.16 数据接入与数据集成](./16-数据接入与数据集成.md)** —— 数据平台的入口。批量接入（DataX/SeaTunnel/Sqoop）vs 实时接入（CDC）、Flink CDC 全增量一体、Debezium + Kafka 架构、Canal 简介、日志采集（Filebeat/Fluentd）、Schema Registry 与 Schema Evolution、异构数据源适配层设计、统一接入平台架构。*面试剖析覆盖：CDC vs 全量同步、Flink CDC 全增量一体原理、Schema 变更处理、不丢不重保障、DataX vs SeaTunnel 选型。*
+
+**[6.17 多租户与权限体系](./17-多租户与权限体系.md)** —— 数据安全与隔离。多租户隔离方案（物理/资源/逻辑）、RBAC + ABAC 权限模型、行级权限（SQL 改写注入）、列级权限与数据脱敏（动态/静态）、Apache Ranger 架构与策略、数据分类分级、审计日志、合规要求映射（个保法/GDPR）、权限与平台各层的集成。*面试剖析覆盖：行级权限实现与性能、多租户资源隔离、Ranger Plugin 机制、脱敏方案选型、统一权限体系设计。*
+
 ---
 
 ## 阅读建议
