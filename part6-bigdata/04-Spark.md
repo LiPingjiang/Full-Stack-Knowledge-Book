@@ -331,6 +331,123 @@ println(accumulator.value)  // 输出全局错误总数
 | **广播变量** | 大变量重复拷贝 | 定义 + 修改 | 只读 | 维表数据下发、配置字典 |
 | **累加器** | 跨 Executor 全局计数 | 定义 + 读取 | 只能 add | 错误计数、有效记录统计 |
 
+<details>
+<summary><b>展开：累加器在生产环境中的真实使用案例</b></summary>
+
+累加器看起来简单，但在大厂生产环境中有很多实战用法，以下是几个典型场景：
+
+**案例 1：ETL 数据质量监控（电商/金融数仓团队常见做法）**
+
+每天跑 T+1 的 ETL 任务时，用累加器统计脏数据量，写入监控系统触发告警：
+
+```scala
+val nullFieldCount = spark.sparkContext.longAccumulator("null_field_count")
+val malformedJsonCount = spark.sparkContext.longAccumulator("malformed_json")
+val totalProcessed = spark.sparkContext.longAccumulator("total_processed")
+
+val cleanDF = rawDF.filter { row =>
+  totalProcessed.add(1)
+  if (row.isNullAt(row.fieldIndex("user_id"))) {
+    nullFieldCount.add(1)
+    false
+  } else if (!isValidJson(row.getString(row.fieldIndex("extra_info")))) {
+    malformedJsonCount.add(1)
+    false
+  } else true
+}
+cleanDF.write.parquet(outputPath)
+
+// ETL 结束后上报监控
+reportMetrics(Map(
+  "total" -> totalProcessed.value,
+  "null_fields" -> nullFieldCount.value,
+  "malformed" -> malformedJsonCount.value
+))
+// 脏数据率超过阈值（如 5%）→ 触发 PagerDuty/飞书告警
+```
+
+这是最常见的生产用法——**不影响主流程的前提下，顺便统计数据质量指标**。用 filter/reduce 也能做，但累加器的优势是不需要额外的 Action 操作，在已有的数据处理流程中"搭便车"完成统计。
+
+**案例 2：Spark Streaming 实时风控——统计触发规则的事件数**
+
+```scala
+val highRiskCount = ssc.sparkContext.longAccumulator("high_risk_events")
+val blockedCount = ssc.sparkContext.longAccumulator("blocked_transactions")
+
+dstream.foreachRDD { rdd =>
+  rdd.foreach { event =>
+    val riskScore = riskModel.score(event)
+    if (riskScore > 0.9) {
+      highRiskCount.add(1)
+      blockTransaction(event)
+      blockedCount.add(1)
+    }
+  }
+  // 每个 batch 结束后推送到 Grafana 监控面板
+  pushToGrafana("high_risk_per_batch", highRiskCount.value)
+}
+```
+
+风控团队用累加器实时追踪"本批次拦截了多少笔高风险交易"，在 Spark UI 和外部监控系统中都能看到。
+
+**案例 3：机器学习特征工程——统计特征覆盖率**
+
+训练数据准备阶段，统计每个特征的缺失率，决定是否丢弃该特征：
+
+```scala
+val featureMissing = spark.sparkContext.collectionAccumulator[String]("missing_features")
+
+trainingData.foreach { row =>
+  for (col <- featureColumns) {
+    if (row.isNullAt(row.fieldIndex(col))) {
+      featureMissing.add(col)  // 记录哪些特征缺失
+    }
+  }
+}
+
+// 统计每个特征的缺失次数
+val missingStats = featureMissing.value.asScala.groupBy(identity).mapValues(_.size)
+// 缺失率 > 30% 的特征直接丢弃
+val dropColumns = missingStats.filter(_._2 > totalRows * 0.3).keys
+```
+
+**案例 4：日志分析——按错误类型分类计数（自定义累加器）**
+
+当需要统计多种类型的计数时，用自定义 MapAccumulator：
+
+```scala
+// 自定义 Map 累加器
+class MapAccumulator extends AccumulatorV2[String, java.util.Map[String, Long]] {
+  private val map = new ConcurrentHashMap[String, Long]()
+  override def add(key: String): Unit = map.merge(key, 1L, _ + _)
+  override def value: java.util.Map[String, Long] = map
+  // ... 省略 reset/merge/copy 等方法
+}
+
+val errorTypeCounter = new MapAccumulator()
+spark.sparkContext.register(errorTypeCounter, "error_types")
+
+logRDD.foreach { line =>
+  val errorType = extractErrorType(line)  // "NullPointer" / "Timeout" / "AuthFail"
+  if (errorType != null) errorTypeCounter.add(errorType)
+}
+
+// 输出：{NullPointer=12340, Timeout=5678, AuthFail=891}
+println(errorTypeCounter.value)
+```
+
+**为什么不用 `rdd.countByValue()` 或 `groupBy` 代替累加器？**
+
+| 方式 | 额外 Action | 额外 Shuffle | 适用场景 |
+|------|-----------|-------------|---------|
+| `countByValue()` | ✅ 需要单独触发 | ✅ 有 | 统计是主要目的 |
+| `groupBy + count` | ✅ 需要单独触发 | ✅ 有 | 统计是主要目的 |
+| **累加器** | ❌ 搭便车 | ❌ 无 | 统计是"顺便做的"，主流程是 ETL/过滤/写入 |
+
+累加器的核心价值：**在已有的计算流程中零成本附加统计，不引入额外的 Shuffle 和 Action**。
+
+</details>
+
 ---
 
 ## 三、执行架构
