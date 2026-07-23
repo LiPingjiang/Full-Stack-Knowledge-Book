@@ -885,6 +885,36 @@ cp-3（增量）：本地 [D E F]（A B 被 Compaction 删了，新增 F）
 
 **增量链的隐患**：随着时间推移，manifest 引用的文件可能散落在几十个历史 cp 目录里，恢复时需要从 HDFS 下载大量分散文件，恢复时间可能比全量 Checkpoint 还长。Flink 通过 `state.checkpoints.num-retained` 控制保留数量，旧目录自动清理（被引用的 SST 文件受引用计数保护不会误删）。
 
+> **`state.checkpoints.num-retained` 控制的是什么？** 它控制的是**保留多少个完整的 Checkpoint 目录（即 cp-1、cp-2、cp-3... 这些目录）**，不是控制 SST 文件数量。每个 Checkpoint 目录里包含：该次 Checkpoint 新增的 SST 文件 + manifest 清单 + 算子状态元数据。
+>
+> ```
+> HDFS 上的 Checkpoint 存储结构：
+>   /checkpoints/job-xxx/
+>     ├── cp-1/    ← 第 1 次 Checkpoint 的目录
+>     │   ├── sst-A, sst-B（该次新增的 SST 文件）
+>     │   └── manifest-1（文件清单：引用 A, B）
+>     ├── cp-2/
+>     │   ├── sst-C, sst-D（该次新增的 SST 文件）
+>     │   └── manifest-2（文件清单：引用 A, B, C, D）
+>     ├── cp-3/
+>     │   ├── sst-E, sst-F（该次新增的 SST 文件）
+>     │   └── manifest-3（文件清单：引用 D, E, F）← A,B,C 已被 Compaction 合并
+>     ...
+>
+> 当 state.checkpoints.num-retained = 3 时：
+>   保留最近 3 个 cp 目录（cp-1, cp-2, cp-3）
+>   当 cp-4 完成后 → 删除 cp-1 目录
+>   但如果 cp-2 的 manifest 仍引用 cp-1 里的某个 SST 文件
+>   → 该文件受引用计数保护，不会被删除（只删除无人引用的文件）
+>
+> 当 state.checkpoints.num-retained = 1（默认）时：
+>   只保留最新的 1 个 cp 目录
+>   → 故障时只有一个恢复点，如果该 cp 损坏就无法恢复
+>   → 生产环境建议设为 2~3
+> ```
+>
+> **总结**：`num-retained` 控制的是"保留几个恢复点"（即几个 cp 目录），间接影响 SST 文件的散落范围——保留越多，manifest 可能引用越多历史目录里的文件，恢复时需要从更多目录拉取。
+
 **恢复时需要多少文件？——取决于 manifest 清单，而非 Checkpoint 次数**
 
 ```
