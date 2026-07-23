@@ -1614,6 +1614,95 @@ coalesce vs repartition：
   → 增加 partition 数或需要均匀分布用 repartition（Shuffle，慢但均匀）
 ```
 
+<details>
+<summary><b>展开：coalesce "不触发 Shuffle" 的真正含义——数据到底动没动？</b></summary>
+
+**coalesce 的原理：让一个 Task 读多个分区（逻辑合并）**
+
+coalesce 不是"把数据搬到一起"，而是让下游 Task 直接从多个上游分区拉取数据：
+
+```
+原来 200 个分区，分布在集群的多台机器上：
+  Node-A: Partition 0, 1, 2, 3, 4
+  Node-B: Partition 5, 6, 7, 8, 9
+  Node-C: Partition 10, 11, 12, 13, 14
+  ...
+
+coalesce(40) 后：
+  Task-0: 负责读取 Partition 0,1,2,3,4 → 写成 1 个文件
+  Task-1: 负责读取 Partition 5,6,7,8,9 → 写成 1 个文件
+  ...
+  Task-39: 负责读取 Partition 195~199 → 写成 1 个文件
+
+  → 每个 Task 读 5 个原始分区的数据，合并写出
+  → 最终输出 40 个文件
+```
+
+**关键问题：数据确实可能跨节点网络传输，但这不叫 Shuffle**
+
+```
+假设 Task-0 被调度到 Node-A 上执行：
+  Partition 0,1,2 在 Node-A 上 → 本地读取，无网络开销
+  Partition 3 在 Node-D 上 → 通过网络拉取（类似读远程 HDFS Block）
+  Partition 4 在 Node-E 上 → 通过网络拉取
+
+  → 数据确实通过网络传输了！但这不是 Shuffle。
+```
+
+**Shuffle vs coalesce 的网络传输，本质区别是什么？**
+
+| 维度 | Shuffle | coalesce（无 Shuffle） |
+|------|---------|---------------------|
+| 数据流向 | 全连接：M 个上游 Task → N 个下游 Task（M×N 条连接） | 多对一：每组上游分区 → 固定的 1 个下游 Task |
+| 是否按 key 重新分区 | ✅ 按 hash(key) 重新分配 | ❌ 不看 key，直接拼接 |
+| 是否排序 | ✅ 需要排序（Sort-based Shuffle） | ❌ 不排序 |
+| 是否写中间文件 | ✅ Shuffle Write 写磁盘 | ❌ 不写中间文件 |
+| 网络模式 | 每个 Mapper 写 R 份文件，Reducer 从所有 Mapper 拉取 | 简单的 RPC 拉取（类似读 HDFS Block） |
+| Stage 边界 | ✅ 产生新 Stage | ❌ 不产生新 Stage（窄依赖） |
+
+**一句话总结**：Shuffle 是"按 key 重新洗牌"（全连接 + 排序 + 写磁盘），coalesce 只是"让一个 Task 多读几个分区"（简单拼接）。后者可能有网络传输，但没有 Shuffle 框架的排序、写中间文件、全连接等重开销。
+
+**coalesce 为什么可能倾斜？**
+
+Spark 的 coalesce 优先把**同一节点上的分区合并到一起**（减少网络传输），但如果数据分布不均匀：
+
+```
+极端情况：
+  Node-A 上有 100 个分区（数据热点节点，比如 HDFS 副本集中）
+  Node-B ~ Node-Z 上各有 4 个分区
+
+  coalesce(40) 时 Spark 优先本地性：
+    → Node-A 上的 100 个分区可能被合并成少数几个 Task
+    → 这几个 Task 数据量远大于其他 Task → 倾斜
+    → 而 repartition(40) 会触发 Shuffle，按 hash 均匀打散，不会倾斜
+```
+
+**一个分区的数据到底在几台机器上？**
+
+分区数据的物理位置取决于数据来源，不是"一个分区一定在一台机器上"：
+
+| 数据来源 | 一个分区在几台机器上 | 由什么控制 |
+|---------|-------------------|-----------|
+| HDFS 文件 | 3 台（默认 3 副本） | `dfs.replication` + 机架感知放置策略 |
+| Shuffle 后 | 分散在多台（上游所有 Task 所在节点各写一份碎片） | 上游 Task 的分布 |
+| 缓存的 RDD | 1 台（默认）或 2 台 | StorageLevel 的副本数 |
+| Kafka | 1 台 Leader + N 台 ISR 副本 | Topic 的 `replication.factor` |
+
+```
+HDFS 副本放置策略（默认 3 副本）：
+  副本 1：写入数据的那台 DataNode（本地）
+  副本 2：另一个机架的某台 DataNode（跨机架容灾）
+  副本 3：和副本 2 同机架的另一台 DataNode（同机架高速复制）
+
+  → 一个 Block（≈ 一个 Spark 分区）存在 3 台机器上
+  → Spark 只需要从其中一台读取（优先本地 → 同机架 → 跨机架）
+  → 控制因素：dfs.replication（副本数）+ HDFS 的机架感知放置策略
+```
+
+所以"200 个分区分布在 200 台机器上"只是简化假设。实际上可能 200 个分区分布在 50 台机器上（每台机器上有多个分区的副本），具体取决于集群规模和 HDFS 副本分布。
+
+</details>
+
 #### cache vs persist——RDD 缓存的正确姿势
 
 **cache() 和 persist() 的关系**：
