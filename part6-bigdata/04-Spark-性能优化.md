@@ -1395,9 +1395,59 @@ spark.sql.shuffle.partitions = 200（默认值，通常偏小）
 
 小文件是 HDFS 和 Spark 的共同敌人——读取端每个小文件产生一个 Task（10GB 数据如果是 10 万个小文件就产生 10 万个 Task），写入端输出过多小文件会拖慢下游任务。
 
-> **DISTRIBUTE BY 在 Hive 和 Spark 中用法一样吗？** 是的，语义完全一致——都是按指定字段做 hash 分区，控制数据分发到哪个 Reducer/Task。Spark SQL 兼容 Hive 的 DISTRIBUTE BY 语法，底层都是 `hash(key) % numPartitions`。详细语法和示例见 [Hive — DISTRIBUTE BY 控制分区规则](./03-Hive.md#distribute-by控制分区规则)。
->
-> **分区后，一个分区就是一个文件吗？** 标准情况下**是的**——一个 Reducer/Task 输出一个文件（part-00000, part-00001...），所以 DISTRIBUTE BY 把同一个 key 的数据路由到同一个 Task，最终这个 Task 写出一个文件。但有一个重要例外：**动态分区写入**时，一个 Task 可能处理多个 Hive 分区值（如 dt='2024-01-01' 和 dt='2024-01-02'），会写到不同分区目录下产生多个文件。这也是为什么动态分区插入容易产生小文件——如果不用 DISTRIBUTE BY 按分区字段分发，每个 Task 都可能往多个分区目录各写一个小文件，文件数 = Task 数 × 分区数。
+<details>
+<summary><b>展开：DISTRIBUTE BY 与文件数的关系 + 不写 DISTRIBUTE BY 时文件数由什么决定？</b></summary>
+
+**DISTRIBUTE BY 在 Hive 和 Spark 中用法一样吗？**
+
+是的，语义完全一致——都是按指定字段做 hash 分区，控制数据分发到哪个 Reducer/Task。Spark SQL 兼容 Hive 的 DISTRIBUTE BY 语法，底层都是 `hash(key) % numPartitions`。详细语法和示例见 [Hive — DISTRIBUTE BY 控制分区规则](./03-Hive.md#distribute-by控制分区规则)。
+
+> **`& Integer.MAX_VALUE` 是什么？** 完整的分区公式是 `(key.hashCode() & Integer.MAX_VALUE) % numReduceTasks`。`& Integer.MAX_VALUE`（即 `& 0x7FFFFFFF`）的作用是**把符号位置 0，保证 hashCode 为非负数**——因为 Java 的 `%` 对负数返回负数（如 `-7 % 4 = -3`），而分区编号必须是 `[0, N-1]`。不用 `Math.abs()` 是因为 `Math.abs(Integer.MIN_VALUE)` 会溢出仍返回负数，位运算永远安全。
+
+**分区后，一个分区就是一个文件吗？**
+
+标准情况下**是的**——一个 Reducer/Task 输出一个文件（part-00000, part-00001...），所以 DISTRIBUTE BY 把同一个 key 的数据路由到同一个 Task，最终这个 Task 写出一个文件。但有一个重要例外：**动态分区写入**时，一个 Task 可能处理多个 Hive 分区值（如 dt='2024-01-01' 和 dt='2024-01-02'），会写到不同分区目录下产生多个文件。这也是为什么动态分区插入容易产生小文件——如果不用 DISTRIBUTE BY 按分区字段分发，每个 Task 都可能往多个分区目录各写一个小文件，文件数 = Task 数 × 分区数。
+
+**如果 SELECT 语句不包含 DISTRIBUTE BY，输出文件数由什么决定？**
+
+不写 DISTRIBUTE BY 时，输出文件数 = **最后一个 Stage 的 Task 数（即分区数）**，每个 Task 写一个文件。分区数的来源取决于查询类型：
+
+```
+情况 1：纯读取 + 过滤（无 Shuffle）
+  SELECT * FROM table WHERE dt = '2024-01-01'
+  → 输出文件数 = 输入文件的分区数（由 spark.sql.files.maxPartitionBytes 决定合并）
+  → 如果输入是 100 个小文件被合并成 10 个 Task → 输出 10 个文件
+
+情况 2：有聚合/JOIN（触发 Shuffle）
+  SELECT dept, COUNT(*) FROM table GROUP BY dept
+  → 输出文件数 = spark.sql.shuffle.partitions（默认 200）
+  → 即使数据量很小，也会输出 200 个文件（大量空文件或极小文件）
+  → 这是最常见的小文件来源！
+
+情况 3：开启 AQE（Spark 3.2+ 默认开启）
+  → AQE 会在 Shuffle 后自动合并过小的分区
+  → 实际输出文件数 < spark.sql.shuffle.partitions
+  → 由 spark.sql.adaptive.advisoryPartitionSizeInBytes（默认 64MB）控制合并目标
+
+情况 4：手动 repartition / coalesce
+  df.repartition(10).write.parquet(path)   // 强制 10 个文件（触发 Shuffle）
+  df.coalesce(10).write.parquet(path)      // 合并到 10 个文件（不触发 Shuffle，可能倾斜）
+```
+
+**控制输出文件数的几种方法对比**：
+
+| 方法 | 是否触发 Shuffle | 适用场景 | 示例 |
+|------|----------------|---------|------|
+| `DISTRIBUTE BY 字段` | ✅ 是 | 动态分区写入，按分区字段聚拢 | `INSERT ... SELECT ... DISTRIBUTE BY dt` |
+| `repartition(N)` | ✅ 是 | 精确控制输出文件数 | `df.repartition(10).write...` |
+| `coalesce(N)` | ❌ 否 | 减少文件数（只能减不能增） | `df.coalesce(10).write...` |
+| AQE 自动合并 | ❌ 已有 Shuffle | Shuffle 后自动优化 | 设置 `advisoryPartitionSizeInBytes` |
+| `spark.sql.shuffle.partitions` | — | 全局控制 Shuffle 后分区数 | `SET spark.sql.shuffle.partitions=50` |
+| Hive 的 `LIMIT` 合并 | — | 小表写入 | `hive.merge.smallfiles.avgsize` |
+
+**一句话总结**：不写 DISTRIBUTE BY 时，输出文件数 = 最后一个 Stage 的分区数。有 Shuffle 时默认 200 个文件（大量小文件的元凶），解决方案是开 AQE、手动 coalesce/repartition、或调小 `shuffle.partitions`。
+
+</details>
 
 ```
 读取端小文件（Task 膨胀）：
