@@ -635,6 +635,135 @@ Executor → 分区：多对多（一个 Executor 可以持有多个分区的数
 
 > **关键**：分区数决定了 Task 数（并行度的上限），Executor 核数决定了同时能跑多少个 Task（实际并行度）。如果分区数远大于总核数，Task 会分批调度；如果分区数小于总核数，有些核会空闲——所以分区数通常建议设为总核数的 2-3 倍。
 
+<details>
+<summary><b>展开：分区数不合理的诊断——如何观测、用什么指标判断</b></summary>
+
+分区数设置不合理是 Spark 最常见的性能问题之一。分区过多和分区过少的症状完全不同，需要不同的指标来诊断。
+
+---
+
+**问题 1：分区数过大 → Task 太多、调度开销大、产生大量小文件**
+
+| 观测指标 | 在哪看 | 异常信号 |
+|---------|--------|---------|
+| Task 数量 | Spark UI → Stage 详情 → Total Tasks | 一个 Stage 几万甚至几十万个 Task |
+| Task 平均执行时间 | Spark UI → Stage 详情 → Duration 的 Median/Min | 大量 Task 执行时间 **< 100ms**（数据太少，调度开销占比高） |
+| Scheduler Delay | Spark UI → Task 详情 → Scheduler Delay 列 | 调度延迟占 Task 总时间 **> 10%**（正常应 < 5%） |
+| Driver GC Time | Spark UI → Executors → Driver 的 GC Time | Driver 端 GC 频繁（大量 Task 元数据对象压力） |
+| Shuffle Write / Task | Spark UI → Stage 详情 → Shuffle Write | 每个 Task 只写几百条记录或几 KB |
+| 输出文件数 | `hdfs dfs -count <output_path>` | 文件数远超需要（如 10000 个文件，每个几 KB） |
+| 单文件大小 | `hdfs dfs -ls <output_path>` | 大量文件 **< 1MB**（NameNode 元数据压力） |
+
+```scala
+// 快速诊断：查看每个分区的记录数
+df.rdd.mapPartitions(iter => Iterator(iter.size)).collect()
+// 如果大量分区只有 0 或几十条记录 → 分区过多
+```
+
+**合理分区数经验公式**：`总数据量 / 128MB`，如 10GB 数据 → ~80 个分区。
+
+---
+
+**问题 2：分区数过小 → 单 Task 数据量过大、OOM、并行度不足**
+
+| 观测指标 | 在哪看 | 异常信号 |
+|---------|--------|---------|
+| Task 执行时间 | Spark UI → Stage 详情 → Duration 的 Max | 单个 Task 执行 **> 10 分钟**（数据量太大） |
+| Shuffle Read / Task | Spark UI → Task 详情 → Shuffle Read Size | 单个 Task 读取 **> 1GB** |
+| Spill 到磁盘 | Spark UI → Task 详情 → Shuffle Spill (Disk) | 出现 Spill 说明内存放不下，被迫写磁盘 |
+| GC Time / Task | Spark UI → Task 详情 → GC Time | 单个 Task GC 时间占执行时间 **> 20%** |
+| OOM 报错 | Driver/Executor 日志 | `java.lang.OutOfMemoryError` |
+| Executor 空闲核 | Spark UI → Executors → Active Tasks | 总核数 100 但只有 10 个 Task 在跑（90 个核空闲） |
+
+```
+症状组合：
+  分区数 = 10，总核数 = 100
+  → 只有 10 个 Task，90 个核空闲
+  → 每个 Task 处理 1GB 数据，频繁 GC 甚至 OOM
+  → 整个 Stage 的时间被最慢的那个 Task 决定
+```
+
+---
+
+**问题 3：数据倾斜 → 个别 Task 特别慢，其他 Task 早已完成**
+
+| 观测指标 | 在哪看 | 异常信号 |
+|---------|--------|---------|
+| Task Duration 分布 | Spark UI → Stage 详情 → Duration 的 Max vs Median | Max **> 10× Median**（如 Median 30s，Max 10min） |
+| Shuffle Read 分布 | Spark UI → Task 详情 → Shuffle Read Size | 个别 Task 读取量是其他的 **10-100 倍** |
+| Task 进度 | Spark UI → Stage 详情 → 进度条 | 99% 的 Task 已完成，1 个 Task 还在跑（长尾） |
+| Spill 集中 | Spark UI → Task 详情 → Shuffle Spill | 只有个别 Task 有 Spill，其他没有 |
+| Executor 利用率 | Spark UI → Executors → Active Tasks | 只有 1-2 个 Executor 在忙，其他都空闲等待 |
+
+```scala
+// 诊断倾斜：查看分区数据量分布
+df.rdd.mapPartitions(iter => Iterator(iter.size)).collect()
+// 如果某几个分区的记录数是其他的 10 倍以上 → 数据倾斜
+
+// 或者用 SQL 查看 key 分布
+spark.sql("SELECT join_key, COUNT(*) as cnt FROM table GROUP BY join_key ORDER BY cnt DESC LIMIT 20")
+// 如果 top key 的 count 远超平均值 → 该 key 会导致倾斜
+```
+
+---
+
+**问题 4：Shuffle 过重 → 网络传输量大、磁盘 IO 高**
+
+| 观测指标 | 在哪看 | 异常信号 |
+|---------|--------|---------|
+| Shuffle Write 总量 | Spark UI → Stage 详情 → Shuffle Write | 单个 Stage 写出 **> 100GB**（考虑是否可以减少） |
+| Shuffle Read 总量 | Spark UI → Stage 详情 → Shuffle Read | 下游 Stage 读取量远大于实际需要 |
+| Shuffle Spill (Disk) | Spark UI → Task 详情 | 大量 Task 有 Spill → 内存不够排序/聚合 |
+| Shuffle Spill (Memory) vs (Disk) | Spark UI → Task 详情 | Memory >> Disk 说明压缩率高；Disk 很大说明真的放不下 |
+| 网络等待时间 | Spark UI → Task 详情 → Shuffle Read Blocked Time | 等待远程数据 **> 执行时间的 30%** |
+| 磁盘 IO | 集群监控（Ganglia/Grafana） | Shuffle 期间磁盘 IO 打满 |
+
+---
+
+**问题 5：内存不足 → 频繁 GC、Spill、OOM**
+
+| 观测指标 | 在哪看 | 异常信号 |
+|---------|--------|---------|
+| GC Time 占比 | Spark UI → Executors → GC Time / Total Time | GC 时间占 **> 20%** 的执行时间 |
+| Peak Memory | Spark UI → Executors → Peak JVM Memory | 接近或达到配置的 Executor Memory 上限 |
+| Spill 频率 | Spark UI → Task 详情 → Shuffle Spill | 大量 Task 都有 Spill（不是个别） |
+| OOM 频率 | Executor 日志 | 反复出现 OOM 后 Task 重试 |
+| Storage Memory 占用 | Spark UI → Storage → Memory Used | 缓存的 RDD 占满了 Storage 区域，挤压 Execution 区域 |
+
+---
+
+**问题 6：本地化不好 → 大量数据跨节点/跨机架传输**
+
+| 观测指标 | 在哪看 | 异常信号 |
+|---------|--------|---------|
+| Locality Level 分布 | Spark UI → Stage 详情 → Locality Level 列 | 大量 Task 是 **RACK_LOCAL 或 ANY**（正常应多数是 PROCESS/NODE_LOCAL） |
+| Input Size / Task | Spark UI → Task 详情 → Input Size | 所有 Task 都有大量 Input，但 Locality 差 → 数据在远程读取 |
+| Scheduler Delay | Spark UI → Task 详情 → Scheduler Delay | 如果 Delay 很小但 Locality 差 → 说明 `locality.wait` 设太短，没等到本地 Executor 就降级了 |
+
+---
+
+**快速诊断决策树**
+
+```
+Job 慢了，先看哪里？
+
+1. 打开 Spark UI → Jobs → 找到最慢的 Stage
+2. 看 Task Duration 分布：
+   - Max >> Median（10倍以上）→ 数据倾斜
+   - 所有 Task 都慢 → 看下一步
+3. 看 Task 执行时间绝对值：
+   - 每个 Task < 100ms → 分区过多，合并分区
+   - 每个 Task > 10min → 分区过少或数据量大，增加分区
+4. 看 Shuffle Spill：
+   - 有大量 Spill → 内存不足，加内存或减少单 Task 数据量
+5. 看 GC Time：
+   - GC > 20% → 内存压力大，考虑增大 Executor Memory 或减少缓存
+6. 看 Locality Level：
+   - 大量 ANY/RACK_LOCAL → 数据本地化差，调整 locality.wait 或 Executor 部署
+```
+
+</details>
+
 #### Executor、Task、Container 到底是什么——进程、线程还是资源配额
 
 上面的描述用了"核"和"Executor"等概念，这里把它们的物理形态说清楚：
