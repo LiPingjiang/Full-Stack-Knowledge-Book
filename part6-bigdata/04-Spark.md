@@ -799,6 +799,27 @@ DAGScheduler → 提交 TaskSet → TaskScheduler
 
 TaskScheduler 决定"哪个 Task 发给哪个 Executor"时，核心原则是**移动计算而非移动数据**——尽量把 Task 分配到数据所在的节点上，避免网络传输。
 
+> **本地化等待时间是全局配置还是按 Task 单独配置？** 是**全局统一配置**，对所有 Task 生效。`spark.locality.wait` 及其子参数（`.process` / `.node` / `.rack`）没有"给 Task-1 设 5s、给 Task-2 设 1s"的机制。原因是 TaskScheduler 批量调度一个 TaskSet（一个 Stage 的所有 Task），用统一的降级策略逐轮扫描，不是逐个 Task 单独决策。
+>
+> **Task 是谁创建的？Driver 怎么知道数据在哪？** Task 是 **Driver 端的 DAGScheduler 创建的**，而且是在**真正处理数据之前**就全部规划好的。整个流程是：
+>
+> ```
+> ① 用户提交 Job（调用 Action 算子，如 collect/save）
+> ② Driver 端 DAGScheduler 根据 RDD 依赖关系划分 Stage
+> ③ 对每个 Stage 的每个 Partition，创建一个 Task 对象
+> ④ 创建 Task 时，向数据源的元数据服务查询数据位置：
+>    - HDFS 文件 → 问 NameNode（getBlockLocations API）
+>      → 得到 "Block-0 在 Node-A、Node-C、Node-E 上"
+>    - HBase 表 → 问 HBase Master → "这个 Region 在 Node-B 上"
+>    - Kafka Topic → 问 Broker 元数据 → "Partition-3 的 Leader 在 Node-D 上"
+>    - 已缓存的 RDD → 问 Spark 自己的 BlockManager
+>      → "这个 Partition 缓存在 Executor-5 的内存里"
+> ⑤ 把位置信息写入 Task 的 preferredLocations 字段
+> ⑥ 打包成 TaskSet 交给 TaskScheduler 做本地化调度
+> ```
+>
+> 所以你的理解是对的——**Driver 在任何数据真正被处理之前，就已经把"后续有哪些步骤（Stage/Task）"和"每个 Task 的数据在哪"全部规划好了**。这就是 Spark 的"先规划再执行"模型。Driver 不需要"知道所有节点有哪些数据"，它只按需向 NameNode 等元数据服务查询当前 Job 涉及的那些文件/分区的位置。
+
 ```
 Task 分配算法（以 Task-1 为例）：
 
