@@ -852,6 +852,34 @@ Task 分配算法（以 Task-1 为例）：
 
 TaskScheduler 不会无限等待最高本地化级别。它会先尝试最高级别（PROCESS_LOCAL），如果在等待时间内没有对应的 Executor 空闲，就降级到下一级别：
 
+> **疑问：既然 Task 是数据处理之前就规划好的，那调度时 Executor 不都是空闲的吗？为什么会"等不到空闲 Executor"？**
+>
+> 关键在于：**"规划"和"调度"虽然都在 Driver 上完成，但 Task 不是一次性全部发出去的，而是逐批滚动调度的。**
+>
+> ```
+> 时间线示例（Stage-0 有 200 个 Task，集群 10 个 Executor × 4 核 = 40 个槽位）：
+>
+> t0: Driver 规划好所有 Stage 和 Task（此时确实所有 Executor 都空闲）
+> t1: 开始调度 Stage-0 的 TaskSet
+>     → 第一批 40 个 Task 立刻分配（此时都空闲，本地化很好）
+>     → 槽位用完，剩余 160 个 Task 排队等待
+> t2: Task-3 完成，Node-B 上腾出 1 个槽位
+>     → 但 Task-41 的数据在 Node-A 上（Node-A 的 Executor 还在忙）
+>     → TaskScheduler 选择：等 3s 看 Node-A 能不能空出来？还是降级到 Node-B？
+> t3: Stage-0 全部完成 → 开始调度 Stage-1
+>     → Stage-1 的 Task 需要读 Stage-0 的 Shuffle 输出
+>     → 此时部分 Executor 可能还在做 Stage-0 的最后几个 Task
+> ```
+>
+> 所以**第一批 Task 确实不会遇到"不空闲"的问题**，本地化降级主要发生在：
+> - **同一 Stage 内**：Task 数 > 总槽位数，前面的 Task 还没跑完
+> - **多 Job 并发**：多个用户/线程同时提交 Job，共享同一批 Executor
+> - **Stage 之间**：上一个 Stage 的尾部 Task 还在跑
+>
+> **规划和调度的分工**：两者都在 Driver 进程内完成，但由不同组件负责——
+> - **DAGScheduler**（规划者）：划分 Stage、创建 Task 对象、确定数据位置 → 一次性完成
+> - **TaskScheduler**（调度者）：把 Task 分配到具体 Executor → 滚动进行，有槽位才发
+
 ```
 降级流程：
   尝试 PROCESS_LOCAL → 等待 spark.locality.wait（默认 3s）
