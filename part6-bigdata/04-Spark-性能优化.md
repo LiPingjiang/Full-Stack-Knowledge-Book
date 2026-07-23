@@ -1649,15 +1649,20 @@ coalesce(40) 后：
   → 数据确实通过网络传输了！但这不是 Shuffle。
 ```
 
-**Shuffle vs coalesce 的网络传输，本质区别是什么？**
+**Shuffle vs coalesce vs repartition 三者对比**
 
-| 维度 | Shuffle | coalesce（无 Shuffle） |
-|------|---------|---------------------|
-| 数据流向 | 全连接：M 个上游 Task → N 个下游 Task（M×N 条连接） | 多对一：每组上游分区 → 固定的 1 个下游 Task |
-| 是否按 key 重新分区 | ✅ 按 hash(key) 重新分配 | ❌ 不看 key，直接拼接 |
-| 是否排序 | ✅ 需要排序（Sort-based Shuffle） | ❌ 不排序 |
-| 是否写中间文件 | ✅ Shuffle Write 写磁盘 | ❌ 不写中间文件 |
-| 网络模式 | 每个 Mapper 写 R 份文件，Reducer 从所有 Mapper 拉取 | 简单的 RPC 拉取（类似读 HDFS Block） |
+| 维度 | Shuffle（如 groupByKey/join） | coalesce（shuffle=false） | repartition（= coalesce + shuffle=true） |
+|------|------------------------------|--------------------------|----------------------------------------|
+| 数据流向 | 全连接：M 个上游 Task → N 个下游 Task（M×N 条连接） | 多对一：每组上游分区 → 固定的 1 个下游 Task | 全连接：所有上游 Task → 所有下游 Task |
+| 是否按 key 重新分区 | ✅ 按 hash(key) 重新分配 | ❌ 不看 key，直接拼接 | ✅ 按 round-robin 或 hash 重新分配 |
+| 是否排序 | ✅ 需要排序（Sort-based Shuffle） | ❌ 不排序 | ✅ 需要排序（走 Shuffle 框架） |
+| 是否写中间文件 | ✅ Shuffle Write 写磁盘 | ❌ 不写中间文件 | ✅ Shuffle Write 写磁盘 |
+| 网络模式 | 每个 Mapper 写 R 份文件，Reducer 从所有 Mapper 拉取 | 简单的 RPC 拉取（类似读远程 HDFS Block） | 同 Shuffle：全量网络交换 |
+| 是否产生新 Stage | ✅ 产生新 Stage（宽依赖） | ❌ 不产生新 Stage（窄依赖） | ✅ 产生新 Stage（宽依赖） |
+| 数据均匀性 | 取决于 key 分布 | ❌ 可能倾斜（优先本地性合并） | ✅ 均匀（round-robin 打散） |
+| 能否增加分区数 | — | ❌ 只能减少 | ✅ 可增可减 |
+| 典型开销 | 高（排序 + 写磁盘 + 全网络交换） | 低（可能有少量网络拉取） | 中高（走 Shuffle 框架，但无业务排序） |
+| 适用场景 | JOIN、聚合、去重等需要按 key 分组的操作 | filter 后减少分区数、写出前合并小分区 | 需要均匀分布、增加并行度、解决倾斜 |
 | Stage 边界 | ✅ 产生新 Stage | ❌ 不产生新 Stage（窄依赖） |
 
 **一句话总结**：Shuffle 是"按 key 重新洗牌"（全连接 + 排序 + 写磁盘），coalesce 只是"让一个 Task 多读几个分区"（简单拼接）。后者可能有网络传输，但没有 Shuffle 框架的排序、写中间文件、全连接等重开销。
