@@ -1478,6 +1478,26 @@ spark.sql.shuffle.partitions = 200（默认值，通常偏小）
   INSERT OVERWRITE TABLE A PARTITION (aa)
   SELECT * FROM B WHERE aa = '大key' DISTRIBUTE BY cast(rand() * 5 as int);
 
+  → 这里 aa 是 Hive 表的分区字段，对应 HDFS 上的一个目录（aa=大key/）
+  → DISTRIBUTE BY cast(rand() * 5 as int) 把数据随机分成 5 份，发到 5 个 Task
+  → 5 个 Task 各写一个文件，都落在同一个 Hive 分区目录下：
+    /warehouse/A/aa=大key/
+      ├── part-00000   ← Task 0 写的（~20GB）
+      ├── part-00001   ← Task 1 写的（~20GB）
+      ├── part-00002   ← Task 2 写的（~20GB）
+      ├── part-00003   ← Task 3 写的（~20GB）
+      └── part-00004   ← Task 4 写的（~20GB）
+  → 文件不需要内部记录"属于哪个分区"——目录路径本身就是分区信息
+  → 下游查询 SELECT * FROM A WHERE aa='大key' 时，Hive 自动扫描该目录下所有文件
+  → 对下游完全透明
+
+  完整的目录结构（大 key 打散 + 小 key 正常）：
+    /warehouse/A/
+      ├── aa=大key/        ← 5 个文件（rand 打散并行写入，避免单 Task OOM）
+      ├── aa=小key1/       ← 1 个文件（正常 DISTRIBUTE BY aa）
+      ├── aa=小key2/       ← 1 个文件
+      └── aa=小key3/       ← 1 个文件
+
   Spark 3.2+ 补充：AQE 的 Rebalance 操作可以自动平衡分区
   SET spark.sql.adaptive.coalescePartitions.enabled=true;
   → AQE 会在写入前自动合并过小分区，配合 DISTRIBUTE BY 效果更好
