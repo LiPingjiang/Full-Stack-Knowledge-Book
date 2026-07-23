@@ -1421,6 +1421,64 @@ spark.sql("""
 
 **Catalyst 优化器**：Spark SQL 的查询会经过 Catalyst 优化器（逻辑优化 → 物理优化），类似 MySQL 的查询优化器。它能在**部分场景下**自动做谓词下推、列裁剪、Join 策略选择等优化——但"自动"不等于"万能"。Catalyst 在 INNER JOIN 下表现良好（过滤条件写在 WHERE 还是 ON 里效果一样），但在**外连接（LEFT/RIGHT JOIN）场景下存在明显局限**：右表的过滤条件写在 WHERE 中不会被下推（因为下推会把 LEFT JOIN 变成 INNER JOIN，改变语义）。此外，分区字段被函数包裹、隐式类型转换、视图遮挡底层分区字段等情况，Catalyst 也无法自动处理。这些需要开发者手动优化的场景，详见 [性能优化专题 — 分区裁剪失效六大场景](./04-Spark-性能优化.md#61-减少数据量)。
 
+<details>
+<summary><b>展开：LEFT JOIN 谓词下推规则详解——为什么有些条件不能推？</b></summary>
+
+**核心原则**：优化器的任何变换都不能改变查询结果。谓词下推能不能做，取决于**条件写在哪里**和**作用于哪张表**。
+
+| 条件位置 | LEFT JOIN 中左表条件 | LEFT JOIN 中右表条件 |
+|---------|-------------------|-------------------|
+| 写在 **JOIN ON** 中 | ❌ 不下推（ON 中只影响匹配，不影响左表输出） | ✅ 下推（安全：只决定能不能匹配上，匹配不上左表行照样补 NULL 输出） |
+| 写在 **WHERE** 中 | ✅ 下推（安全：先过滤左表再 JOIN，结果不变） | ❌ 不下推（会把 LEFT 变 INNER，改变语义） |
+
+**为什么 WHERE 中的右表条件不能下推？这是"没开发"还是"不能做"？**
+
+这不是工程上的缺失，而是**关系代数的数学约束**——任何正确的 SQL 引擎（PostgreSQL、MySQL、Oracle、Presto、Spark）都遵循同样的规则。
+
+```sql
+-- 原始 SQL
+SELECT *
+FROM orders o
+LEFT JOIN payments p ON o.id = p.order_id
+WHERE p.status = 'paid'
+
+-- 如果强行把 p.status = 'paid' 下推到 JOIN 之前：
+SELECT *
+FROM orders o
+LEFT JOIN (SELECT * FROM payments WHERE status = 'paid') p
+  ON o.id = p.order_id
+-- ❌ 结果不同！原始 SQL 中没有 paid 记录的 order 会被 WHERE 过滤掉（NULL ≠ 'paid'）
+-- 但下推后这些 order 会保留（LEFT JOIN 补 NULL，没有 WHERE 再过滤）
+```
+
+**Spark 实际做了什么（比"不下推"更聪明）？**
+
+Catalyst 优化器会检测到：`WHERE p.status = 'paid'` 是一个对右表的非 NULL 条件，它会过滤掉所有右表为 NULL 的行——这意味着 LEFT JOIN 的"保留左表"语义已经被 WHERE 破坏了，等价于 INNER JOIN。于是 Catalyst 做的是：
+
+```
+用户写的：  LEFT JOIN + WHERE p.status = 'paid'
+Catalyst：  检测到 WHERE 条件隐式排除了 NULL 行
+  → 等价变换：LEFT JOIN → INNER JOIN
+  → 然后在 INNER JOIN 基础上正常下推 p.status = 'paid'
+  → 最终执行效率和手写 INNER JOIN + 下推一样
+```
+
+所以 Spark **不是不优化**，而是先做等价变换（LEFT → INNER），再正常下推。
+
+**总结：开发者应该怎么写？**
+
+```sql
+-- ✅ 正确写法：右表过滤条件放在 ON 中（保持 LEFT JOIN 语义 + 允许下推）
+SELECT *
+FROM orders o
+LEFT JOIN payments p ON o.id = p.order_id AND p.status = 'paid'
+
+-- ⚠️ 如果你写在 WHERE 中，说明你其实想要 INNER JOIN 的语义
+-- Catalyst 会帮你转成 INNER JOIN，但代码意图不清晰，建议直接写 INNER JOIN
+```
+
+</details>
+
 ### 4.2 Spark SQL 的执行流程
 
 上面提到 Catalyst 优化器，这里把 Spark SQL 从 SQL 语句到 RDD 执行的**完整链路**说清楚。这条链路和 Hive SQL 的执行过程类似（都是 SQL → 逻辑计划 → 物理计划 → 执行），区别在于底层引擎是 Spark 而非 MapReduce。
