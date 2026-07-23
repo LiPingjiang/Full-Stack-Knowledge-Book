@@ -862,7 +862,7 @@ sequenceDiagram
     HDFS-->>JM: 5. 上传完成，确认 Checkpoint
 ```
 
-**增量 Checkpoint 的工作机制**：Flink 的增量 Checkpoint 不是"定期打全量 + 后续打增量"的模式，而是**每次都增量**（首次除外）。它依赖 SST 文件的不可变性——SST 文件一旦生成就不会被修改，上次已上传的文件这次不需要重传，只上传新增的 SST 文件，并记录一份 manifest（文件清单）指向所有需要的文件（可能散落在多个历史 Checkpoint 目录里）。
+**增量 Checkpoint 的工作机制**：Flink 的增量 Checkpoint 不是"定期打全量 + 后续打增量"的模式，而是**每次都增量**（首次除外）。它依赖 [SST 文件](../part3-java-deep/A1-核心数据结构原理.md#112-sst-文件是什么)的不可变性——SST 文件一旦生成就不会被修改，上次已上传的文件这次不需要重传，只上传新增的 SST 文件，并记录一份 manifest（文件清单）指向所有需要的文件（可能散落在多个历史 Checkpoint 目录里）。
 
 ```
 增量 Checkpoint 示意：
