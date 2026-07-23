@@ -1395,6 +1395,10 @@ spark.sql.shuffle.partitions = 200（默认值，通常偏小）
 
 小文件是 HDFS 和 Spark 的共同敌人——读取端每个小文件产生一个 Task（10GB 数据如果是 10 万个小文件就产生 10 万个 Task），写入端输出过多小文件会拖慢下游任务。
 
+> **DISTRIBUTE BY 在 Hive 和 Spark 中用法一样吗？** 是的，语义完全一致——都是按指定字段做 hash 分区，控制数据分发到哪个 Reducer/Task。Spark SQL 兼容 Hive 的 DISTRIBUTE BY 语法，底层都是 `hash(key) % numPartitions`。详细语法和示例见 [Hive — DISTRIBUTE BY 控制分区规则](./03-Hive.md#distribute-by控制分区规则)。
+>
+> **分区后，一个分区就是一个文件吗？** 标准情况下**是的**——一个 Reducer/Task 输出一个文件（part-00000, part-00001...），所以 DISTRIBUTE BY 把同一个 key 的数据路由到同一个 Task，最终这个 Task 写出一个文件。但有一个重要例外：**动态分区写入**时，一个 Task 可能处理多个 Hive 分区值（如 dt='2024-01-01' 和 dt='2024-01-02'），会写到不同分区目录下产生多个文件。这也是为什么动态分区插入容易产生小文件——如果不用 DISTRIBUTE BY 按分区字段分发，每个 Task 都可能往多个分区目录各写一个小文件，文件数 = Task 数 × 分区数。
+
 ```
 读取端小文件（Task 膨胀）：
   调大 spark.sql.files.maxPartitionBytes（默认 128MB → 256MB）
