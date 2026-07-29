@@ -102,13 +102,13 @@ graph TD
 
 **[3.13 Spring 全家桶](./13-Spring全家桶.md)** —— 为什么 Java 后端绕不开它。IOC 容器与依赖注入、AOP 原理（JDK 动态代理 vs CGLIB）、Bean 生命周期、Spring Boot 自动配置原理（spring.factories + 条件装配）、Spring MVC 请求处理流程、Spring Cloud 核心组件选型。*面试剖析覆盖：循环依赖三级缓存、@Transactional 失效场景、BeanPostProcessor 时机。*
 
-**[3.14 微服务治理与分布式锁](./14-微服务与分布式锁.md)** —— 从单体到微服务后多出来的麻烦。服务注册与发现、配置中心、分布式锁三种实现（Redis/ZooKeeper/MySQL）、链路追踪、服务网关、服务间通信选型。*面试剖析覆盖：Redis 分布式锁主从切换丢锁/RedLock 争议、Redisson 看门狗、ZK 临时顺序节点。*
+**[3.14 微服务治理与分布式锁](./14-微服务与分布式锁.md)** —— 从单体到微服务后多出来的麻烦。服务注册与发现、配置中心、分布式锁三种实现（Redis/ZooKeeper/MySQL）、链路追踪、服务网关、K8s 编排、服务网格与流量切片、可观测性三支柱。*面试剖析覆盖：Redis 分布式锁主从切换丢锁/RedLock 争议、Redisson 看门狗、ZK 临时顺序节点。*
 
 **[3.15 Java 集合框架](./15-Java集合框架.md)** —— ArrayList 扩容机制、LinkedList 为何几乎不该用、HashMap 源码全解（hash 扰动/红黑树转换/扩容 rehash）、ConcurrentHashMap（JDK 7 分段锁 → JDK 8 CAS + synchronized）、LinkedHashMap 实现 LRU、TreeMap、PriorityQueue。*面试剖析覆盖：HashMap 线程不安全的具体表现、fail-fast vs fail-safe、synchronizedMap vs ConcurrentHashMap、key 的 hashCode/equals 契约。*
 
 **[3.16 Java 8+ 新特性](./16-Java8+新特性.md)** —— Lambda 与函数式接口、Stream API（惰性求值/flatMap/Collectors）、Optional 正确用法与反模式、新日期 API（java.time）、JDK 9-21 关键特性速览（var/Record/Sealed Class/Pattern Matching/虚拟线程）。*面试剖析覆盖：Stream vs for 循环性能、Lambda 捕获变量限制、parallelStream 陷阱、orElse vs orElseGet。*
 
-**[3.17 设计模式](./17-设计模式.md)** —— 先宏观（SOLID 原则 → 三大类 23 种模式），再逐个击破。创建型（单例 5 种写法/工厂/建造者）、结构型（代理/适配器/装饰器/外观）、行为型（策略/模板方法/观察者/责任链）。每种模式一句话定义 + Java/Spring 实战应用 + 代码骨架。*面试剖析覆盖：Spring 用了哪些设计模式、策略模式消除 if-else、代理 vs 装饰器 vs 适配器区分。*
+**[3.17 设计模式](./17-设计模式.md)** —— 先宏观（SOLID 原则 → 三大类 23 种模式），再逐个击破。创建型（单例 5 种写法/工厂/建造者）、结构型（代理/适配器/装饰器/外观）、行为型（策略/模板方法/观察者/责任链），并新增 SDK 工程化（Client 分层、版本兼容、重试、错误语义与凭证安全）。*面试剖析覆盖：Spring 用了哪些设计模式、策略模式消除 if-else、代理 vs 装饰器 vs 适配器区分。*
 
 **[附录 A1：核心数据结构原理](./A1-核心数据结构原理.md)** —— 跳表、红黑树、布隆过滤器、一致性 Hash、HashMap、B+ 树——这些被多个章节引用的通用数据结构集中讲透。结构图解、插入/查找过程、复杂度对比、变体与参数设计、Java/Redis 实战用法、常见树结构总览（BST/AVL/红黑树/B树/B+树/跳表/Trie/堆），面试时任何场景问到都能从容作答。
 
