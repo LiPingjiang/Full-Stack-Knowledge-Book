@@ -168,7 +168,81 @@ yarn logs -applicationId application_xxx_xxx -containerId container_xxx_xxx_xxx 
 
 > **关键区分**：AM Container 启动失败 ≠ Executor 启动失败。前者是 Driver/AM 自身的 JVM 退出（SparkContext 还没建好），后者是 Executor 进程启动失败但 Driver 还活着。前者的日志需要通过 YARN API 或命令获取，后者的日志在 Driver 的 syslog 中可以看到（Driver 会记录 Executor 注册失败的信息）。
 
-### 7.7 Spark UI 显示正常但作业状态为失败
+### 7.7 拓展：YARN 磁盘管理与日志聚合机制
+
+理解 YARN 的磁盘管理机制，有助于排查"日志找不到""磁盘空间不足导致任务失败"等根因问题。
+
+#### YARN NodeManager 磁盘目录
+
+NodeManager 维护两类本地磁盘目录：
+
+| 配置项 | 作用 | 数据生命周期 |
+|--------|------|-------------|
+| `yarn.nodemanager.local-dirs` | Container 运行时的本地工作目录（shuffle 数据、临时文件、jar 包缓存） | Container 结束后由 DeletionService 异步清理 |
+| `yarn.nodemanager.log-dirs` | Container 运行期间的 stdout/stderr/syslog 本地日志 | 作业结束后由 LogAggregation 模块收集到 HDFS，本地保留一段时间后清理 |
+
+```
+数据流转路径：
+  Container 运行期间
+    → 临时数据写入 local-dirs
+    → 日志写入 log-dirs
+  Container 结束后
+    → 如果 yarn.log-aggregation-enable=true
+      → NM 将 log-dirs 下的日志打包上传至 HDFS（/tmp/logs/<user>/logs/）
+      → 本地日志在 yarn.nodemanager.delete.debug-delay-sec 秒后清理
+    → local-dirs 下的临时数据由 DeletionService 清理
+```
+
+#### 日志聚合配置要点
+
+```xml
+<!-- yarn-site.xml 核心配置 -->
+<property>
+  <name>yarn.log-aggregation-enable</name>
+  <value>true</value>
+</property>
+<property>
+  <name>yarn.log-aggregation.retain-seconds</name>
+  <value>604800</value>  <!-- HDFS 上聚合日志保留 7 天 -->
+</property>
+<property>
+  <name>yarn.nodemanager.delete.debug-delay-sec</name>
+  <value>0</value>  <!-- 0 表示立即清理本地日志；调大便于排查问题 -->
+</property>
+```
+
+> **排查经验**：如果 `local-dirs` 所在磁盘打满，NodeManager 会认为该磁盘不健康，新 Container 不再往这个磁盘分配，可能导致集群可用资源骤降。查看 NM 日志可发现 `DiskChecker` 相关的 `local-dirs are bad` 告警。
+
+#### NodeManager 磁盘健康检查
+
+NodeManager 定期扫描 `local-dirs` 和 `log-dirs` 的可用空间，当可用空间低于阈值时标记磁盘为 `bad`，并上报 ResourceManager：
+
+```xml
+<property>
+  <name>yarn.nodemanager.disk-health-checker.min-healthy-disks</name>
+  <value>0.25</value>  <!-- 单个磁盘可用空间低于 25% 视为不健康 -->
+</property>
+<property>
+  <name>yarn.nodemanager.disk-health-checker.max-disk-utilization-per-disk-percentage</name>
+  <value>90</value>  <!-- 磁盘使用率超过 90% 视为不健康 -->
+</property>
+```
+
+磁盘不健康的影响：
+- **新 Container**：不再分配到不健康的磁盘上
+- **运行中 Container**：不受影响（但可能因磁盘满而失败）
+- **Shuffle 数据**：如果所有 local-dirs 都不健康，NodeManager 会停止服务，等待运维介入
+
+#### 与 Spark 排查的关联
+
+| 现象 | 可能根因 | 排查方向 |
+|------|---------|---------|
+| 日志链接提示 Not Found | 日志保留期已过或聚合未开启 | 检查 `yarn.log-aggregation-enable` 和保留期配置 |
+| Executor 启动后立即失败，日志无异常 | local-dirs 磁盘满导致 jar 包/依赖写失败 | 检查 NodeManager 磁盘健康状态 |
+| 集群突然大量任务失败 | 多台 NodeManager 磁盘同时打满 | 检查集群磁盘水位和 `DiskChecker` 日志 |
+| Shuffle 阶段大量失败 | 本地磁盘 IO 打满或磁盘被标记 bad | 检查 local-dirs 性能和可用空间 |
+
+### 7.8 Spark UI 显示正常但作业状态为失败
 
 有时 Spark UI 显示所有 Stage 都成功了，但作业最终状态却是 FAILED。这类问题通常由两个原因引起：
 
@@ -201,7 +275,7 @@ Driver 进程本身崩溃（OOM、JVM 错误），导致 Application 被 YARN �
   ③ 如果日志完全丢失，联系平台运维协助排查
 ```
 
-### 7.8 参数设置语法与注意事项
+### 7.9 参数设置语法与注意事项
 
 在 Spark SQL 中通过 `SET` 语句调整参数时，有几个语法细节需要注意，否则可能导致参数不生效：
 
@@ -234,7 +308,7 @@ set spark.executor.memory=3g ;
   ④ 通过 spark-submit 命令行参数设置的优先级高于 SQL 中的 set 语句
 ```
 
-### 7.9 日志排查实战——从报错到定位的完整路径
+### 7.10 日志排查实战——从报错到定位的完整路径
 
 将上面的知识串联起来，排查一个 Spark 作业问题的完整路径：
 
