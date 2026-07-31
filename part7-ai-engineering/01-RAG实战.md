@@ -456,23 +456,305 @@ def recall_at_k(ann_results, ground_truth, k):
 
 > **可观测性建议**：把 `efSearch`、召回率、P99 延迟这三个指标做成看板，并在每次索引重建后自动跑一次召回率回归测试。这和 [6.14 数据质量](../part6-bigdata/14-数据质量.md) 里对数据管道做质量校验是同一个思路——**检索质量也是一种数据质量**。
 
-### 4.6 向量检索 vs 关键词检索 vs 混合检索
+### 4.6 混合检索——多路召回与结果融合
+
+#### 4.6.1 三种检索方式的互补关系
 
 | 检索方式 | 原理 | 擅长 | 不擅长 |
 |---------|------|------|--------|
 | **关键词检索（BM25）** | 词频 + 逆文档频率，精确匹配 | 专有名词、ID、代码、缩写 | 语义相近但措辞不同 |
 | **向量检索** | 语义相似度匹配 | 同义改写、跨语言、模糊意图 | 精确匹配专有名词 |
-| **混合检索（Hybrid Search）** | 向量 + 关键词加权融合 | 兼顾语义和精确匹配 | 需要调融合权重 |
+| **混合检索（Hybrid Search）** | 向量 + 关键词多路召回后融合 | 兼顾语义和精确匹配 | 需要调融合策略 |
 
 ```
 用户问："K8s Pod 一直 CrashLoopBackOff 怎么排查？"
 
 纯关键词检索：能精确匹配 "CrashLoopBackOff" 这个术语 ✅
 纯向量检索：可能匹配到 "容器反复重启的排查方法"，但错过了精确术语 ❌
-混合检索：两者都召回，重排后取最优 ✅
+混合检索：两者都召回，融合后取最优 ✅
 ```
 
-**经验**：生产环境几乎都用混合检索。ES 8.x 也已原生支持 KNN 向量检索，可以一个引擎同时做 BM25 + 向量。
+**经验**：生产环境几乎都用混合检索。ES 8.x 已原生支持 KNN + BM25 + RRF 一体化（见 [A5 §6.9](../part3-java-deep/A5-ElasticSearch.md)），也可以用 ES + Milvus 两路独立召回后自行融合。
+
+#### 4.6.2 多路召回架构
+
+生产级的混合检索不是简单地"查两路拼一起"，而是有完整的召回-融合-精排流水线：
+
+```mermaid
+graph LR
+    Q["用户查询"] --> QV["查询向量化<br/>Embedding"]
+    Q --> QK["查询分词<br/>IK/Standard"]
+
+    QV --> V["向量检索<br/>Top-K1"]
+    QK --> K["关键词检索<br/>Top-K2"]
+    Q --> G["知识图谱检索<br/>Top-K3（可选）"]
+
+    V --> F["融合层<br/>Fuse & Dedup"]
+    K --> F
+    G --> F
+
+    F --> R["精排层<br/>Reranker"]
+    R --> T["Top-N 最终结果"]
+    T --> L["→ LLM 生成"]
+
+    style F fill:#e1f5ff
+    style R fill:#ffe1e1
+```
+
+```
+各路召回的典型配额：
+  向量检索：   Top-50  （语义宽召回）
+  关键词检索： Top-50  （精确匹配兜底）
+  图谱检索：   Top-10  （结构化关系，可选）
+
+融合后去重：100+ → ~70（向量与关键词有重叠）
+精排后截断：70 → Top-5~10 （送入 LLM 的最终结果）
+```
+
+> **为什么各路召回要多取一些**：精排（Reranker）是逐对计算的 Cross-Encoder，候选数直接决定延迟。但如果召回太少，Reranker 再强也"巧妇难为无米之炊"。典型配比是每路取最终所需数的 5~10 倍，融合去重后送入精排。
+
+#### 4.6.3 三种结果融合策略
+
+多路召回的结果要融合成一个排序列表。这是工程上最容易被面试官追问的点——**因为分数不能直接比**。
+
+```
+问题：BM25 分数和余弦相似度不能直接比较
+
+  BM25 分数：   典型范围 [0, ~15]，分布偏右尾
+  余弦相似度：  范围 [0, 1]，分布偏左尾（大多在 0.7~0.9）
+
+  直接加权：0.7 × BM25_score + 0.3 × cosine_score
+  → BM25 的数值范围碾压余弦相似度，权重形同虚设
+```
+
+| 融合策略 | 原理 | 优点 | 缺点 | 适用 |
+|---------|------|------|------|------|
+| **加权融合（需归一化）** | 先把各路分数归一化到 [0,1]，再加权求和 | 直觉清晰，可调权重 | 归一化方法敏感，权重需调参 | 各路分数分布稳定 |
+| **RRF（Reciprocal Rank Fusion）** | 只看排名，不看分数 | **无需归一化、鲁棒** | 丢失分数差异信息 | **生产首选** |
+| **级联过滤** | 一路做初筛，另一路做精排 | 简单 | 浪费另一路的召回能力 | 一强一弱的场景 |
+
+#### 4.6.4 RRF——生产环境首选的融合算法
+
+RRF（Reciprocal Rank Fusion，倒数排名融合）的核心思想极其简单：**不看分数，只看排名**。排名越靠前贡献越大，且贡献按倒数衰减。
+
+```
+RRF 公式：
+
+  RRF_score(d) = Σ  1 / (k + rank_i(d))
+                i∈sources
+
+  rank_i(d) : 文档 d 在第 i 路检索结果中的排名（从 1 开始）
+  k         : 平滑常数（默认 60），防止排名第 1 的贡献过大
+```
+
+```
+示例：文档 A 在向量检索排第 1，在 BM25 排第 20
+
+  RRF(A) = 1/(60+1) + 1/(60+20) = 0.0164 + 0.0125 = 0.0289
+
+文档 B 在向量检索排第 3，在 BM25 排第 2
+
+  RRF(B) = 1/(60+3) + 1/(60+2) = 0.0159 + 0.0161 = 0.0320
+
+  → B 的 RRF 分数高于 A，因为 B 在两路都靠前
+  → A 虽然向量排第一，但 BM25 排名靠后，被拉平了
+```
+
+**RRF 为什么好**：
+
+- **无需归一化**——BM25 可能是 12.3，余弦可能是 0.85，RRF 完全不关心绝对数值，只用排名
+- **鲁棒**——某个引擎偶发的分数异常（如 BM25 某词的 IDF 极高导致分数飙升）不会影响融合
+- **参数极少**——只有一个 `k`（默认 60），而且对结果不敏感
+
+> **k 的作用**：`k` 越大，排名差异的影响越平滑（第 1 名和第 10 名贡献差变小）；`k` 越小，头部排名优势越大。默认值 60 是大量实验验证出的鲁棒选择，**除非有明确实验数据，否则不要动它**。
+
+```python
+def rrf_fusion(results: dict[str, list], k: int = 60, top_n: int = 10) -> list:
+    """
+    results: {"vector": [(doc_id, score), ...], "bm25": [(doc_id, score), ...]}
+    返回融合排序后的 Top-N
+    """
+    scores = defaultdict(float)
+    for source, hits in results.items():
+        for rank, (doc_id, _) in enumerate(hits, 1):   # rank 从 1 开始
+            scores[doc_id] += 1.0 / (k + rank)
+
+    return sorted(scores.items(), key=lambda x: -x[1])[:top_n]
+```
+
+> **ES 8.x 内置 RRF**：如果你用 ES 做混合检索，ES 8.14+ 的 `retriever` API 原生支持 RRF（见 [A5 §6.9](../part3-java-deep/A5-ElasticSearch.md) 的示例），不需要自己写融合逻辑。只有用 ES + Milvus 分离架构时才需要自己在应用层实现 RRF。
+
+#### 4.6.5 加权融合与分数归一化
+
+如果业务需要对各路召回的权重做精细控制（如"向量检索更重要，权重 0.7"），就必须先做分数归一化：
+
+```python
+def normalize_scores(hits: list[tuple[str, float]], method: str = "minmax") -> list[tuple[str, float]]:
+    """把分数归一化到 [0, 1]"""
+    if not hits:
+        return hits
+    scores = [s for _, s in hits]
+    lo, hi = min(scores), max(scores)
+
+    if method == "minmax":
+        return [(doc_id, (s - lo) / (hi - lo + 1e-9)) for doc_id, s in hits]
+    elif method == "zscore":
+        mu, sigma = statistics.mean(scores), statistics.stdev(scores)
+        # z-score → sigmoid 映射到 [0,1]
+        return [(doc_id, 1 / (1 + math.exp(-(s - mu) / (sigma + 1e-9)))) for doc_id, s in hits]
+
+def weighted_fusion(results: dict, weights: dict, top_n: int = 10) -> list:
+    """
+    results:  {"vector": [(doc_id, score), ...], "bm25": [(doc_id, score), ...]}
+    weights:  {"vector": 0.7, "bm25": 0.3}
+    """
+    normalized = {
+        src: dict(normalize_scores(hits)) for src, hits in results.items()
+    }
+    combined = defaultdict(float)
+    for src, weight in weights.items():
+        for doc_id, score in normalized[src].items():
+            combined[doc_id] += weight * score
+    return sorted(combined.items(), key=lambda x: -x[1])[:top_n]
+```
+
+| 归一化方法 | 特点 | 适用 |
+|-----------|------|------|
+| **Min-Max** | 简单，但受极端值影响大（一个异常高分把其他都压成 0） | 分数分布均匀 |
+| **Z-Score + Sigmoid** | 对极端值鲁棒，输出平滑 | 分数有离群点 |
+| **RRF（不用归一化）** | **最鲁棒，最省心** | **默认选择** |
+
+> **选型建议**：**先用 RRF，不满意再考虑加权融合**。RRF 在绝大多数场景的效果已经足够好，加权融合的调参成本（需要离线评估不同权重的效果）往往不值得。只有当某一路召回质量明显优于另一路时，加权融合才有意义。
+
+#### 4.6.6 Rerank 工程化
+
+[5.4](#54-重排序reranking) 讲了 Rerank 的原理（Cross-Encoder 精排）。这里补充工程落地的关键决策。
+
+**延迟预算**——这是 Rerank 在生产中最需要注意的点：
+
+```
+端到端检索延迟预算（P99 目标 < 200ms）：
+
+  查询向量化（Embedding API）：  ~20ms
+  向量检索 + BM25 并行：         ~30ms（并行取 max）
+  融合去重：                     ~5ms
+  ─── 到这里约 55ms ───
+  Rerank 精排（Cross-Encoder）：  ~80ms（取决于候选数和模型）
+  ─── 总计约 135ms ───
+  余量：                         ~65ms（网络传输、序列化等）
+
+  Rerank 的延迟 = 候选数 × 单次推理时间
+  例：50 候选 × 1.5ms/对 = 75ms（GPU）
+      50 候选 × 5ms/对  = 250ms（CPU，超预算！）
+```
+
+**控制 Rerank 延迟的三种手段**：
+
+| 手段 | 做法 | 效果 |
+|------|------|------|
+| **减少候选数** | 融合后只取 Top-20 送入 Rerank，而非 100 | 延迟线性下降 |
+| **批量推理** | 把 (query, doc) 对打包成一个 batch 送 GPU | GPU 利用率提升 5~10 倍 |
+| **模型量化** | FP16 → INT8 量化 Reranker | 推理速度提升 2~3 倍 |
+
+```python
+# 批量推理的典型实现
+def rerank_batch(query: str, candidates: list[str], model, batch_size: int = 32) -> list[tuple[str, float]]:
+    """Cross-Encoder 批量精排"""
+    pairs = [(query, doc) for doc in candidates]
+    scores = []
+
+    for i in range(0, len(pairs), batch_size):
+        batch = pairs[i:i + batch_size]
+        # Cross-Encoder 一次性处理一个 batch
+        batch_scores = model.predict(batch)   # 返回 [batch_size] 的相似度
+        scores.extend(batch_scores)
+
+    ranked = list(zip(candidates, scores))
+    return sorted(ranked, key=lambda x: -x[1])
+```
+
+**Rerank 模型选型**：
+
+| 模型 | 语言 | 特点 | 延迟（20 候选，GPU） | 适用 |
+|------|------|------|---------------------|------|
+| **bge-reranker-v2-m3** | 多语言 | 效果好、体积适中 | ~30ms | 中文场景首选 |
+| **bge-reranker-large** | 多语言 | 效果更好、体积大 | ~60ms | 对精度要求高 |
+| **Cohere Rerank 3** | 多语言 | 托管 API、无需 GPU | ~100ms（网络） | 不想运维 GPU |
+| **jina-reranker-v2** | 多语言 | 轻量、速度快 | ~20ms | 延迟敏感 |
+
+> **选型建议**：中文场景首选 `bge-reranker-v2-m3`，效果和延迟的平衡好且开源可私有部署。如果有 GPU 资源，自部署比调 API 快且省钱；没有 GPU 或想快速验证，用 Cohere 的托管 API。
+
+**Rerank 不是必须的**——如果候选只有 10 条以下，直接用 RRF 融合后的排序就够了。Rerank 的价值在于候选量在 20~100 之间时，Cross-Encoder 能显著纠正向量检索的粗排错误。**候选太少时 Rerank 的延迟收益是负的。**
+
+#### 4.6.7 召回不足的诊断与工程优化
+
+```
+症状：用户反馈"搜不到""答案不准""漏了关键信息"
+
+诊断清单（按优先级排查）：
+
+  ① 检查分词
+    → 用 _analyze 看查询和文档的分词结果是否一致
+    → 最常见的问题：业务专有名词没进自定义词典，被切碎了
+
+  ② 检查混合检索的两路召回
+    → 分别打印向量 Top-K 和 BM25 Top-K，看目标文档在哪一路
+    → 如果两路都没有 → 问题在召回阶段（分词/Embedding/索引）
+    → 如果有但融合后排不上 → 问题在融合策略（试 RRF）
+
+  ③ 检查 Rerank
+    → 看 Rerank 前后的排序变化，如果变化剧烈说明粗排质量差
+    → 换一个更强的 Reranker 或增大送入 Rerank 的候选数
+
+  ④ 检查分块
+    → 答案被切在两个 chunk 里 → 调大分块或用 Parent-Document Retrieval
+    → chunk 太大导致语义被稀释 → 调小分块
+
+  ⑤ 检查 Embedding 模型
+    → 中文场景用 BGE/GTE 而非通用英文模型
+    → 确保索引和查询用的是同一个模型版本
+```
+
+**幻觉的工程防护**——不完全依赖模型自觉，在系统层面兜底：
+
+| 手段 | 做法 | 效果 |
+|------|------|------|
+| **引用强制** | Prompt 要求 LLM 每条结论都标注 `[doc_id]`，输出校验时检查引用是否存在 | 能拦截无中生有的回答 |
+| **置信度阈值** | Rerank 分数低于阈值时不回答，返回"知识库中未找到相关内容" | 宁可拒答也不编造 |
+| **Grounding 校验** | 用 NLI（自然语言推理）模型检查"回答是否被检索到的上下文支持" | 技术上可检测幻觉 |
+| **兜底 Prompt** | "如果检索结果与问题无关，请直接说不知道" | 最简单但有效 |
+
+```python
+def rag_generate_with_guardrails(query, retrieved_context):
+    # 置信度检查
+    max_score = max(doc.rerank_score for doc in retrieved_context)
+    if max_score < CONFIDENCE_THRESHOLD:
+        return "抱歉，知识库中未找到与该问题相关的内容。"
+
+    # 生成 + 引用强制
+    prompt = f"""
+基于以下参考资料回答问题。要求：
+1. 只使用参考资料中的信息，不要编造
+2. 每条结论后用 [来源编号] 标注引用
+3. 如果参考资料无法回答该问题，直接回答"根据现有资料无法回答"
+
+参考资料：
+{format_context_with_ids(retrieved_context)}
+
+问题：{query}
+"""
+    answer = llm.complete(prompt)
+
+    # 引用校验
+    cited_ids = extract_citations(answer)
+    valid_ids = {doc.id for doc in retrieved_context}
+    invalid_citations = cited_ids - valid_ids
+    if invalid_citations:
+        logger.warning(f"hallucinated citations: {invalid_citations}")
+        answer = strip_invalid_citations(answer, invalid_citations)
+
+    return answer
+```
 
 ### 4.7 相似度度量
 

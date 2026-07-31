@@ -99,7 +99,7 @@ flowchart LR
 - [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
 - [附录 A3：两阶段提交——MySQL 内部 2PC / 分布式 2PC / Flink 2PC](./part3-java-deep/A3-两阶段提交.md)
 - [附录 A4：SQL 语言与查询优化——执行顺序 / JOIN / 窗口函数 / EXPLAIN / 慢 SQL](./part3-java-deep/A4-SQL语言与数据处理.md)
-- [附录 A5：ElasticSearch——倒排索引 / DSL 查询 / 集群架构 / MongoDB 简介](./part3-java-deep/A5-ElasticSearch.md)
+- [附录 A5：ElasticSearch——倒排索引 / DSL 查询 / BM25 相关性 / 搜索工程实践（分片规划·冷热分离·集群调优·KNN）/ MongoDB 简介](./part3-java-deep/A5-ElasticSearch.md)
 - [附录 A6：代码规范与设计原则——SOLID / 阿里规范 / 代码坏味道](./part3-java-deep/A6-代码规范与设计原则.md)
 - [附录 A7：开发工具链——Git 进阶 / Maven / CI·CD / Linux 速查](./part3-java-deep/A7-开发工具链.md)
 - [附录 A8：Linux 操作系统基础——cgroup / VFS / 进程线程 / namespace / IPC](./part3-java-deep/A8-Linux操作系统基础.md)
@@ -175,6 +175,7 @@ flowchart LR
 - [7.8 AgentBI 智能分析：自然语言问数 / 查询编排 / 图表推荐 / 多步归因 / 报告生成](./part7-ai-engineering/08-AgentBI智能分析.md)
 - [7.9 AI 安全与可信：Prompt 注入防御 / 数据投毒检测 / PII 脱敏 / 多租户隔离](./part7-ai-engineering/09-AI安全与可信.md)
 - [7.10 GraphRAG 与知识图谱增强：实体关系抽取 / 社区发现 / Local-Global Search / 工具关系图谱](./part7-ai-engineering/10-GraphRAG与知识图谱.md)
+- [7.11 检索平台工程：Embedding 管道 / 语义缓存 / 容量规划 / 降级链路](./part7-ai-engineering/11-检索平台工程.md)
 
 ### 第八章 · Notebook 平台架构：全栈开发的绝佳研究案例 〔综合应用〕
 
