@@ -1503,7 +1503,7 @@ spark.sql.shuffle.partitions = 200（默认值，通常偏小）
   → AQE 会在写入前自动合并过小分区，配合 DISTRIBUTE BY 效果更好
 ```
 
-> **Hive 四种排序关键字在 Spark SQL 中的支持情况**：Spark SQL 兼容 Hive 的 ORDER BY、SORT BY、DISTRIBUTE BY、CLUSTER BY 语法，语义一致。关键区别：Spark SQL 中 ORDER BY 不再强制单 Reducer——当查询有 LIMIT 时，Spark 会用 Top-K 算法（TakeOrdered）避免全量排序；没有 LIMIT 时仍是全局排序但可以多分区并行收集后合并。DISTRIBUTE BY 在 Spark 中最常用于控制输出文件数和解决动态分区写入 OOM，而非排序场景。详见 [Hive — 四种排序关键字](./03-Hive.md#26-四种排序关键字order-by--sort-by--distribute-by--cluster-by)。
+> **Hive 四种排序关键字在 Spark SQL 中的支持情况**：Spark SQL 兼容 Hive 的 ORDER BY、SORT BY、DISTRIBUTE BY、CLUSTER BY 语法，语义一致。关键区别：Spark SQL 中 ORDER BY 不再强制单 Reducer——当查询有 LIMIT 时，Spark 会用 Top-K 算法（TakeOrdered）避免全量排序；没有 LIMIT 时仍是全局排序但可以多分区并行收集后合并。DISTRIBUTE BY 在 Spark 中最常用于控制输出文件数和解决动态分区写入 OOM，而非排序场景。详见 [Hive — 四种排序关键字](./03-Hive.md#26-四种排序关键字order-by-sort-by-distribute-by-cluster-by)。
 
 #### spark.default.parallelism vs spark.sql.shuffle.partitions——两个最容易混淆的参数
 

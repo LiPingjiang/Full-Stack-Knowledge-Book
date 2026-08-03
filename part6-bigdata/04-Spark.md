@@ -129,7 +129,7 @@ Action 分为两大类，区别在于计算结果去哪里：
   → 数据量有上限，安全
 ```
 
-> **生产环境最佳实践**：能用 `write` 写存储就不用 `collect()` 回 Driver。数据量大时，结果直接写到 HDFS/S3/MySQL/Kafka，Driver 只负责提交任务和接收"成功/失败"的状态，不碰实际数据。Driver OOM 的头号原因就是 `collect()` 拉了过大结果集（详见 [性能优化专题 — OOM 排查](./04-Spark-性能优化.md#oom--spill-排查路径)）。
+> **生产环境最佳实践**：能用 `write` 写存储就不用 `collect()` 回 Driver。数据量大时，结果直接写到 HDFS/S3/MySQL/Kafka，Driver 只负责提交任务和接收"成功/失败"的状态，不碰实际数据。Driver OOM 的头号原因就是 `collect()` 拉了过大结果集（详见 [性能优化专题 — OOM 排查](./04-Spark-性能优化.md#oom-spill-排查路径)）。
 
 ### 2.3 宽依赖 vs 窄依赖
 

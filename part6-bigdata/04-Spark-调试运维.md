@@ -323,7 +323,7 @@ Step 2：定位报错位置
   → 如果 Driver 日志显示是某个 Task 失败 → 再看对应 Executor 的日志
 
 Step 3：根据报错类型选择排查方向
-  → OOM（Java heap space）→ 见 [性能优化专题 — OOM/Spill 排查路径](./04-Spark-性能优化.md#oom--spill-排查路径)
+  → OOM（Java heap space）→ 见 [性能优化专题 — OOM/Spill 排查路径](./04-Spark-性能优化.md#oom-spill-排查路径)
   → YARN kill（exitCode 143）→ 堆外内存超限，调大 memoryOverhead
   → 数据倾斜（部分 Task 极慢）→ 见 [性能优化专题 — 数据倾斜八种修复方案](./04-Spark-性能优化.md#65-数据倾斜八种修复方案)
   → Shuffle 文件丢失 → 见主文档 [考点 10：FileNotFoundException 区分](./04-Spark.md#考点-10spark-作业报-filenotfoundexception-怎么区分原因)
