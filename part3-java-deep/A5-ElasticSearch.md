@@ -267,6 +267,14 @@ ES 写入后**不是立即可搜**，而是有约 1 秒的延迟（`refresh_inte
 
 ### 4.3 聚合（Aggregation）
 
+聚合是 ES 的"GROUP BY + 统计函数"，但比 SQL 强的地方在于**可以无限层嵌套**。ES 的聚合分三大类：
+
+| 类别 | 作用 | 类比 SQL | 代表 |
+|------|------|---------|------|
+| **Bucket（分桶）** | 把文档**分组**，每组一个桶 | `GROUP BY` | `terms`、`range`、`date_histogram` |
+| **Metric（指标）** | 对桶内文档**算数值** | `SUM()`、`AVG()` | `sum`、`avg`、`cardinality` |
+| **Pipeline（管道）** | 对**其他聚合的结果**再计算 | 窗口函数 | `derivative`、`cumulative_sum`、`bucket_selector` |
+
 ```json
 // 按品牌分组统计销量，并计算平均价格
 {
@@ -282,6 +290,99 @@ ES 写入后**不是立即可搜**，而是有约 1 秒的延迟（`refresh_inte
   }
 }
 ```
+
+**常用聚合速查**：
+
+| 聚合 | 类别 | 说明 |
+|------|------|------|
+| `terms` | Bucket | 按字段值分组（最常用），类似 `GROUP BY` |
+| `range` / `date_range` | Bucket | 按数值/日期区间分桶 |
+| `date_histogram` | Bucket | 按时间间隔分桶，做趋势图的核心 |
+| `histogram` | Bucket | 按数值间隔分桶 |
+| `filter` / `filters` | Bucket | 按条件筛选出一个/多个桶 |
+| `nested` / `reverse_nested` | Bucket | 处理 nested 类型字段 |
+| `composite` | Bucket | **支持分页的分组**，用于导出全部分组结果 |
+| `sum` / `avg` / `min` / `max` | Metric | 基础数值统计 |
+| `stats` / `extended_stats` | Metric | 一次返回 count/min/max/avg/sum（及方差标准差） |
+| `cardinality` | Metric | **去重计数**（近似），类似 `COUNT(DISTINCT)` |
+| `percentiles` | Metric | 百分位数，算 P95/P99 延迟的利器 |
+| `top_hits` | Metric | 每个桶内返回 Top N 原始文档（分组取详情） |
+| `value_count` | Metric | 计数（不去重） |
+| `derivative` / `cumulative_sum` | Pipeline | 求导（环比）/ 累计求和 |
+| `bucket_selector` / `bucket_sort` | Pipeline | 对桶做过滤/排序，类似 `HAVING` |
+
+**去重聚合——支持，但要理解它是"近似"的**。这是 ES 聚合里最容易踩坑的点：
+
+```json
+// 统计有多少个不同的用户访问过（≈ SELECT COUNT(DISTINCT user_id)）
+{
+  "size": 0,
+  "aggs": {
+    "unique_users": {
+      "cardinality": { "field": "user_id" }
+    }
+  }
+}
+```
+
+`cardinality` 底层用的是 **HyperLogLog++ 算法**——不存储所有去重值，而是用固定大小的内存做概率估算：
+
+```
+精确去重（如 MySQL COUNT DISTINCT）：
+  必须把所有不同的值放进内存去重 → 亿级基数就是几 GB 内存 → 分布式下还要汇总
+
+HyperLogLog++：
+  用固定几 KB 内存估算基数，误差约 0.5%
+  代价：结果是【近似值】，不是精确值
+```
+
+关键参数是 `precision_threshold`（默认 3000，最大 40000）：**基数低于这个阈值时结果几乎精确，超过则开始有误差**。调大更准但更耗内存。
+
+```json
+{
+  "aggs": {
+    "unique_users": {
+      "cardinality": {
+        "field": "user_id",
+        "precision_threshold": 40000     // 4 万以内基本精确，内存约几十 KB
+      }
+    }
+  }
+}
+```
+
+> **必须精确去重怎么办**：ES 没有精确的 `COUNT(DISTINCT)`。变通方案有三种——① 基数不大时用 `terms` 聚合（设置足够大的 `size`）后数桶的个数；② 用 `composite` 聚合分页遍历所有分组，在应用层统计；③ 如果这是核心指标，说明它更适合放在数仓（Hive/ClickHouse）里算，而不是 ES。**不要试图靠调大 `precision_threshold` 得到精确值，它有上限。**
+
+**另一个必须知道的坑：`terms` 聚合的结果也可能不准。**
+
+```
+分布式聚合的固有问题：
+
+  协调节点向 3 个分片各要 Top 5 品牌
+        ↓
+  某个品牌在 P0 排第 6（没返回），在 P1、P2 排第 2
+        ↓
+  汇总后它的总数被低估，甚至可能被挤出最终 Top 5
+```
+
+返回结果里的 `doc_count_error_upper_bound`（误差上界）和 `sum_other_doc_count`（未纳入统计的文档数）就是用来提示这个问题的。解法是**调大 `shard_size`**（每个分片返回更多候选，默认 `size × 1.5 + 10`），代价是内存和网络开销：
+
+```json
+{
+  "aggs": {
+    "brands": {
+      "terms": {
+        "field": "brand.keyword",
+        "size": 10,
+        "shard_size": 100,                 // 每个分片多返回候选，提升准确度
+        "show_term_doc_count_error": true  // 显示误差信息
+      }
+    }
+  }
+}
+```
+
+> **聚合的内存风险**：聚合走 Doc Values（见 [6.2](#62-索引设计与分片规划)），高基数字段做 `terms` 聚合会产生海量桶，可能撑爆堆内存。ES 有 `search.max_buckets`（默认 65536）保护，超了直接报错。**遇到这个错误不要盲目调大上限，先想想是不是该换 `composite` 聚合分页，或者这个查询本就不该在 ES 上做。**
 
 ---
 
@@ -340,7 +441,25 @@ IDF 部分 Lucene 用的是带平滑的变体，保证结果恒为正数：
 
 > **GitHub 数学公式渲染**：上面用的是 GitHub 自 2022 年起原生支持的 LaTeX 语法——块级公式用 ` ```math ` 代码块（或 `$$...$$`），行内公式用 `$...$`，底层由 KaTeX 渲染。本地用 VS Code 预览需要装 Markdown+Math 类插件。
 
-> **"25" 是什么意思**：纯粹是**实验编号**，没有数学含义。BM25 出自 Robertson 与 Spärck Jones 的概率检索模型研究，他们在 TREC 评测中依次试验了 BM1、BM11、BM15…… 其中 **BM11** 是文档长度完全归一化（相当于 $b=1$），**BM15** 是完全不归一化（相当于 $b=0$），而 **BM25 用参数 $b$ 在两者之间做插值**——把 $b=1$ 和 $b=0$ 代入长度归一化因子 $1-b+b\cdot\frac{|D|}{\text{avgdl}}$ 就能验证。第 25 号配置在评测中效果最好，于是成了工业标准。面试时顺口带一句"$b$ 本质是在 BM11 和 BM15 之间插值"，比只说"b 控制长度归一化"显得理解更深。
+**"BM25" 这个名字是怎么来的**——很多人以为 25 有什么数学含义，其实它就是个**版本号**。
+
+**BM = Best Matching（最佳匹配）**，属于经典的**信息检索（Information Retrieval）概率模型**。20 世纪 70 至 90 年代，伦敦城市大学（City University London）的 **Stephen Robertson**、**Karen Spärck Jones** 等学者在研究**概率检索模型（Probabilistic Relevance Framework）**时，陆续提出了一系列加权公式，依次命名为 BM1、BM2、BM3……
+
+他们不断做实验调整，逐步加入**文档长度归一化（Document Length Normalization）**和**词频调节参数**（也就是今天的 $k_1$ 和 $b$），一路迭代到**第 25 个版本**。这一版在著名的 **TREC（Text REtrieval Conference）文本检索大会**上表现极其优异、大幅超越此前版本，最终成为信息检索领域最经典、应用最广的标准算法。
+
+所以 **25 = "第 25 次迭代"**，仅此而已。
+
+从命名还能看出它的血统——这个系列里有两个关键的前辈版本：
+
+| 版本 | 长度归一化策略 | 等价于 BM25 的 |
+|------|--------------|--------------|
+| **BM11** | 文档长度**完全归一化** | $b = 1$ |
+| **BM15** | **完全不做**长度归一化 | $b = 0$ |
+| **BM25** | 用参数 $b$ 在两者间**线性插值** | $0 \le b \le 1$ |
+
+把 $b=1$ 和 $b=0$ 代入长度归一化因子 $1-b+b\cdot\frac{|D|}{\text{avgdl}}$ 就能验证：$b=1$ 时化简为 $\frac{|D|}{\text{avgdl}}$（即 BM11），$b=0$ 时化简为常数 $1$（即 BM15）。ES 默认的 $b=0.75$ 正是**偏向 BM11 的一个折中**。
+
+> **面试加分点**：顺口带一句"$b$ 本质是在 BM11 全归一化和 BM15 不归一化之间做插值"，比只说"b 控制长度归一化强度"显得理解深一层——因为它说明你知道这个参数的设计动机，而不只是背了参数表。
 
 ### 5.2 k1 与 b 两个调优参数
 
