@@ -209,16 +209,38 @@ ES 5.x 之后默认的评分算法是 **BM25**（Best Matching 25），它是 TF
 
 BM25 公式（面试能说清三个因子的作用即可，不要求背）：
 
+```math
+\text{score}(D, Q) = \sum_{q_i \in Q} \text{IDF}(q_i) \cdot \frac{f(q_i, D) \cdot (k_1 + 1)}{f(q_i, D) + k_1 \cdot \left(1 - b + b \cdot \frac{|D|}{\text{avgdl}}\right)}
 ```
-score(D, Q) = Σ  IDF(qi) ×          f(qi, D) × (k1 + 1)
-              qi∈Q              ─────────────────────────────────
-                                f(qi,D) + k1 × (1 - b + b × |D|/avgdl)
 
-  f(qi, D) : 词 qi 在文档 D 中的出现次数（TF）
-  |D|      : 文档 D 的长度
-  avgdl    : 索引中所有文档的平均长度
-  k1, b    : 两个可调参数
+其中：
+
+| 符号 | 含义 |
+|------|------|
+| $f(q_i, D)$ | 词 $q_i$ 在文档 $D$ 中的出现次数（词频 TF） |
+| $\lvert D \rvert$ | 文档 $D$ 的长度（词条数） |
+| $\text{avgdl}$ | 索引中所有文档的平均长度（average document length） |
+| $\text{IDF}(q_i)$ | 逆文档频率，衡量词 $q_i$ 的区分度 |
+| $k_1$ | 词频饱和参数，ES 默认 `1.2` |
+| $b$ | 文档长度归一化强度，ES 默认 `0.75` |
+
+IDF 部分 Lucene 用的是带平滑的变体，保证结果恒为正数：
+
+```math
+\text{IDF}(q_i) = \ln\left(1 + \frac{N - n(q_i) + 0.5}{n(q_i) + 0.5}\right)
 ```
+
+其中 $N$ 是索引总文档数，$n(q_i)$ 是包含词 $q_i$ 的文档数。**词越罕见，$n(q_i)$ 越小，IDF 越大**——这就是"布隆过滤器"比"的"权重高的数学来源。
+
+把公式拆开看，三个因子各司其职：
+
+```math
+\underbrace{\text{IDF}(q_i)}_{\text{词的稀有度}} \cdot \frac{\overbrace{f(q_i,D)}^{\text{词频}}\cdot(k_1+1)}{f(q_i,D) + k_1\cdot\underbrace{\left(1-b+b\cdot\frac{|D|}{\text{avgdl}}\right)}_{\text{长度归一化}}}
+```
+
+**为什么这个分式能实现"饱和"**：当 $f(q_i,D) \to \infty$ 时，分子分母同阶，整体趋近于常数 $k_1 + 1$。也就是说**无论一个词出现多少次，单个词的得分都有上限**，这正是 BM25 相比 TF-IDF 最关键的改进。
+
+> **GitHub 数学公式渲染**：上面用的是 GitHub 自 2022 年起原生支持的 LaTeX 语法——块级公式用 ` ```math ` 代码块（或 `$$...$$`），行内公式用 `$...$`，底层由 KaTeX 渲染。本地用 VS Code 预览需要装 Markdown+Math 类插件。
 
 ### 5.2 k1 与 b 两个调优参数
 
