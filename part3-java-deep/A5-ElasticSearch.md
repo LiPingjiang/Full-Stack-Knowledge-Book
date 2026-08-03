@@ -325,7 +325,7 @@ ES 写入后**不是立即可搜**，而是有约 1 秒的延迟（`refresh_inte
 }
 ```
 
-`cardinality` 底层用的是 **HyperLogLog++ 算法**——不存储所有去重值，而是用固定大小的内存做概率估算：
+`cardinality` 底层用的是 **[HyperLogLog++ 算法](./A1-核心数据结构原理.md#九hyperlogloghll用-12kb-估算亿级基数)**（原理详见 A1 第九章：分桶 + 前导零计数 + 调和平均，以及 [§9.5 HLL++ 的改进](./A1-核心数据结构原理.md#95-hyperloglog-改进google-论文)）——不存储所有去重值，而是用固定大小的内存做概率估算：
 
 ```
 精确去重（如 MySQL COUNT DISTINCT）：
