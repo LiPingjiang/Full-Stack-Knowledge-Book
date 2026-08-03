@@ -225,7 +225,7 @@ Embedding（嵌入）是将文本映射为高维浮点数向量的过程。核�
 | **Chroma** | 嵌入式 / 本地 | 轻量、Python 友好、开发体验好 | 原型开发、小规模 |
 | **FAISS** | 库（非数据库） | Meta 开源、纯计算库、极致性能、无持久化 | 已有自己的存储层、只需要检索能力 |
 
-> **后端类比**：FAISS 是"库"（类似 Java 的 Lucene），Milvus/Pinecone 是"数据库"（类似 ES）。
+> **后端类比**：FAISS 是"库"（类似 Java 的 [Lucene](../part3-java-deep/A5-ElasticSearch.md#611-底层存储引擎lucene-到底长什么样)），Milvus/Pinecone 是"数据库"（类似 ES）。这个类比很贴切——Lucene 只提供索引和检索能力，分布式、分片、副本、REST API 都是 ES 在它之上加的；FAISS 与 Milvus 的关系完全相同。
 
 **选型决策树**：
 
