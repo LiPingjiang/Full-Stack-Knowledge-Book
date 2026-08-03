@@ -475,17 +475,33 @@ PUT /articles
 
 **自定义词典**——这是企业场景下投入产出比最高的一环，因为业务黑话、产品名、内部缩写 IK 的默认词典绝对没有：
 
+IK 一共有**四个**配置项，按「词典用途」× 「本地/远程」两两组合：
+
 ```xml
 <!-- config/IKAnalyzer.cfg.xml -->
 <properties>
-    <!-- 扩展词典：业务专有名词，防止被切碎 -->
+    <!-- ① 本地扩展词典：值是相对 config 目录的【文件路径】 -->
     <entry key="ext_dict">custom/business.dic</entry>
-    <!-- 停用词典：过滤无意义词 -->
+
+    <!-- ② 本地扩展停用词典：同样是【文件路径】 -->
     <entry key="ext_stopwords">custom/stopword.dic</entry>
-    <!-- 远程词典：支持热更新，无需重启集群 -->
+
+    <!-- ③ 远程扩展词典：值是【HTTP URL】，支持热更新 -->
     <entry key="remote_ext_dict">http://config-server/dict/hot.dic</entry>
+
+    <!-- ④ 远程扩展停用词典：值也是【HTTP URL】 -->
+    <entry key="remote_ext_stopwords">http://config-server/dict/hot_stop.dic</entry>
 </properties>
 ```
+
+|  | 扩展词典（要成词的） | 停用词典（要丢弃的） |
+|---|---|---|
+| **本地**（文件路径，改后需重启） | `ext_dict` | `ext_stopwords` |
+| **远程**（HTTP URL，60 秒热更新） | `remote_ext_dict` | `remote_ext_stopwords` |
+
+> **"远程"指的就是 URL**——`ext_dict` / `ext_stopwords` 的值是**节点本地文件路径**（相对 IK 插件的 `config` 目录），改完必须重启节点才生效；带 `remote_` 前缀的两个才是 **HTTP URL**，由 IK 定时轮询、无需重启。两组可以同时配置：稳定的基础词库放本地，高频变动的业务词放远程。
+>
+> **多个词典文件用英文分号分隔**：`<entry key="ext_dict">custom/a.dic;custom/b.dic</entry>`。
 
 **词典文件长什么样**——结构简单到令人意外：**一行一个词，没有权重、没有词性、没有分隔符**。
 
@@ -502,7 +518,7 @@ LBS
 ```
 
 ```
-# custom/stopword.dic —— 停用词典
+# custom/stopword.dic —— 停用词典（Stop Words）
 的
 了
 是
@@ -510,16 +526,67 @@ LBS
 和
 ```
 
-> **两个必踩的坑**：**① 编码必须是 UTF-8 无 BOM**。用 Windows 记事本另存为会带上 BOM 头，导致**第一行词条永远不生效**——而且不报错，只是静默失效，极难排查。**② 换行符建议用 LF**，CRLF 在部分 IK 版本下会把 `\r` 当作词的一部分。
+> **"停用词"是什么意思，为什么叫"停"**——这个译名容易让人误以为是"遇到它就停止切分"，**并不是**。Stop Word 指的是**高频出现但几乎不携带检索价值的词**（中文的"的、了、是"，英文的 the、a、is）。IK 的处理方式是：**照常切分，但把命中停用词表的 Token 丢弃，不写入倒排索引**。
 >
-> 排查方法：`file custom/business.dic` 看编码，或直接用 `_analyze` 测第一个词能不能被正确切出来。
+> ```
+> "Java 的并发编程"  →  切分：[java] [的] [并发] [编程]
+>                    →  丢弃停用词"的"
+>                    →  入库：[java] [并发] [编程]     ← "的"消失了，但切分本身没被打断
+> ```
+>
+> 名字里的 "stop" 来自 1950 年代信息检索先驱 H.P. Luhn 的 **stop list**（停止表）——意为"处理到这些词就**停手，不再往下建索引**"，而不是"停止切分"。所以准确的理解是「**停止收录**」，不是「停止分词」。中文学界固定译作**停用词**（也有译作"停止词"的），本书统一用「停用词（Stop Words）」。
+>
+> **为什么要去掉**：这些词几乎每篇文档都有，IDF 极低（见 [5.1](#51-从-tf-idf-到-bm25)），对区分文档毫无帮助，却要占用大量倒排索引空间。**但也有代价**——去掉后无法做包含停用词的短语精确匹配，比如搜英文乐队名 "The Who" 会因为两个词都是停用词而检索不到。这也是 ES 的 `standard` analyzer 默认**不启用**英文停用词过滤的原因。
+
+**两个必踩的坑**：
+
+**① 编码必须是 UTF-8 无 BOM。**
+
+**BOM（Byte Order Mark，字节顺序标记）**是文件开头的一段**不可见的特殊字节**，用来向读取程序声明"我是什么编码"。UTF-8 的 BOM 是三个字节 `EF BB BF`。
+
+```
+你以为文件是这样：              实际磁盘上是这样：
+┌──────────────┐               ┌──────────────────────────┐
+│ 布隆过滤器      │               │ EF BB BF 布隆过滤器        │
+│ 一致性哈希      │               │ 一致性哈希                 │
+└──────────────┘               └──────────────────────────┘
+                                  ↑ 三个看不见的字节
+```
+
+IK 逐行读取词典时**不会剥离 BOM**，于是第一行被读成 `"\uFEFF布隆过滤器"`——一个前面挂着幽灵字符的词。它和用户真正输入的"布隆过滤器"永远匹配不上，**所以第一行词条永远不生效**。而且 IK 不会报错，只是静默失效，极难排查。
+
+Windows 记事本"另存为 UTF-8"默认就会加 BOM（Win10 1903 后才改为默认不加），这是最常见的来源。
+
+```bash
+# 检测：有 BOM 会显示 "UTF-8 Unicode (with BOM) text"
+file custom/business.dic
+
+# 看前三个字节，是 efbbbf 就说明有 BOM
+head -c 3 custom/business.dic | xxd
+
+# 去除 BOM
+sed -i '1s/^\xEF\xBB\xBF//' custom/business.dic
+```
+
+> **为什么 UTF-8 其实不需要 BOM**：BOM 的本意是给 UTF-16/UTF-32 区分大端小端（Byte **Order**），而 UTF-8 是单字节序列、根本不存在字节序问题。所以 UTF-8 的 BOM 纯粹是"标记这是 UTF-8"的冗余设计，Unicode 标准也不推荐使用。**Linux/Unix 生态一律不加 BOM**，只有 Windows 系工具爱加。
+
+**② 换行符建议用 LF。** CRLF（Windows 换行 `\r\n`）在部分 IK 版本下会把 `\r` 当作词的一部分，效果和 BOM 类似——每一行的词都多了个看不见的尾巴。
+
+```bash
+# 检测：显示 "with CRLF line terminators" 就是 Windows 换行
+file custom/business.dic
+# 转换
+dos2unix custom/business.dic
+```
+
+> **最可靠的验证方式**：别只看文件，直接用 `_analyze` 测第一个词能不能被正确切出来——这是端到端的验证，BOM、换行符、路径配错、词典没加载，任何一个环节出问题都会暴露。
 
 **词典的三种加载方式**，对应三种运维成本：
 
 | 方式 | 配置项 | 生效时机 | 适用 |
 |------|-------|---------|------|
-| **本地词典** | `ext_dict` | **需重启节点** | 稳定的基础词库，很少变动 |
-| **远程词典** | `remote_ext_dict` | 60 秒内自动生效，**无需重启** | 业务黑话、新品名，需要频繁增补 |
+| **本地词典** | `ext_dict` / `ext_stopwords` | **需重启节点** | 稳定的基础词库，很少变动 |
+| **远程词典** | `remote_ext_dict` / `remote_ext_stopwords` | 60 秒内自动生效，**无需重启** | 业务黑话、新品名，需要频繁增补 |
 | **同义词** | `synonym_graph` + `updateable` | 调 `_reload_search_analyzers` 立即生效 | 同义改写规则 |
 
 **远程词典的 HTTP 契约**——这是很多人配了不生效的原因，IK 对服务端有硬性要求：
