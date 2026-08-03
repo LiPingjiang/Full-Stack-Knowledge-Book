@@ -118,7 +118,7 @@ graph TD
 
 **[附录 A4：SQL 语言与查询优化](./A4-SQL语言与数据处理.md)** —— SQL 执行顺序（和书写顺序不一样）、JOIN 全家福与底层实现、窗口函数、EXPLAIN 执行计划、索引失效速查、慢 SQL 排查流程、深分页优化、SQL 实战高频题型（TopN/连续登录/行转列）。大数据技术栈已独立为 [第六章](../part6-bigdata/README.md)。
 
-**[附录 A5：ElasticSearch](./A5-ElasticSearch.md)** —— 倒排索引原理、ES 核心概念与 MySQL 类比、**Analyzer 分析器与 Tokenizer 分词器的区别**（三段式流水线）、集群架构（分片/副本物理分布/近实时原理）、DSL 查询入门（match/term/bool/aggs）、**相关性评分与 BM25**（TF 饱和/IDF/长度归一化、k1 与 b 调优、explain 排查）、**搜索工程实践**（IK 词典文件结构与远程热更新 HTTP 契约、同义词配置、分片规划与 reindex/split/shrink、Mapping 设计与 Doc Values 列存、dynamic strict 防字段爆炸、filter 缓存 bitset 机制、Segment 与批量写入优化、冷热分离与 ILM、JVM 堆与节点角色调优、查询优化与慢日志、深分页原理与三种方案、ES 8.x KNN 与 RRF 混合检索、**三种 Rerank 接入方式**、**底层存储引擎 Lucene**（Segment 文件组成、FST 词典、与 B+ 树/LSM-Tree 的对比））、ES 与 MySQL 的互补关系。附 NoSQL 家族速览（MongoDB 文档型数据库简介）。*面试剖析覆盖：ES 为什么快、深分页问题、MySQL-ES 数据一致性、BM25 三因子与两参数、分片数怎么定、集群调优排查、批量写入优化、冷热分离落地。*
+**[附录 A5：ElasticSearch](./A5-ElasticSearch.md)** —— 倒排索引原理、ES 核心概念与 MySQL 类比、**Analyzer 分析器与 Tokenizer 分词器的区别**（三段式流水线）、集群架构（分片/副本物理分布/近实时原理）、DSL 查询入门（match/term/bool/aggs）、**相关性评分与 BM25**（TF 饱和/IDF/长度归一化、k1 与 b 调优、explain 排查）、**搜索工程实践**（IK 词典文件结构与远程热更新 HTTP 契约、同义词配置、分片规划与 reindex/split/shrink、Mapping 设计与 Doc Values 列存、dynamic strict 防字段爆炸、filter/must/should 语义辨析与 bitset 缓存、function_score 与 rank_feature 相关性加权、Segment 与批量写入优化、冷热分离与 ILM、JVM 堆与节点角色调优、查询优化与慢日志、深分页原理与三种方案、ES 8.x KNN 与 RRF 混合检索、**三种 Rerank 接入方式**、**底层存储引擎 Lucene**（Segment 文件组成、FST 词典、与 B+ 树/LSM-Tree 的对比））、ES 与 MySQL 的互补关系。附 NoSQL 家族速览（MongoDB 文档型数据库简介）。*面试剖析覆盖：ES 为什么快、深分页问题、MySQL-ES 数据一致性、BM25 三因子与两参数、分片数怎么定、集群调优排查、批量写入优化、冷热分离落地。*
 
 **[附录 A6：代码规范与设计原则](./A6-代码规范与设计原则.md)** —— SOLID 五原则逐一拆解（每个原则一句话 + Java 正例/反例）、阿里巴巴 Java 编码规范精选要点（命名/异常处理/集合/并发/日志）、代码坏味道速查表。
 
