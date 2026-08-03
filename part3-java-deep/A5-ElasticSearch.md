@@ -2030,7 +2030,7 @@ List<Doc> reranked = rerankClient.rerank(userQuery, candidates, /* topN */ 10);
 | **`text_similarity_reranker`** | 大 | 中（30~80ms） | ES 8.14+ 和 ML 节点 | ES 版本够新的 RAG 场景 |
 | **应用层外挂** | 大 | 中（30~80ms） | 独立 Rerank 服务 | **RAG 主流方案**，模型可自由选型 |
 
-> **Rerank 不是无脑加**：候选数少于 10 条时，Rerank 的延迟收益是负的——粗排本来就没排错什么。Rerank 的价值窗口在候选量 **20~100** 之间。模型选型（`bge-reranker-v2-m3` 等）、延迟预算拆解、批量推理优化详见 [7.1 RAG 实战 §4.6.6](../part7-ai-engineering/01-RAG实战.md)。
+> **Rerank 不是无脑加**：候选数少于 10 条时，Rerank 的延迟收益是负的——粗排本来就没排错什么。Rerank 的价值窗口在候选量 **20~100** 之间。模型选型（`bge-reranker-v2-m3` 等）、延迟预算拆解、批量推理优化详见 [7.1 RAG 实战 §4.7.6](../part7-ai-engineering/01-RAG实战.md)。
 
 ### 6.12 底层存储引擎：Lucene 到底长什么样
 
