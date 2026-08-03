@@ -99,7 +99,7 @@ flowchart LR
 - [附录 A2：网络协议基础——TCP 握手挥手 / HTTP / HTTPS / DNS / 网络分层](./part3-java-deep/A2-网络协议基础.md)
 - [附录 A3：两阶段提交——MySQL 内部 2PC / 分布式 2PC / Flink 2PC](./part3-java-deep/A3-两阶段提交.md)
 - [附录 A4：SQL 语言与查询优化——执行顺序 / JOIN / 窗口函数 / EXPLAIN / 慢 SQL](./part3-java-deep/A4-SQL语言与数据处理.md)
-- [附录 A5：ElasticSearch——倒排索引 / DSL 查询 / BM25 相关性 / 搜索工程实践（分片规划·冷热分离·集群调优·KNN）/ MongoDB 简介](./part3-java-deep/A5-ElasticSearch.md)
+- [附录 A5：ElasticSearch——倒排索引 / DSL 查询 / BM25 相关性 / 搜索工程实践（IK 词典·分片规划·冷热分离·集群调优·KNN·Rerank）/ MongoDB 简介](./part3-java-deep/A5-ElasticSearch.md)
 - [附录 A6：代码规范与设计原则——SOLID / 阿里规范 / 代码坏味道](./part3-java-deep/A6-代码规范与设计原则.md)
 - [附录 A7：开发工具链——Git 进阶 / Maven / CI·CD / Linux 速查](./part3-java-deep/A7-开发工具链.md)
 - [附录 A8：Linux 操作系统基础——cgroup / VFS / 进程线程 / namespace / IPC](./part3-java-deep/A8-Linux操作系统基础.md)

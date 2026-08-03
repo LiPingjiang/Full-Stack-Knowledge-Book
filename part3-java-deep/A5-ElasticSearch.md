@@ -351,7 +351,7 @@ PUT /products
 }
 ```
 
-> **调优前必读**：BM25 参数调优的收益，通常远小于「改进分词」和「加 Rerank」。**先把分词和同义词做好，再考虑动 k1/b**。而且改了 `similarity` 需要重建索引，成本不低。
+> **调优前必读**：BM25 参数调优的收益，通常远小于「改进分词」（见 [6.1](#61-分词器深入ik-的工程用法)）和「加 Rerank」（见 [6.10](#610-怎么给-es-加-rerank)）。**先把分词和同义词做好，再考虑动 k1/b**。而且改了 `similarity` 需要重建索引，成本不低。
 
 ### 5.3 用 explain 排查评分
 
@@ -423,7 +423,107 @@ PUT /articles
 </properties>
 ```
 
+**词典文件长什么样**——结构简单到令人意外：**一行一个词，没有权重、没有词性、没有分隔符**。
+
+```
+# custom/business.dic —— 扩展词典
+# 以 # 开头的是注释行
+布隆过滤器
+一致性哈希
+熔断降级
+美团外卖
+青龙系统
+SKU
+LBS
+```
+
+```
+# custom/stopword.dic —— 停用词典
+的
+了
+是
+在
+和
+```
+
+> **两个必踩的坑**：**① 编码必须是 UTF-8 无 BOM**。用 Windows 记事本另存为会带上 BOM 头，导致**第一行词条永远不生效**——而且不报错，只是静默失效，极难排查。**② 换行符建议用 LF**，CRLF 在部分 IK 版本下会把 `\r` 当作词的一部分。
+>
+> 排查方法：`file custom/business.dic` 看编码，或直接用 `_analyze` 测第一个词能不能被正确切出来。
+
+**词典的三种加载方式**，对应三种运维成本：
+
+| 方式 | 配置项 | 生效时机 | 适用 |
+|------|-------|---------|------|
+| **本地词典** | `ext_dict` | **需重启节点** | 稳定的基础词库，很少变动 |
+| **远程词典** | `remote_ext_dict` | 60 秒内自动生效，**无需重启** | 业务黑话、新品名，需要频繁增补 |
+| **同义词** | `synonym_graph` + `updateable` | 调 `_reload_search_analyzers` 立即生效 | 同义改写规则 |
+
+**远程词典的 HTTP 契约**——这是很多人配了不生效的原因，IK 对服务端有硬性要求：
+
+```
+IK 每 60 秒发一次请求（HEAD 探测 + GET 拉取）：
+
+  ① 先发 HEAD 请求，读两个响应头：
+       Last-Modified: Mon, 03 Aug 2026 10:00:00 GMT
+       ETag: "abc123"
+
+  ② 只要其中任意一个与上次不同 → 判定词典有更新
+  ③ 再发 GET 请求拉取全量词典内容（不是增量！）
+  ④ 重新构建内存里的词典树（DictSegment 字典树）
+
+  ⚠️ 服务端必须返回这两个头中的至少一个，否则 IK 永远认为没更新
+  ⚠️ 返回内容的 Content-Type 需为 text/plain，编码 UTF-8
+  ⚠️ 每次是全量替换，不是追加——新文件必须包含所有历史词条
+```
+
+用 Nginx 托管是最省事的做法，静态文件天然带 `Last-Modified` 和 `ETag`：
+
+```nginx
+server {
+    listen 80;
+    location /dict/ {
+        alias /data/es-dict/;
+        charset utf-8;
+        # 静态文件自动带 Last-Modified / ETag，无需额外配置
+    }
+}
+```
+
+如果用应用服务托管（比如词典存在数据库、需要动态生成），必须自己实现这两个头：
+
+```java
+@GetMapping(value = "/dict/hot.dic", produces = "text/plain;charset=UTF-8")
+public ResponseEntity<String> hotDict() {
+    DictSnapshot snap = dictService.getSnapshot();   // 含内容和版本号
+    return ResponseEntity.ok()
+            // 这两个头缺一不可，否则 IK 检测不到变更
+            .header("Last-Modified", snap.getGmtModified())   // GMT 格式
+            .eTag(snap.getVersion())
+            .body(snap.getContent());                          // 全量词条
+}
+```
+
+**完整的词典更新流程**——新词生效不是改完文件就完事：
+
+```
+① 运营在词典管理后台新增词条 "青龙系统"
+        ↓
+② 词典服务更新文件 / 数据库，同时更新 ETag
+        ↓
+③ 各 ES 节点在 60 秒内检测到变更，重载词典树
+        ↓  此时：新写入的文档已能正确切分
+        ↓         但历史文档的倒排索引还是旧的切分结果
+        ↓
+④ 触发历史数据重建（二选一）：
+     • 数据量小 → POST /index/_update_by_query?conflicts=proceed
+     • 数据量大 → 走 Reindex 到新索引 + 别名切换（不阻塞线上）
+        ↓
+⑤ 用 _analyze 验证切分结果，用实际 query 验证召回
+```
+
 > **远程词典热更新机制**：IK 每 60 秒请求一次远程词典 URL，通过 HTTP 头的 `Last-Modified` 或 `ETag` 判断是否变更。**注意——新词典只对之后写入的文档生效，已索引的老文档不会自动重新分词**，需要 `_update_by_query` 重建。这是最容易踩的坑。
+>
+> **为什么老文档不会自动更新**：倒排索引是在**写入时**根据当时的分词结果构建的，且 Lucene 的 segment 不可变（见 [6.4](#64-segment-与写入性能)）。词典只影响"分词这个动作"，不会回溯改写已经落盘的索引。所以「加了词还是搜不到」十有八九不是词典没生效，而是**忘了重建历史数据**——先用 `_analyze` 确认词典本身是好的，再去查数据。
 
 **同义词**——搜"手机"要能召回"移动电话"：
 
@@ -940,6 +1040,106 @@ GET /docs/_search
 
 > **什么时候用 ES 做向量检索、什么时候上专业向量库**：向量规模在千万级以内、且已有 ES 基建的，直接用 ES 8.x 最省事——一个引擎、一套运维、天然支持混合检索和过滤。到亿级向量或对检索延迟有极致要求时，再引入 Milvus。融合算法 RRF 的原理详见 [7.1 RAG 实战](../part7-ai-engineering/01-RAG实战.md)。
 
+### 6.10 怎么给 ES 加 Rerank
+
+前面多次提到「BM25 调参的收益远小于加 Rerank」，这里讲**具体怎么加**。核心认知是：**检索是两阶段的**——粗排（Recall）负责"快速捞出候选"，精排（Rerank）负责"精确排序"。
+
+```
+粗排（ES 负责）                     精排（Rerank 负责）
+─────────────────                  ─────────────────
+BM25 / 向量检索                     Cross-Encoder 逐对打分
+扫描百万级文档                       只处理 Top 20~100 候选
+单文档打分，互不影响                  Query 和 Doc 一起进模型，能捕捉细粒度交互
+快（毫秒级）                         慢（几十毫秒）
+准确率一般                           准确率高
+```
+
+ES 侧有三种加 Rerank 的方式，成本和效果递增：
+
+**方式一：`rescore` —— ES 原生，零外部依赖**
+
+对 BM25 的 Top N 结果用一个更贵的查询重新打分。适合"粗排够用，只需微调排序"的场景：
+
+```json
+GET /docs/_search
+{
+  "query": {                          // 粗排：快速召回
+    "match": { "content": "分布式锁实现" }
+  },
+  "rescore": {
+    "window_size": 50,                // 只对 Top 50 重新打分（关键：控制代价）
+    "query": {
+      "rescore_query": {              // 精排：更贵但更准的查询
+        "match_phrase": {             // 短语匹配，要求词序连续
+          "content": { "query": "分布式锁实现", "slop": 2 }
+        }
+      },
+      "query_weight": 0.7,            // 原始 BM25 分数权重
+      "rescore_query_weight": 1.3     // 精排分数权重
+    }
+  }
+}
+```
+
+> **`rescore` 的本质是"分层计算"**：昂贵的算法只作用于 `window_size` 条候选，而不是全量文档。这和 Cross-Encoder 精排是同一个思路，只是打分器换成了 ES 内置查询。**注意 `window_size` 必须大于等于 `from + size`**，否则翻页时会出现排序错乱。
+
+**方式二：`text_similarity_reranker` —— ES 8.14+ 原生 Cross-Encoder**
+
+ES 8.14 之后，`retriever` API 支持直接挂载 Rerank 模型，模型通过 Eland 部署到 ES 的 ML 节点，或走 Inference API 调外部服务：
+
+```json
+GET /docs/_search
+{
+  "retriever": {
+    "text_similarity_reranker": {
+      "retriever": {                        // 内层：混合检索粗排
+        "rrf": {
+          "retrievers": [
+            { "standard": { "query": { "match": { "content": "分布式锁实现" } } } },
+            { "knn": { "field": "embedding", "query_vector": [], "k": 50, "num_candidates": 200 } }
+          ]
+        }
+      },
+      "field": "content",                   // 用哪个字段和 query 做相关性计算
+      "inference_id": "my-rerank-model",    // 已注册的 Rerank 模型
+      "inference_text": "分布式锁实现",
+      "rank_window_size": 50                // 送入精排的候选数
+    }
+  }
+}
+```
+
+这是**最优雅的方案**——召回、融合、精排在一次请求内完成，应用层不用做任何编排。代价是需要 ES 8.14+、需要 ML 节点资源，且模型选择受限于 ES 生态。
+
+**方式三：应用层外挂 Rerank —— 最灵活，生产最常见**
+
+ES 只负责召回，精排在应用层调独立的 Rerank 服务。这是 RAG 场景的主流做法：
+
+```java
+// 1. ES 粗排：多召回一些候选（关键：召回数是最终数的 5~10 倍）
+SearchResponse resp = esClient.search(s -> s
+        .index("docs")
+        .size(50)                              // 粗排取 50
+        .query(q -> q.match(m -> m.field("content").query(userQuery))), Doc.class);
+
+List<Doc> candidates = extractDocs(resp);
+
+// 2. 调 Rerank 服务精排（Cross-Encoder，batch 推理）
+List<Doc> reranked = rerankClient.rerank(userQuery, candidates, /* topN */ 10);
+```
+
+> **为什么粗排要多取**：Rerank 只能对召回到的候选重排序，**召回不到的文档它永远救不回来**。典型配比是最终需要 10 条就召回 50~100 条。但候选数直接决定精排延迟（Cross-Encoder 是逐对推理），所以要在召回率和延迟之间权衡。
+
+**三种方式怎么选**：
+
+| 方式 | 效果提升 | 延迟成本 | 依赖 | 适用场景 |
+|------|---------|---------|------|---------|
+| **`rescore`** | 小（10~20%） | 极低（几 ms） | 无 | 传统搜索，只需微调排序 |
+| **`text_similarity_reranker`** | 大 | 中（30~80ms） | ES 8.14+ 和 ML 节点 | ES 版本够新的 RAG 场景 |
+| **应用层外挂** | 大 | 中（30~80ms） | 独立 Rerank 服务 | **RAG 主流方案**，模型可自由选型 |
+
+> **Rerank 不是无脑加**：候选数少于 10 条时，Rerank 的延迟收益是负的——粗排本来就没排错什么。Rerank 的价值窗口在候选量 **20~100** 之间。模型选型（`bge-reranker-v2-m3` 等）、延迟预算拆解、批量推理优化详见 [7.1 RAG 实战 §4.6.6](../part7-ai-engineering/01-RAG实战.md)。
+
 ---
 
 ## 七、ES 与 MySQL 的互补关系
@@ -992,7 +1192,7 @@ MySQL FULLTEXT 索引功能有限（中文分词差、不支持复杂查询、�
 
 两个参数：**k1（默认 1.2）控制词频饱和速度**——调小则出现 1 次和 10 次差别不大，可压制关键词堆砌；**b（默认 0.75）控制长度惩罚强度**——`b=0` 完全忽略文档长度，商品标题这类长度不代表相关性的场景应调小。
 
-**加分项**：主动说明「BM25 调参的收益通常远小于改进分词和加 Rerank，而且改 `similarity` 要重建索引」——体现你知道优化的优先级，而不是死磕参数。
+**加分项**：主动说明「BM25 调参的收益通常远小于改进分词和加 Rerank（见 [6.10](#610-怎么给-es-加-rerank)），而且改 `similarity` 要重建索引」——体现你知道优化的优先级，而不是死磕参数。
 
 ### 考点 5：分片数怎么定？分片是不是越多越好？
 
