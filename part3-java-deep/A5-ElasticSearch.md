@@ -52,6 +52,61 @@ Standard Analyzer:  "Hello World" → ["hello", "world"]（英文按空格分，
 IK Analyzer:        "中华人民共和国" → ["中华人民共和国", "中华", "人民", "共和国"]（中文分词）
 ```
 
+**Analyzer 和 Tokenizer 不是一回事**——中文都翻译成"分词器"，是混淆的根源。准确地说：**Analyzer 是完整的文本处理流水线，Tokenizer 只是其中负责切分的那一环**。
+
+```
+Analyzer（分析器）= 一条三段式流水线
+┌──────────────────────────────────────────────────────────┐
+│                                                          │
+│  ① Character Filter（字符过滤器）  0 个或多个             │
+│     在切分前预处理原始字符串                               │
+│     例：去 HTML 标签、字符替换（& → and）                  │
+│                        ↓                                 │
+│  ② Tokenizer（分词器）           有且仅有 1 个 ← 必需     │
+│     真正把字符串切成词条（Token）                          │
+│     例：按空格切、按 IK 词典切                             │
+│                        ↓                                 │
+│  ③ Token Filter（词条过滤器）     0 个或多个              │
+│     对切好的词条做加工                                     │
+│     例：转小写、去停用词、同义词扩展、词干还原              │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
+                        ↓
+                  最终写入倒排索引的 Term
+```
+
+举个完整例子，处理 `"<p>The QUICK brown Foxes</p>"`：
+
+```
+原始文本： <p>The QUICK brown Foxes</p>
+    ↓ ① char_filter: html_strip（去标签）
+           The QUICK brown Foxes
+    ↓ ② tokenizer: standard（按词边界切）
+           [The] [QUICK] [brown] [Foxes]
+    ↓ ③ token_filter: lowercase（转小写）
+           [the] [quick] [brown] [foxes]
+    ↓ ③ token_filter: stop（去停用词）
+           [quick] [brown] [foxes]
+    ↓ ③ token_filter: stemmer（词干还原）
+           [quick] [brown] [fox]     ← 最终入库的 Term
+```
+
+所以「`ik_max_word` 是 analyzer 还是 tokenizer」这个问题的答案是：**两者都是**。IK 插件同时注册了同名的 analyzer 和 tokenizer——`ik_max_word` 作为 analyzer 是"开箱即用的完整流水线"，作为 tokenizer 则是"可被组合的切分组件"。当你需要在 IK 切分基础上再加同义词时，用的就是它的 tokenizer 身份：
+
+```json
+"analyzer": {
+  "my_analyzer": {
+    "char_filter": ["html_strip"],      // ① 可选，可多个
+    "tokenizer":   "ik_smart",          // ② 必需，只能一个 ← IK 在这里是 tokenizer
+    "filter":      ["lowercase", "my_synonym"]   // ③ 可选，可多个，有序
+  }
+}
+```
+
+> **一句话记忆**：Tokenizer 是"切"，Token Filter 是"改"，Char Filter 是"切之前先洗"，Analyzer 是"把这三件事串起来的那个整体"。配置 mapping 时字段上写的 `"analyzer": "xxx"` 永远是 analyzer，不能直接填 tokenizer。
+
+常见的开箱即用 analyzer：
+
 | 分词器 | 适用场景 |
 |--------|---------|
 | Standard | 英文默认，按空格分词 |
@@ -566,6 +621,46 @@ GET /articles/_analyze
 
 **分片数量是 ES 最重要、也最难改的决策**——主分片数创建后不可修改（只能 reindex/split/shrink）。
 
+**这三个操作分别是什么**——它们都是"改变分片数"的手段，但代价和限制差别很大：
+
+| 操作 | 作用 | 分片数变化 | 硬性限制 | 代价 |
+|------|------|-----------|---------|------|
+| **`_reindex`** | 把数据从旧索引**重新写入**新索引 | 任意 | 无 | **最贵**——等于全量重写，数据量大时以小时计 |
+| **`_split`** | 把每个分片**拆成 N 份** | 只能**变多**，且必须是原数量的整数倍 | 源索引须只读 | 中等——底层做硬链接，比 reindex 快 |
+| **`_shrink`** | 把多个分片**合并成更少的** | 只能**变少**，且新数量须能整除原数量 | 源索引须只读，且所有主分片要先搬到同一节点 | 中等——同样走硬链接 |
+
+```
+原索引 6 个主分片
+
+  _split  → 12 个（×2）、18 个（×3）、24 个（×4）   ✓ 整数倍
+          → 8 个                                    ✗ 不是整数倍，报错
+
+  _shrink → 3 个（6÷2）、2 个（6÷3）、1 个（6÷6）    ✓ 能整除
+          → 4 个                                    ✗ 6 不能被 4 整除，报错
+
+  _reindex → 任意数量，但要重写全部数据
+```
+
+`_split` 和 `_shrink` 之所以比 `_reindex` 快，是因为它们**不重新分析文档**，而是在文件系统层面对 Lucene segment 做**硬链接**（同一块磁盘数据被两个索引共享），只调整分片路由。而 `_reindex` 是把每篇文档取出来、重新走一遍分词和索引流程。
+
+```json
+// _shrink 前置条件：设为只读 + 主分片集中到一个节点
+PUT /logs-old/_settings
+{
+  "settings": {
+    "index.blocks.write": true,                          // 停止写入
+    "index.routing.allocation.require._name": "node-1"   // 主分片全搬到 node-1
+  }
+}
+
+POST /logs-old/_shrink/logs-small
+{
+  "settings": { "index.number_of_shards": 1 }
+}
+```
+
+> **实践中最常用的其实是第四种做法：滚动索引 + 别名**。与其纠结分片数改不了，不如一开始就按时间滚动（`logs-2026.08.01`、`logs-2026.08.02`…），用别名对外提供统一视图。这样新索引可以随时用新的分片数，老索引到期直接删除，**完全绕开了"分片数不可变"这个问题**——这也是时序场景的标准解法。`_shrink` 则常用在 ILM 的 Warm 阶段（见 [6.5](#65-冷热分离与索引生命周期ilm)）：数据不再写入后，把分片数降下来省资源。
+
 ```
 分片大小经验值：
   单个分片 20~50 GB   ← 日志/时序场景可到 50GB
@@ -637,6 +732,67 @@ POST /logs-write/_rollover
   }
 }
 ```
+
+**什么是"字段爆炸"（Mapping Explosion）**——这是上表里 `dynamic: strict` 那一条要防的事故，值得单独讲。
+
+ES 默认开启**动态映射（Dynamic Mapping）**：你写入一个 mapping 里没定义过的字段，ES 不报错，而是**自动推断类型并把它永久加进 mapping**。这个特性开发期很方便，生产环境却是定时炸弹：
+
+```
+业务代码不小心把用户 ID 当成了字段名：
+
+  写入 { "user_1001_score": 95 }   → mapping 新增字段 user_1001_score
+  写入 { "user_1002_score": 87 }   → mapping 新增字段 user_1002_score
+  写入 { "user_1003_score": 92 }   → mapping 新增字段 user_1003_score
+       ...
+  100 万用户 → mapping 里 100 万个字段
+```
+
+后果是**集群级别的**，不只是这个索引的问题：
+
+```
+① Mapping 属于 Cluster State（集群状态元数据）
+       ↓
+② Cluster State 常驻每个节点的堆内存，且任何变更都要广播到全集群
+       ↓
+③ Mapping 膨胀到几十 MB → 每次字段新增都触发全集群同步
+       ↓
+④ Master 节点 CPU 打满、GC 频繁 → 整个集群响应变慢甚至失联
+       ↓
+⑤ 每个字段还要额外占用 Lucene 的元数据和文件句柄
+```
+
+ES 7.x 之后默认有 `index.mapping.total_fields.limit = 1000` 兜底，超过就拒绝写入。**但很多人遇到报错的第一反应是把这个值调大到 10000**——那只是把爆炸推迟，不是解决。
+
+`dynamic` 有三个取值：
+
+| 取值 | 遇到未定义字段的行为 | 适用 |
+|------|-------------------|------|
+| `true`（默认） | 自动推断类型并加入 mapping | 开发调试期 |
+| `false` | **不加入 mapping，字段能存但搜不到**（`_source` 里有，无法查询/聚合） | 需要保留原始数据但不索引 |
+| `strict` | **直接抛错拒绝写入** | **生产环境推荐** |
+
+```json
+PUT /orders
+{
+  "mappings": {
+    "dynamic": "strict",              // 未定义字段直接拒绝，倒逼上游规范
+    "properties": {
+      "order_id": { "type": "keyword" },
+      "amount":   { "type": "double" }
+    }
+  }
+}
+```
+
+`strict` 的价值在于**把问题暴露在写入时**——脏字段一进来就报错，你立刻知道是哪个上游改了数据结构；而不是等到 mapping 涨到几万个字段、集群开始抖动了才去排查。
+
+> **如果业务确实需要动态字段怎么办**：用 `flattened` 类型。它把整个对象当作**一个字段**存储，内部的所有键值对不会各自成为独立字段，从根本上避免爆炸。代价是只支持精确匹配、不支持分词和数值范围查询。
+>
+> ```json
+> "labels": { "type": "flattened" }    // 无论里面有多少个 key，mapping 里只算 1 个字段
+> ```
+>
+> 另一种思路是**转成 nested 的键值对数组**：`[{"k":"user_1001","v":95}]`，把"字段名"变成"字段值"。这样字段数固定为 2，但要注意 nested 的写放大代价。
 
 ### 6.3 filter vs query 与缓存机制
 
