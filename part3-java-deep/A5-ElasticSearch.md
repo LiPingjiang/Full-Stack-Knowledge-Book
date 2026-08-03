@@ -1095,6 +1095,115 @@ POST /logs-write/_rollover
 }
 ```
 
+**多字段（multi-fields）到底是什么**——上面 `title` 里那个 `fields` 值得单独讲，它是 ES Mapping 设计里最常用也最容易被低估的机制。
+
+关键认知：**子字段不是"字段里嵌套了字段"，而是同一份输入值被用多套配置各索引了一份。**
+
+```
+写入 "department": "技术研发部"   ← 你只写了一个值
+
+   │
+   ├─► department          (text)     → 分词 → [技术, 研发, 部, 研发部]
+   │                                    用途：全文搜索
+   │
+   └─► department.keyword  (keyword)  → 不分词 → ["技术研发部"]
+                                        用途：聚合、排序、精确匹配
+
+  两个独立的字段，共享同一个数据来源
+```
+
+**为什么必须这样设计**——因为 `text` 和 `keyword` 的诉求天然冲突：只用 `text`，聚合会按切碎的词（"技术"/"研发"/"部"）分组而不是按完整部门名分组，还会触发 [fielddata](#62-索引设计与分片规划) 打爆堆；只用 `keyword`，用户搜"研发"就什么都搜不到。多字段就是"我全都要"。
+
+> **`.keyword` 通常已经存在**：ES 5.x 之后，动态映射对字符串的默认推断结果就是 `text` + `.keyword` 子字段。所以生产上「聚合把节点打挂」的事故，十有八九是**写查询的人用错了字段名**（把 `department.keyword` 写成 `department`），改一行 DSL 即可，不必动索引。只有当初显式写死 `"type": "text"` 且没配 `fields` 时，才真需要改 mapping + reindex。
+>
+> `ignore_above: 256` 表示超过 256 字符的值不为该子字段建索引（原文仍在 `_source` 里）——超长字符串做精确匹配和聚合没有意义。
+
+**子字段不限于"分词/不分词"，可以是任何配置组合**：
+
+```json
+"title": {
+  "type": "text",
+  "analyzer": "ik_max_word",                                        // 主字段：细粒度保召回
+  "fields": {
+    "smart":   { "type": "text", "analyzer": "ik_smart" },          // 粗粒度保精度
+    "pinyin":  { "type": "text", "analyzer": "pinyin_analyzer" },   // 拼音搜索
+    "ngram":   { "type": "text", "analyzer": "ngram_analyzer" },    // 输入即搜/前缀
+    "keyword": { "type": "keyword", "ignore_above": 256 }           // 聚合排序
+  }
+}
+```
+
+一个值同时具备了细粒度召回、精准短语匹配、拼音搜索（输入 `shenrulijie` 能命中）、实时补全和精确聚合。查询时还能用 `multi_match` 一次打多路并分配权重：
+
+```json
+{
+  "multi_match": {
+    "query": "深入理解JVM",
+    "fields": ["title^3", "title.smart^2", "title.pinyin"]
+  }
+}
+```
+
+子字段的类型也可以和主字段完全不同，这在**接手脏数据**时很有用——上游传字符串，你既要保留原样又要能做数值运算：
+
+```json
+"price":      { "type": "keyword", "fields": { "num":  { "type": "double" } } },
+"created_at": { "type": "text",    "fields": { "date": { "type": "date", "format": "yyyy-MM-dd HH:mm:ss" } } }
+```
+
+甚至可以让子字段"不可搜索、只可聚合"来省空间：
+
+```json
+"log_message": {
+  "type": "text",
+  "fields": {
+    "raw": { "type": "keyword", "index": false, "doc_values": true }
+    // 不建倒排索引（搜不到），但保留 Doc Values（能聚合排序）
+  }
+}
+```
+
+**三条硬性限制**：
+
+```
+① 子字段不能再嵌套子字段 —— 只有一层
+② 子字段不能是 object / nested —— 多字段处理的是标量值的多种索引方式，
+   而 object/nested 意味着数据本身有结构，语义冲突
+③ 所有子字段共享同一个输入值 —— 不能给主字段和子字段喂不同的数据
+```
+
+> **注意区分两种点号**：`author.name` 里的点号是 **object 类型**的"下钻到子数据"（`name` 和 `email` 是两份不同的数据）；`title.keyword` 里的点号是**多字段**的"换一种方式看同一份数据"。含义完全不同。
+
+**一个被低估的优点：子字段可以随时新增，不需要 reindex**。
+
+```json
+PUT /books/_mapping
+{
+  "properties": {
+    "title": {
+      "type": "text",
+      "fields": {
+        "keyword": { "type": "keyword", "ignore_above": 256 },
+        "pinyin":  { "type": "text", "analyzer": "pinyin_analyzer" }   // 线上直接加
+      }
+    }
+  }
+}
+```
+
+Mapping 更新立即成功，此后写入的文档就有拼音索引。**但老文档必须 `_update_by_query` 才会补上**——这和 [IK 词典热更新](#61-分词器深入ik-的工程用法)是完全相同的机制：倒排索引在写入时构建、Segment 不可变，不会回溯改写。
+
+**代价**——每个子字段都是一份完整独立的索引结构：
+
+```
+title 配了 4 个子字段
+  → 磁盘：5 份索引数据（主 + 4 子）
+  → 写入：每篇文档跑 5 次分析流程
+  → 内存：5 份 FST 词典
+```
+
+所以不要无脑加。**最常见的过度设计是给每个 `text` 字段都留着默认的 `.keyword`**——文章正文这类永远不会用于聚合排序的字段，那份 keyword 索引是纯浪费，在日志类索引里往往是磁盘占用的一大来源，应当显式关掉。
+
 **什么是 Doc Values**——上表里 `doc_values: false` 那一条，背后是 ES 一个容易被忽略的设计：**倒排索引只解决"搜索"，解决不了"聚合和排序"，所以 ES 额外存了一份列式数据**。
 
 倒排索引是 `词 → 文档列表` 的映射，天生适合回答"哪些文档包含这个词"：
