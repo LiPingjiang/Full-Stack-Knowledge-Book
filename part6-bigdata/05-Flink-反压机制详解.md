@@ -10,7 +10,7 @@
   - [1.1 ResultPartition 与 InputGate](#11-resultpartition-与-inputgate)
   - [1.2 Network Buffer 与 BufferPool](#12-network-buffer-与-bufferpool)
   - [1.3 单 TaskManager 内的数据流转](#13-单-taskmanager-内的数据流转)
-  - [1.4 跨 TaskManager 的数据流转（Netty + TCP）](#14-跨-taskmanager-的数据流转netty--tcp)
+  - [1.4 跨 TaskManager 的数据流转（Netty + TCP）](#14-跨-taskmanager-的数据流转netty-tcp)
 - [二、反压的产生与传播](#二反压的产生与传播)
   - [2.1 单 TaskManager 内的反压传播](#21-单-taskmanager-内的反压传播)
   - [2.2 跨 TaskManager 的反压传播](#22-跨-taskmanager-的反压传播)

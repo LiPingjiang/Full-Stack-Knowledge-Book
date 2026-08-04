@@ -22,9 +22,9 @@
     - 有窗口场景——两阶段聚合
     - 无窗口场景——LocalKeyBy 预聚合
     - Flink SQL 场景——TWO_PHASE 参数 vs 手工两个 GROUP BY
-  - [第 4 步：切换 RocksDB + 参数调优](#第-4-步切换-rocksdb--参数调优)
+  - [第 4 步：切换 RocksDB + 参数调优](#第-4-步切换-rocksdb-参数调优)
   - [第 5 步：增加并行度分散 State](#第-5-步增加并行度分散-state)
-  - [持续监控 + Checkpoint 调优](#持续监控--checkpoint-调优)
+  - [持续监控 + Checkpoint 调优](#持续监控-checkpoint-调优)
     - 增量 Checkpoint 工作机制
     - Checkpoint 调优参数
     - 监控指标
@@ -122,6 +122,8 @@ Flink SQL 的 Group Aggregate 默认每条数据都会读写一次 State，QPS �
 
 确认 State 存的内容是必要的之后，接下来优化每条数据的存储体积。
 
+<a id="11-序列化优化避免-kryo-fallback"></a>
+
 **1.1 序列化优化：避免 Kryo fallback**
 
 Flink 有三层序列化体系，优先级从高到低：
@@ -182,6 +184,8 @@ long urlHash = MurmurHash.hash64(url.getBytes());
 deduplicationState.put(urlHash, true);
 ```
 
+<a id="12-mapstate-替代-valuestate集合"></a>
+
 **1.2 MapState 替代 ValueState<集合>**
 
 当需要存储"一个 key 对应多个子项"时，`ValueState<Map>` 或 `ValueState<Set>` 每次读写都要序列化/反序列化整个集合，State 越大越慢。`MapState` 在 RocksDB 中每个 entry 是独立的 key-value 对，只序列化单条数据：
@@ -215,6 +219,8 @@ RocksDB 的存储模型是 key-value 对。对于 `ValueState<T>`，Flink 在 Ro
 | `ReducingState<T>` / `AggregatingState` | 一个 KV 对，value = 聚合结果 | O(1)——只存聚合值 | 增量聚合场景（sum/count/max） |
 
 注意：`ListState` 有一个容易踩的坑——`add()` 操作在 RocksDB backend 上确实是 O(1)（追加一个 KV 对），但 `get()` 返回的 `Iterable` 需要读取该 key 下的所有 entry 并逐条反序列化，是 O(n) 的。如果你频繁读取 ListState，性能可能比预期差很多。
+
+<a id="13-自定义-typeserializer当-pojo-serializer-不够用时的兜底方案"></a>
 
 **1.3 自定义 TypeSerializer：当 POJO Serializer 不够用时的兜底方案**
 

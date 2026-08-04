@@ -16,7 +16,7 @@
 - [三、架构](#三架构)
   - [3.1 算子链（Operator Chain）](#31-算子链operator-chain)
   - [3.2 数据传输与 Network Buffer](#32-数据传输与-network-buffer)
-- [四、容错机制——Checkpoint + Exactly-Once](#四容错机制checkpoint--exactly-once)
+- [四、容错机制——Checkpoint + Exactly-Once](#四容错机制checkpoint-exactly-once)
   - [4.1 Checkpoint（检查点）](#41-checkpoint检查点)
     - [Chandy-Lamport 分布式快照算法](../part3-java-deep/A9-Chandy-Lamport分布式快照算法.md)
     - Watermark 与 Barrier 的区别
