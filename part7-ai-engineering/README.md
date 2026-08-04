@@ -67,7 +67,7 @@ graph LR
 
 **[7.10 GraphRAG 与知识图谱增强](./10-GraphRAG与知识图谱.md)** —— 当向量检索回答不了全局性问题。向量 RAG 的三个结构性盲区（全局问题/多跳推理/关系型问题）与分块对结构的破坏 → 局部问题 vs 全局问题 → GraphRAG 完整架构（LLM 驱动的实体关系抽取、Gleaning 补抽、分层实体消歧、Leiden 社区发现、自底向上社区摘要）→ 三种检索模式（Local Search 实体锚定与超级节点问题、Global Search 的 Map-Reduce、DRIFT Search）与查询路由 → 图存储选型（Neo4j vs NebulaGraph vs 混合存储）→ LLM-Wiki 与 Agent 工具关系图谱 → 渐进式落地路径与增量更新难题。*面试重点：GraphRAG 解决什么问题、索引成本瓶颈、Local vs Global Search、图库选型、增量更新方案、图谱质量评估。*
 
-**[7.11 检索平台工程](./11-检索平台工程.md)** —— 从 RAG 原型到高可用生产底座。支撑 100-300 QPS、99.9% SLA、百亿级文档秒级入库的工程体系 → Embedding 管道（Flink Async I/O 的 unorderedWait、三级容灾与死信队列、攒批调用与成本优化、存储膨胀治理）→ 四层缓存与**语义缓存**（相似度阈值、租户隔离风险）→ 容量规划（ES 分片与向量库内存推算、SLA 分解与 LLM 短板）→ 故障模式与四级降级梯度、`efSearch` 动态降档。*面试重点：Flink 调 Embedding 服务与容灾、检索服务容量规划、语义缓存设计、降级链路。*
+**[7.11 检索平台工程](./11-检索平台工程.md)** —— 从 RAG 原型到高可用生产底座。支撑 100-300 QPS、99.9% SLA、百亿级文档秒级入库的工程体系 → Embedding 管道（Flink Async I/O 的 unorderedWait、三级容灾与死信队列、攒批调用与成本优化、存储膨胀治理）→ 四层缓存与**语义缓存**（相似度阈值、租户隔离风险）→ 容量规划（ES 分片与向量库内存推算、SLA 分解与 LLM 短板）→ **向量库架构与运维**（Milvus 存算分离、Growing/Sealed Segment、一致性级别、与 ES 的运维对照）→ 故障模式与四级降级梯度、`efSearch` 动态降档。*面试重点：Flink 调 Embedding 服务与容灾、检索服务容量规划、语义缓存设计、向量库存算分离、降级链路。*
 
 ---
 

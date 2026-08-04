@@ -175,7 +175,7 @@ flowchart LR
 - [7.8 AgentBI 智能分析：自然语言问数 / 查询编排 / 图表推荐 / 多步归因 / 报告生成](./part7-ai-engineering/08-AgentBI智能分析.md)
 - [7.9 AI 安全与可信：Prompt 注入防御 / 数据投毒检测 / PII 脱敏 / 多租户隔离](./part7-ai-engineering/09-AI安全与可信.md)
 - [7.10 GraphRAG 与知识图谱增强：实体关系抽取 / 社区发现 / Local-Global Search / 工具关系图谱](./part7-ai-engineering/10-GraphRAG与知识图谱.md)
-- [7.11 检索平台工程：Embedding 管道 / 语义缓存 / 容量规划 / 降级链路](./part7-ai-engineering/11-检索平台工程.md)
+- [7.11 检索平台工程：Embedding 管道 / 语义缓存 / 容量规划 / 向量库存算分离 / 降级链路](./part7-ai-engineering/11-检索平台工程.md)
 
 ### 第八章 · Notebook 平台架构：全栈开发的绝佳研究案例 〔综合应用〕
 
