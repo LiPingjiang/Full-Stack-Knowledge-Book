@@ -1,4 +1,4 @@
-# 3.3 附录：线上 OOM / CPU 飙高实战排查
+# 3.3 附录：线上 OOM / CPU 飙高 / 锁竞争实战排查
 
 > 配套正文 [3.3 JVM 运行时 · 考点 6](./03-JVM运行时.md#考点-6线上-oom-cpu-飙高怎么排查实战加分项最能拉开差距)。
 > 正文给的是「排查思路链路图」，本文给**可复现的示例代码 + 一条条能照着敲的命令**——把理论变成肌肉记忆。
@@ -275,7 +275,127 @@ jstack 12345 | grep '0x304c' -A 30
 
 ---
 
-## 三、更快的姿势：Arthas（线上首选）
+## 三、锁竞争 / 线程池打满——RT 变高但 CPU 不忙
+
+前两节的 OOM 和 CPU 飙高，共同特征是「机器资源确实被吃满了」，工具链的任务是揪出「谁在吃」。但线上还有一类更隐蔽的现象：**接口 RT（响应时间）明显变长，甚至超时，但 `top` 看 CPU 占用率一点都不高，机器看起来很闲**。这种情况的根因往往不是「线程在拼命算」，而是**线程在傻等**——要么在等一把锁，要么在线程池队列里排队，要么在等下游响应。用 CPU 飙高那套「找烧CPU的线程」的思路在这里会直接扑空，因为问题线程根本不怎么消耗 CPU，需要换一套完全不同的排查工具和视角。
+
+### 1. 复现代码：一把锁把大部分线程堵死
+
+下面模拟一个典型场景：多个请求线程抢同一把锁去更新一个共享的本地缓存（这正是 [11.2 高并发中台架构全景](../part11-case-tag-strategy-platform/02-高并发中台架构全景.md) 里提到的本地缓存更新场景），持锁的线程里故意 `sleep` 模拟一次稍慢的操作，让其余线程排队等待：
+
+```java
+import java.util.concurrent.CountDownLatch;
+
+/**
+ * 模拟：20 个"请求线程"抢同一把锁去更新共享缓存，
+ * 每次持锁操作耗时 500ms（模拟一次不该放在锁里的慢操作），
+ * 观察大部分线程会长时间处于 BLOCKED 状态排队等锁。
+ */
+public class LockContentionDemo {
+
+    // 共享资源，所有线程抢的就是这把锁
+    private static final Object CACHE_LOCK = new Object();
+    private static int cacheVersion = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        int threadCount = 20;
+        CountDownLatch latch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            Thread t = new Thread(() -> {
+                synchronized (CACHE_LOCK) {          // 抢锁
+                    try {
+                        // 模拟一次不该放在临界区里的慢操作（比如序列化整个大对象）
+                        Thread.sleep(500);
+                        cacheVersion++;
+                    } catch (InterruptedException ignored) {
+                    }
+                }
+                latch.countDown();
+            }, "request-thread-" + i);               // 起个好认的名字，方便 jstack 里识别
+            t.start();
+        }
+
+        latch.await();
+        System.out.println("全部完成，最终版本号 = " + cacheVersion);
+    }
+}
+```
+
+这段代码跑起来，`top` 看 CPU 占用几乎不会有明显异常（毕竟线程大部分时间在 `sleep`/等锁，不消耗 CPU），但如果把这 20 个线程模拟成 20 个并发请求，最后一个请求线程要等前面 19 个各自持锁 500ms 才能轮到自己，相当于**整体 RT 被线性拉长到接近 10 秒**——这正是「CPU 不忙但 RT 很高」这类问题的典型样子。
+
+> **真实业务里的同款根因**：本地缓存/共享 Map 更新时加了粒度过粗的锁（比如整个方法加锁，而不是只锁真正需要保护的那几行）；把远程调用（RPC/Redis/DB 查询）放在了 `synchronized` 块里，导致持锁时间被下游延迟拖长；用了 `Collections.synchronizedMap` 这类粗粒度同步容器在高并发下退化成串行访问。
+
+### 2. 排查命令（照着敲）—— 用 jstack 找 BLOCKED 线程和持锁人
+
+第一步，确认现象：`top` CPU 不高，但接口 RT 确实变长了（业务监控/APM 上能看到），初步怀疑不是计算密集型问题。
+
+第二步，直接抓全部线程栈，重点看 `BLOCKED` 状态的线程数量：
+
+```bash
+jstack <pid> > threads.txt
+
+# 统计各状态线程数量，一眼看出是不是大面积 BLOCKED
+grep "java.lang.Thread.State" threads.txt | sort | uniq -c
+# 典型输出（锁竞争场景）：
+#   18 java.lang.Thread.State: BLOCKED (on object monitor)
+#    1 java.lang.Thread.State: RUNNABLE
+#    1 java.lang.Thread.State: TIMED_WAITING
+```
+
+如果看到大量线程都是 `BLOCKED (on object monitor)`，基本可以确认是**锁竞争**，而不是 CPU 计算问题——这一步就是「CPU 飙高」和「锁竞争」两类问题在排查上的第一个分岔点。
+
+第三步，`jstack` 的输出里，`BLOCKED` 线程会直接告诉你**它在等哪把锁、这把锁当前被谁拿着**：
+
+```bash
+grep -A 5 "request-thread" threads.txt | head -40
+
+# 你会看到类似：
+# "request-thread-5" #16 ... 
+#    java.lang.Thread.State: BLOCKED (on object monitor)
+#         at LockContentionDemo.lambda$main$0(LockContentionDemo.java:18)
+#         - waiting to lock <0x000000076b5a1234> (a java.lang.Object)
+#         - locked <0x000000076b5a5678> (a java.util.concurrent.CountDownLatch)
+#
+# "request-thread-2" #13 ...
+#    java.lang.Thread.State: TIMED_WAITING (sleeping)
+#         at java.lang.Thread.sleep(Native Method)
+#         at LockContentionDemo.lambda$main$0(LockContentionDemo.java:16)
+#         - locked <0x000000076b5a1234> (a java.lang.Object)   ← 这个线程正拿着大家在等的锁
+```
+
+关键字是 `waiting to lock <地址>` 和 `locked <地址>`——**地址相同**说明大家都在等同一把锁；反过来搜这个地址找到哪个线程写的是 `locked` 而不是 `waiting to lock`，那个线程就是「正在持锁、让别人干等」的元凶，顺着它的栈往下看，就能定位到具体是哪一行代码把锁占了这么久（这里就是 `LockContentionDemo.java:16` 的 `Thread.sleep(500)`）。
+
+> **一个更快的姿势**：如果是真正的死锁（互相等对方的锁，谁都拿不到），`jstack` 输出末尾会直接打印一段 `Found one Java-level deadlock:`，把死锁的两个线程和它们互相等待的锁直接列出来，不需要你手动比对地址——但**锁竞争（大量线程排队等同一把锁，但最终都能拿到）不是死锁**，`jstack` 不会自动帮你标出来，需要按上面的方法手动比对 `waiting to lock` 和 `locked` 的地址。
+
+第四步，用 Arthas 更快定位（省去手动比对地址）：
+
+```bash
+thread -b      # 直接找出「当前阻塞其他线程的罪魁线程」，锁竞争/死锁排查专用，一步到位
+```
+
+### 3. 另一种「不忙但慢」：线程池排队，而不是锁竞争
+
+如果 `jstack` 里没看到大量 `BLOCKED`，而是看到大量业务线程处于 `WAITING`/`TIMED_WAITING` 卡在线程池的任务队列上（比如栈里出现 `java.util.concurrent.ThreadPoolExecutor$Worker.run` 或者 `LinkedBlockingQueue.take`），说明瓶颈不是锁，而是**线程池被打满，请求在队列里排队**，这是高并发场景下 RT 劣化的另一大常见根因。
+
+排查线程池状态，优先用监控面板看趋势（而不是登机器执行一次性命令看瞬时值）：
+
+- 如果线程池指标已经上报到 Prometheus/Grafana：直接看 `活跃线程数`、`队列排队任务数`、`已完成任务数` 这几条曲线是否和 QPS 上涨、RT 劣化的时间点吻合。
+- 如果是 Spring Boot 应用且开了 Actuator：`/actuator/metrics/tomcat.threads.busy`、`/actuator/metrics/tomcat.threads.current` 能直接看到 Tomcat 内置线程池的繁忙情况。
+- 如果是自定义 `ThreadPoolExecutor` 且没有提前埋点监控，临时排查可以在代码里加一行日志定时打印 `getActiveCount()` / `getQueue().size()` / `getPoolSize()`，或者用 Arthas 的 `watch` 命令不重启直接观察这几个方法的返回值：
+
+```bash
+# 不重启服务，直接观察线程池对象某个方法的返回值
+watch com.xxx.TagQueryService threadPoolExecutor '{target.getActiveCount(), target.getQueue().size()}'
+```
+
+如果观察到 `getActiveCount()` 长期等于线程池最大线程数（线程全忙）、`getQueue().size()` 持续增长，说明线程池确实被打满了，请求在队列里等待的时间直接计入了总 RT，但这部分等待时间完全不消耗 CPU，这也是为什么 `top` 看起来"很闲"却依然超时——**这正是本节开头强调的核心认知：RT 高不等于 CPU 忙，也可能是线程在排队或等锁**。
+
+> **排查口诀**：先看 `top` CPU 是否真的高——高就走「CPU 飙高」那条路（`top -Hp → jstack`）；不高但 RT 依然差，就抓 `jstack` 统计 `BLOCKED` 线程数量，大量 `BLOCKED` 走「锁竞争」这条路（比对 `waiting to lock`/`locked` 地址，或直接 `thread -b`）；如果 `BLOCKED` 不多但线程都卡在队列相关的栈帧上，走「线程池打满」这条路（看线程池的活跃数/队列长度监控）。三条路径分工明确，不要一上来就无脑上火焰图——火焰图擅长发现「CPU 确实在忙着算什么」，但对「线程在傻等」这类问题基本看不出名堂。
+
+---
+
+## 四、更快的姿势：Arthas（线上首选）
 
 上面是「原生 JDK 工具链」，胜在任何环境都有。但线上排查更推荐阿里开源的 **Arthas**，不用重启、不用改参数、交互式：
 
@@ -297,7 +417,7 @@ watch 类 方法 '{params,returnObj}'  # 不重启就观察方法入参/返回�
 
 ---
 
-## 四、命令速查表
+## 五、命令速查表
 
 | 场景 | 命令 | 作用 |
 | --- | --- | --- |
@@ -313,7 +433,10 @@ watch 类 方法 '{params,returnObj}'  # 不重启就观察方法入参/返回�
 | 线程号转 16 进制 | `printf '0x%x\n' tid` | 配合 jstack |
 | 抓线程栈 | `jstack pid \| grep 0xXXX -A 30` | 定位到具体代码行 |
 | 看/改运行时参数 | `jinfo -flag 名 pid` | 查看 JVM 参数 |
-| 线上一键排查 | `arthas: dashboard / thread -n 3 / thread -b` | 不重启、交互式 |
+| 统计线程状态分布 | `jstack pid \| grep "java.lang.Thread.State" \| sort \| uniq -c` | 一眼看是否大面积 `BLOCKED`，锁竞争排查第一步 |
+| 找持锁/等锁线程 | `jstack pid \| grep -A 5 "request-thread"` 后比对 `waiting to lock`/`locked` 地址 | 定位「谁在等」「谁在拿」这把锁 |
+| 看线程池活跃/排队数 | Arthas `watch 类 字段 '{target.getActiveCount(), target.getQueue().size()}'` | 免重启看线程池是否被打满 |
+| 线上一键排查 | `arthas: dashboard / thread -n 3 / thread -b` | 不重启、交互式，`thread -b` 专治锁竞争/死锁 |
 
 ---
 
