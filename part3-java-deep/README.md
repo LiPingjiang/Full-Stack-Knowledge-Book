@@ -45,6 +45,7 @@ graph TD
     A --> R[附录 A1 核心数据结构<br/>跳表/红黑树/布隆过滤器/B+树]
     A --> S[附录 A2 网络协议基础<br/>TCP握手/HTTP/DNS]
     A --> T[附录 A8 Linux操作系统基础<br/>cgroup/VFS/进程线程/namespace]
+    A --> U[附录 A9 表达式引擎与规则引擎<br/>Aviator/QLExpress/Drools/跨语言]
 
     B -.为第四章并发对比筑基.-> G[第四章 多语言对比]
     C -.为内存模型对比筑基.-> G
@@ -125,6 +126,8 @@ graph TD
 **[附录 A7：开发工具链](./A7-开发工具链.md)** —— Git 进阶（分支策略/rebase vs merge/cherry-pick/bisect/stash）、Maven 生命周期与依赖冲突排查、Maven vs Gradle、CI/CD 概念与工具选型、Linux 运维命令速查（文件/进程/网络/线上排查组合拳）。
 
 **[附录 A8：Linux 操作系统基础](./A8-Linux操作系统基础.md)** —— 不讲命令（命令速查见 A7），讲内核运行机制。进程与线程的内核表示（task_struct / clone / fork-exec）、cgroup 资源隔离（虚拟文件系统配置、权限模型、五大功能、YARN 如何用 cgroup 控制 Executor）、VFS 一切皆文件设计（回调机制、cgroup 文件为何写一下就生效、非轮询的事件驱动原理）、namespace 视图隔离（Docker Container vs YARN Container 的区别）、进程间通信 IPC 全家桶。*面试剖析覆盖：cgroup vs JVM -Xmx、Spark Task 为何用线程、cgroup 文件写一下生效的原理、Docker Container vs YARN Container。*
+
+**[附录 A9：表达式引擎与规则引擎](./A9-表达式引擎与规则引擎.md)** —— 当业务规则频繁变更、硬编码 if-else 满天飞时，你需要"规则和代码分离"的能力。本附录覆盖三层分类（表达式引擎 → 脚本引擎 → 规则引擎）、Java 生态主流方案（Aviator 字节码编译 / QLExpress 解释执行+VM 指令 / SpEL / MVEL / Janino / Drools Rete 算法）、跨语言方案（Go govaluate/expr/grule/gengine、Python eval/compile/exec、Rust evalexpr/GoRules ZEN、Google CEL 跨语言统一）、三种执行机制本质差异（字节码编译 vs 解释执行 vs VM 指令集）、DSL 编译器工具（ANTLR4 / JavaCC / JFlex+Bison）、表达式注入安全问题（SpEL RCE / 防御原则）、完整选型决策树与按场景推荐表。
 
 ---
 

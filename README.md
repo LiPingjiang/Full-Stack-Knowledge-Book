@@ -104,6 +104,7 @@ flowchart LR
 - [附录 A6：代码规范与设计原则——SOLID / 阿里规范 / 代码坏味道](./part3-java-deep/A6-代码规范与设计原则.md)
 - [附录 A7：开发工具链——Git 进阶 / Maven / CI·CD / Linux 速查](./part3-java-deep/A7-开发工具链.md)
 - [附录 A8：Linux 操作系统基础——cgroup / VFS / 进程线程 / namespace / IPC](./part3-java-deep/A8-Linux操作系统基础.md)
+- [附录 A9：表达式引擎与规则引擎——Aviator / QLExpress / SpEL / Drools / 跨语言方案 / DSL 编译器 / 安全防护](./part3-java-deep/A9-表达式引擎与规则引擎.md)
 
 ### 第四章 · 核心场景的多语言对比与讲解 〔核心重点 ②〕
 
