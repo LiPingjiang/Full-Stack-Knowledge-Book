@@ -1117,7 +1117,7 @@ RocksDB 采用 LSM-Tree 结构：新数据先写入内存 MemTable，MemTable �
 
 > **详细原理**（分层结构、Compaction 局部合并机制、读取为什么从新到旧查、Block Cache 与 MemTable 分工）详见 [A1 附录 · 十一、LSM-Tree 与 SST 文件](../part3-java-deep/A1-核心数据结构原理.md#十一lsm-tree-与-sst-文件写优化存储引擎的通用原理)。本节聚焦三种放大效应对 Flink 大 State 的影响。
 
-RocksDB 底层的 LSM-Tree（Log-Structured Merge-Tree）虽然写入性能极高（顺序写），但存在三种放大效应，直接影响 Flink 大 State 场景的稳定性：
+RocksDB 底层的 LSM-Tree（Log-Structured Merge-tree，日志结构合并树）虽然写入性能极高（顺序写），但存在三种放大效应，直接影响 Flink 大 State 场景的稳定性：
 
 **写放大（Write Amplification）**
 
