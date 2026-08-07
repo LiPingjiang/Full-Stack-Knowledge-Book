@@ -465,6 +465,8 @@ AgentBI 的价值在于**让数据平台的能力对业务用户零门槛可用*
 | [6.11 ClickHouse](../part6-bigdata/11-ClickHouse.md) | AgentBI 查询执行的目标引擎之一 |
 | [6.12 Presto](../part6-bigdata/12-Presto查询引擎.md) | AgentBI 查询执行的目标引擎之一 |
 | [6.9 湖仓一体](../part6-bigdata/09-湖仓一体.md) | AgentBI 底层数据来自湖仓底座 |
+| [6.19 元数据管理与智能数据治理](../part6-bigdata/19-元数据管理与智能数据治理.md) | AgentBI 理解表结构和语义依赖元数据体系 |
+| [6.20 AI Native 数仓与数仓智能体](../part6-bigdata/20-AI-Native数仓与数仓智能体.md) | 把本节"交互层"放进 AgentBI → 语义层 → 元数据层的整体架构图中理解 |
 
 ---
 
