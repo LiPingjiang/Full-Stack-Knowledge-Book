@@ -180,7 +180,7 @@ flowchart LR
 - [7.9 AI 安全与可信：Prompt 注入防御 / 数据投毒检测 / PII 脱敏 / 多租户隔离](./part7-ai-engineering/09-AI安全与可信.md)
 - [7.10 GraphRAG 与知识图谱增强：实体关系抽取 / 社区发现 / Local-Global Search / 工具关系图谱](./part7-ai-engineering/10-GraphRAG与知识图谱.md)
 - [7.11 检索平台工程：Embedding 管道 / 语义缓存 / 容量规划 / 向量库存算分离 / 降级链路](./part7-ai-engineering/11-检索平台工程.md)
-- [7.12 案例研究：点富科技「大模型数据工程与评测岗」深度分析——公司背景核验 / 专家数字分身技术拆解 / persona 数据构建 / CharacterEval / LLM-as-a-Judge 校准 / 医疗合规 / 20 道预测题 / 16 个反问](./part7-ai-engineering/12-案例-点富科技大模型数据评测岗.md)
+- [7.12 案例研究：点富科技「大模型数据工程与评测岗」深度分析——公司背景核验 / 专家数字分身技术拆解 / persona 数据构建 / CharacterEval / LLM-as-a-Judge 校准 / 医疗合规 / **数据体系 0→1 建设规划（架构·三期路线·选型·ROI·团队）** / 25 道预测题 / 20 个反问](./part7-ai-engineering/12-案例-点富科技大模型数据评测岗.md)
 
 ### 第八章 · Notebook 平台架构：全栈开发的绝佳研究案例 〔综合应用〕
 
