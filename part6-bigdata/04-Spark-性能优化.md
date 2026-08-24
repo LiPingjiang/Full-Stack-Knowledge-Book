@@ -2579,6 +2579,100 @@ SortShuffleManager 有两种运行机制：
 
 > **经验总结**：Shuffle 调优的本质是在"磁盘 I/O、网络传输、内存占用"三者间找平衡。没有万能参数，但 `spark.sql.shuffle.partitions` + AQE 的组合能解决 80% 的 Shuffle 性能问题。理解 ShuffleManager 演进的意义在于：知道为什么 SortShuffleManager 是默认的——它用排序的确定性开销换来了文件数量的量级下降，这在工程上几乎总是划算的。
 
+#### Shuffle Read 进阶参数——大规模集群稳定性调优
+
+上面 7 个参数覆盖了日常 90% 的场景。但在 **千亿级数据量 + 数百节点集群** 中，以下 3 个 Shuffle Read 侧的进阶参数会成为稳定性瓶颈。它们不影响正常性能，只在极端场景下触发兜底保护：
+
+| 参数 | 默认值 | 说明 | 调优建议 | 适用场景 |
+|------|--------|------|---------|---------|
+| `spark.reducer.maxReqsInFlight` | Int.MaxValue | Shuffle Read 时单个批次同时发送的远程拉取请求数。`maxSizeInFlight` 限制的是字节量，这个参数限制的是请求数。当 block 分布不均匀时（大量小 block），一个批次可能发出远超预期的请求，导致对端入站连接数爆炸 | 大集群（100+ 节点）可设为 50–100，限制并发请求数 | 大规模集群 + block 数量多且体积不均 |
+| `spark.reducer.maxReqSizeShuffleToMem` | Int.MaxValue (Spark 2.x) / 200m (Spark 3.0+) | 单次拉取请求的 block 如果大于此值，直接落盘而不放内存。防止超大 block 撑爆内存。注意 Netty 的传输上限是 2G，超过必报错 | Spark 2.x 建议手动设为 200m；Spark 3.x 默认值已合理，一般不用改。Spark 2.3+ 参数名改为 `spark.maxRemoteBlockSizeFetchToMem` | 数据倾斜严重、某个 key 对应的 block 异常大 |
+| `spark.reducer.maxBlocksInFlightPerAddress` | Int.MaxValue | 单个 Shuffle Write 节点同时被拉取的最大 block 数。极端情况下，一个 Write Executor 被 1000 个 Read Task 同时请求，导致该节点服务崩溃 | 大集群建议设为 9–18（与 `executor.cores` 相关，防止 CPU 被拉取请求占满） | 节点数多、Shuffle Write 侧 Executor 负载集中 |
+
+> **这三个参数的共同特征**：默认值都是 `Int.MaxValue`（无限制），这意味着 Spark 的默认策略是"信任集群规模不会太大"。当集群规模到数百节点、数据量到千亿级时，无限制会变成灾难——某个 Write Executor 被数千个请求打垮，触发 `FetchFailed` → Stage 重试 → 更多请求雪崩。这三个参数是**大规模集群的保险丝**，小集群完全不需要关注。
+
+#### spark.shuffle.spill.batchSize——溢写批处理大小
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| `spark.shuffle.spill.batchSize` | 10000 | Shuffle 溢写（Spill）过程中序列化/反序列化的批处理条数。每批处理 10000 条数据做一次序列化写磁盘 | 数据量大且单条记录较小（如日志类数据）时可调大到 25000–50000，减少序列化调用次数。单条记录较大时保持默认，避免单批内存占用过高 |
+
+这个参数在 Spill 频繁的任务中有一定效果，但优先级远低于 `memory.fraction` 和 `shuffle.partitions`——只有在前者都已调优且 Spill 仍然严重时，才考虑调大 batchSize。
+
+### 6.7 序列化优化——Kryo vs Java Serialization
+
+Spark 中有三个场景涉及序列化：算子中使用外部变量（闭包序列化）、RDD 缓存到磁盘/打散到网络（持久化序列化）、Shuffle 数据传输。Spark 默认使用 Java 原生序列化（`JavaSerializer`），性能低、序列化后体积大。Kryo 序列化在速度和压缩比上都快 5–10 倍，但需要手动注册类。
+
+#### 开启 Kryo 序列化
+
+```scala
+val conf = new SparkConf()
+  .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+  .registerKryoClasses(Array(
+    classOf[MyClass1],
+    classOf[MyClass2],
+    classOf[Array[MyClass1]]
+  ))
+```
+
+```bash
+# spark-submit 方式
+--conf spark.serializer=org.apache.spark.serializer.KryoSerializer
+```
+
+> **注册类的原因**：Kryo 不注册时，每个对象序列化时会写入完整的类名（字符串），体积膨胀。注册后用 int ID 替代类名，体积大幅减小。对于 Shuffle 量大的任务，注册类可以减少 30%–50% 的序列化后数据量。
+
+#### Kryo 相关参数
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| `spark.serializer` | `org.apache.spark.serializer.JavaSerializer` | 全局序列化器，影响 Shuffle、广播变量、RDD 缓存。改为 `KryoSerializer` 提升性能 | 生产环境一律用 Kryo。注意：闭包序列化（`spark.closure.serializer`）目前只支持 JavaSerializer，Kryo 无法覆盖 |
+| `spark.kryoserializer.buffer` | 64k | Kryo 序列化的初始缓冲区大小。单个对象序列化超过此值会自动扩容 | 一般不用改。如果序列化的对象很大（如大数组），可调到 256k |
+| `spark.kryoserializer.buffer.max` | 64m | Kryo 序列化缓冲区的最大值。序列化单个对象超过此值会抛 `Buffer limit exceeded` 异常 | `collect()` 大量数据到 Driver 时容易触发，调到 256m 或 1024m。注意：此参数是**单个对象**的限制，不是总量 |
+
+> **什么时候会踩坑？** 最常见的场景是 `collect()` 把大量数据拉到 Driver 端——Spark 需要把每个 Task 的结果序列化后传输，如果单个 Task 的结果集很大（比如几百万行），就会触发 `spark.kryoserializer.buffer.max` 限制。解决方式要么调大此参数，要么改用 `take(N)` 或写出到文件而不是 `collect()`。
+
+#### spark.driver.maxResultSize——collect 的安全阀
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| `spark.driver.maxResultSize` | 1g | 所有 Task 的序列化结果拉取到 Driver 端的总大小上限。超过此值抛 `SparkException: Total size of serialized results is bigger than spark.driver.maxResultSize` | 需要 `collect()` 大数据集时调到 2g–4g。设为 0 表示不限制（不推荐，Driver OOM 风险）。配合 `kryoserializer.buffer.max` 一起调整 |
+
+> **与 `kryoserializer.buffer.max` 的区别**：`maxResultSize` 限制的是**所有 Task 结果的总量**，`buffer.max` 限制的是**单个对象的序列化上限**。collect 报错时先看报错信息——如果是 "Total size of serialized results of N tasks is bigger than..."，调 `maxResultSize`；如果是 "Buffer limit exceeded"，调 `buffer.max`。
+
+### 6.8 Parquet/Hive 兼容性参数——跨引擎读写的坑
+
+Spark 读写 Hive 表时，默认用自己的 Parquet SerDe 而非 Hive 的，这在 Decimal 精度、null 值处理上会产生兼容性问题。以下参数在生产环境中经常踩坑：
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| `spark.sql.hive.convertMetastoreParquet` | true | 是否用 Spark 自己的 Parquet SerDe 读取 Hive Metastore 创建的 Parquet 表。true 时性能更好，但与 Hive 的 null 值和 Decimal 精度处理不一致 | 如果 Hive 侧读取 Spark 写的 Parquet 报精度错误或 null 异常，设为 false（使用 Hive SerDe，性能稍降但兼容）。正常无报错时保持 true |
+| `spark.sql.parquet.writeLegacyFormat` | false | 写 Parquet 时是否用 Hive 兼容的格式。标准 Parquet 规范中 Decimal 根据精度用 int32/int64 存储，而 Hive 固定用 int32。Spark 默认用标准格式，Hive 读取时可能报错 | 如果上下游有 Hive 读 Spark 写的 Parquet 表，且涉及 Decimal 类型，设为 true。建议上下游表的 Decimal 精度保持一致 |
+| `spark.sql.parquet.compression.codec` | snappy | Parquet 文件的压缩 codec。可选 snappy / gzip / lzo / uncompressed / zstd | 生产环境用 snappy（压缩比和速度的平衡）。对压缩比要求高、查询不频繁的冷数据用 zstd 或 gzip。注意：gzip 对下游 Hive 读取可能不可分割（取决于实现） |
+| `spark.io.compression.codec` | lz4 | Spark 内部数据的压缩 codec，影响 RDD 缓存、Shuffle 输出、广播变量的序列化后压缩 | 默认 lz4 速度最快。如果更看重压缩比，用 snappy（略慢但压缩更好）。Shuffle 量大时影响明显 |
+
+> **Decimal 精度问题的本质**：Hive 中 Decimal 固定用 int32 存储，标准 Parquet 规范约定根据精度不同分别使用 int32（精度 ≤ 9）和 int64（精度 > 9）。Spark 默认遵循标准 Parquet 规范，所以 Spark 写的 Decimal 字段，Hive 读取时底层存储类型不匹配，就会报错。`writeLegacyFormat=true` 让 Spark 也用 int32 存储 Decimal，与 Hive 保持一致——代价是高精度 Decimal 占用更多空间（int64 的值用 int32 存不下时需要用 binary）。
+
+<details>
+<summary>完整的 Decimal 兼容性问题排查清单</summary>
+
+1. **现象**：Hive 读取 Spark 写的 Parquet 表，Decimal 字段报错或精度丢失
+2. **根因**：Spark 标准 Parquet 格式与 Hive 的 Decimal 存储方式不一致
+3. **修复**：`SET spark.sql.parquet.writeLegacyFormat=true;` 后重写数据
+4. **预防**：建表时上下游表的 Decimal 精度保持一致（如都用 `decimal(10,2)`）
+5. **验证**：用 Hive 和 Spark 分别 `SELECT` 同一条记录，对比 Decimal 值是否一致
+6. **注意**：已有的错误数据需要重写，改参数只影响新写入的数据
+
+</details>
+
+### 6.9 HDFS 写入稳定性参数
+
+| 参数 | 默认值 | 说明 | 调优建议 |
+|------|--------|------|---------|
+| `dfs.client.block.write.locateFollowingBlock.retries` | 5（Hadoop 2.x） | HDFS 写入 block 后尝试关闭文件的次数。当 HDFS 集群繁忙或 DataNode 通信超时时，可能抛 `Unable to close file because the last block does not have enough number of replicas` | 调到 6–10 增加重试次数。Hadoop 2.7.4+ 已修复底层 bug，一般在低版本集群才需要调 |
+
+> **这个参数不属于 Spark**，而是 HDFS 客户端参数，需要在 `spark-defaults.conf` 或 `spark-submit --conf` 中通过 `spark.hadoop.dfs.client.block.write.locateFollowingBlock.retries` 设置。踩坑场景：Spark 任务写 HDFS 时偶发失败，报错信息指向 HDFS block 副本数不足，但 HDFS 集群本身正常——这是因为 HDFS 客户端重试次数不够，在集群负载高峰期偶尔超时。
+
 ---
 
 [← 返回 Spark 主文档](./04-Spark.md)
