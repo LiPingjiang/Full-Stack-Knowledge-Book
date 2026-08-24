@@ -99,32 +99,32 @@
 
 ## 六、调试运维
 
-### 6.1 Spark 作业秒退怎么查
+### Spark 作业秒退怎么查
 
 短答：优先看 Driver / AM 初始化日志，不要先盯 Spark UI。
 
-### 6.2 日志体系怎么理解
+### 日志体系怎么理解
 
 短答：要区分 Driver、Executor、AM、Client，以及 stdout、stderr、syslog 的职责。
 
-### 6.3 FileNotFoundException 怎么区分原因
+### FileNotFoundException 怎么区分原因
 
 短答：先看文件路径指向业务数据文件，还是本地 Shuffle 中间文件，根因完全不同。
 
-### 6.4 Spark UI 正常但作业失败怎么办
+### Spark UI 正常但作业失败怎么办
 
 短答：说明 Driver 通常已经起来了，此时优先转向执行期错误，而不是提交失败问题。
 
 ## 七、现代 Spark 话题
 
-### 7.1 Spark Connect 是什么
+### Spark Connect 是什么
 
 短答：Spark Connect 是 Spark 3.4 引入的新 client-server 架构，适合更平台化、更远程、更多语言的使用方式。
 
-### 7.2 YARN 和 Kubernetes 有什么差别
+### YARN 和 Kubernetes 有什么差别
 
 短答：差别不只是部署方式，而是日志入口、资源管理方式、本地盘生命周期、弹性回收和排障视角都不同。
 
-### 7.3 如果让你设计 Spark 调优顺序，你会怎么做
+### 如果让你设计 Spark 调优顺序，你会怎么做
 
 短答：先减数据量，再修 SQL 与分布，再看资源与内存，最后调细节参数；全程以 UI 和日志证据为依据。

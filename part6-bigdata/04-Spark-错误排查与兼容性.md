@@ -171,20 +171,20 @@ Kryo 通常更高效，但不是“打开就一定万事大吉”。真正重要
 
 ## 六、错误速查表
 
-### 6.1 按关键词定位
+### 按关键词定位
 
 - OOM：先分 Driver / Executor / 容器
 - FetchFailed：先看 Shuffle 文件与 Executor 稳定性
 - FileNotFound：先看文件路径归属
 - timeout：先看对象大小、网络、下游依赖
 
-### 6.2 按症状定位
+### 按症状定位
 
 - 提交秒退：优先看 AM / Driver 初始化
 - 跑到一半挂：优先看 stage / task / Executor
 - 结果不对：优先看 SQL 语义与数据分布
 
-### 6.3 按组件定位
+### 按组件定位
 
 - Driver 问题：主逻辑、提交、collect、广播
 - Executor 问题：task、Shuffle、OOM、数据读写

@@ -168,7 +168,7 @@ CTE 的主要作用是可读性，而不是天然的执行优化。某些查询�
 
 ## 六、算子级优化
 
-### 6.1 reduceByKey vs groupByKey
+### reduceByKey vs groupByKey
 
 这是 Spark 面试和实战里都很经典的一个点。核心不在“一个 API 好、一个 API 坏”，而在：
 
@@ -177,11 +177,11 @@ CTE 的主要作用是可读性，而不是天然的执行优化。某些查询�
 
 只要业务允许提前聚合，通常就优先考虑 `reduceByKey` 类路径。
 
-### 6.2 map-side combine 的意义
+### map-side combine 的意义
 
 map-side combine 的本质就是：**尽量在数据还没真正跨网络之前，就先把能缩的缩掉。**
 
-### 6.3 聚合、排序、去重的代价差异
+### 聚合、排序、去重的代价差异
 
 这三类操作都可能引发 Shuffle，但代价侧重点不一样：
 
@@ -189,7 +189,7 @@ map-side combine 的本质就是：**尽量在数据还没真正跨网络之前�
 - 排序看数据规模和排序键
 - 去重看基数与分区数
 
-### 6.4 cache vs persist 的正确姿势
+### cache vs persist 的正确姿势
 
 缓存不是越早越好，而是要看：
 
@@ -199,13 +199,13 @@ map-side combine 的本质就是：**尽量在数据还没真正跨网络之前�
 
 ## 七、小文件与输出分布控制
 
-### 7.1 coalesce / repartition / repartitionByRange 的区别
+### coalesce / repartition / repartitionByRange 的区别
 
 - `coalesce`：更偏向减少分区，代价较小，但不保证全局均匀
 - `repartition`：显式重分布，代价更高，但通常更均匀
 - `repartitionByRange`：更适合需要范围有序或按值域分布的场景
 
-### 7.2 REBALANCE 的适用场景
+### REBALANCE 的适用场景
 
 `REBALANCE` 更适合“写出前最后一公里”的重新均衡：
 
@@ -213,11 +213,11 @@ map-side combine 的本质就是：**尽量在数据还没真正跨网络之前�
 - 还想避免个别分区过大或过小
 - 你关心输出文件与业务分布的平衡
 
-### 7.3 AQE 自动合并为什么不总是够用
+### AQE 自动合并为什么不总是够用
 
 AQE 自动合并解决的是“过多小分区”的一部分问题，但它不理解你的业务写出目标，也不保证文件大小、业务 key 分布、资源效率三者同时满足。
 
-### 7.4 输出文件数与分区分布如何统一考虑
+### 输出文件数与分区分布如何统一考虑
 
 最终要同时考虑三件事：
 
